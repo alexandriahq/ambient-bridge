@@ -1,0 +1,52 @@
+{
+  "name": "@ambient/bridge",
+  "version": "0.1.0-alpha.3",
+  "description": "Standalone Ambient Bridge desktop app for WorkOS auth, local IPC pairing, and inference egress.",
+  "author": "Ambient",
+  "type": "module",
+  "packageManager": "pnpm@10.7.1",
+  "engines": {
+    "node": ">=22",
+    "pnpm": ">=10 <11"
+  },
+  "main": "dist/electron/main.js",
+  "scripts": {
+    "dev": "node scripts/dev-electron.mjs",
+    "dev:electron": "node scripts/dev-electron.mjs",
+    "icon:build": "node scripts/build-app-icon.mjs",
+    "dev:renderer": "vite --host 127.0.0.1",
+    "build": "pnpm build:mac:dir",
+    "build:mac:dir": "vite build && tsc -p tsconfig.electron.json && electron-builder --mac dir",
+    "build:mac:smoke": "pnpm build:mac:dir && pnpm smoke:packaged",
+    "build:release:mac": "vite build && tsc -p tsconfig.electron.json && electron-builder --mac dmg zip --arm64 --publish never",
+    "build:electron": "tsc -p tsconfig.electron.json",
+    "release:publish": "node scripts/publish-release.mjs",
+    "smoke:packaged": "node scripts/smoke-packaged-app.mjs",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.electron.json --noEmit && tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@ambient/shared": "workspace:*",
+    "@lucide/svelte": "^1.16.0",
+    "@workos-inc/node": "^10.1.0",
+    "effect": "3.21.2",
+    "electron-updater": "^6.8.3",
+    "semver": "^7.7.4",
+    "svelte": "^5.56.3",
+    "tinfoil": "1.1.4",
+    "zod": "^4.1.8"
+  },
+  "devDependencies": {
+    "@aws-sdk/client-s3": "^3.1061.0",
+    "@electron/asar": "3.4.1",
+    "@sveltejs/vite-plugin-svelte": "^7.1.2",
+    "@types/node": "^25.9.1",
+    "@types/semver": "^7.7.1",
+    "electron": "^42.3.3",
+    "electron-builder": "^26.8.1",
+    "typescript": "^5.8.3",
+    "vite": "^8.0.16",
+    "vitest": "^4.1.8",
+    "yaml": "^2.9.0"
+  }
+}

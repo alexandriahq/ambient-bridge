@@ -1,0 +1,7 @@
+packages:
+  - shared
+onlyBuiltDependencies:
+  - '@parcel/watcher'
+  - electron
+  - esbuild
+  - macos-alias

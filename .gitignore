@@ -1,0 +1,17 @@
+# macOS Finder metadata
+.DS_Store
+._*
+.AppleDouble
+.LSOverride
+
+.env
+.env.*
+!.env.example
+
+node_modules/
+dist/
+dist-packaged/
+out/
+.svelte-kit/
+.vite/
+*.log

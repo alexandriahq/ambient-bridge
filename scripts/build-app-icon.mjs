@@ -1,0 +1,175 @@
+#!/usr/bin/env node
+// Builds the rounded macOS Ambient Bridge app icon.
+//
+// Inputs:
+//   resources/bridge-icon-mark.png  — raw square mark (lock glyph)
+//
+// Outputs:
+//   resources/bridge-icon-source.png  — 1024x1024 squircle (transparent corners)
+//   resources/bridge-icon.icns        — multi-size .icns for electron-builder
+//
+// Strategy mirrors ambient-app/devtools/scripts/build-rounded-app-icon.mjs: a
+// tiny Swift helper rasterises the mark inside a squircle clip path using Core
+// Graphics (which honours alpha), then we pack each iconset slot into an .icns.
+
+import { spawnSync } from "node:child_process";
+import {
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+  copyFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+if (process.platform !== "darwin") {
+  console.error("[build-app-icon] must run on macOS.");
+  process.exit(1);
+}
+
+const scriptDir = path.dirname(fileURLToPath(import.meta.url));
+const projectRoot = path.resolve(scriptDir, "..");
+const resourcesRoot = path.join(projectRoot, "resources");
+const markPath = path.join(resourcesRoot, "bridge-icon-mark.png");
+const sourceOut = path.join(resourcesRoot, "bridge-icon-source.png");
+const icnsOut = path.join(resourcesRoot, "bridge-icon.icns");
+
+// The bridge mark already ships with generous internal padding, so unlike the
+// main app icon we let the rounded white card fill the full 1024×1024 canvas
+// (only the corners are clipped transparent). This keeps the lock glyph from
+// reading too small once the source's own padding is accounted for.
+const CANVAS = 1024;
+const SQUIRCLE_SIZE = 1024;
+const SQUIRCLE_RADIUS = 230; // ~22.5% of 1024, Apple's squircle approximation
+
+const SQUIRCLE_SWIFT = `
+import Cocoa
+import CoreGraphics
+
+let args = CommandLine.arguments
+guard args.count == 7 else {
+    fatalError("usage: squircle <input.png> <output.png> <canvas> <squircle> <radius> <inset>")
+}
+let inputPath = args[1]
+let outputPath = args[2]
+let canvas = Int(args[3])!
+let squircle = CGFloat(Double(args[4])!)
+let radius = CGFloat(Double(args[5])!)
+let inset = CGFloat(Double(args[6])!)
+
+guard let src = NSImage(contentsOfFile: inputPath) else { fatalError("cannot load \\(inputPath)") }
+let colorSpace = CGColorSpaceCreateDeviceRGB()
+let bytesPerRow = canvas * 4
+guard let ctx = CGContext(
+    data: nil,
+    width: canvas,
+    height: canvas,
+    bitsPerComponent: 8,
+    bytesPerRow: bytesPerRow,
+    space: colorSpace,
+    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+) else { fatalError("cannot create context") }
+
+let canvasRect = CGRect(x: 0, y: 0, width: canvas, height: canvas)
+ctx.clear(canvasRect)
+
+let squircleRect = CGRect(x: inset, y: inset, width: squircle, height: squircle)
+let clipPath = CGPath(roundedRect: squircleRect, cornerWidth: radius, cornerHeight: radius, transform: nil)
+
+ctx.saveGState()
+ctx.addPath(clipPath)
+ctx.clip()
+
+ctx.setFillColor(NSColor.white.cgColor)
+ctx.fill(squircleRect)
+
+var imageRect = squircleRect
+guard let cgSrc = src.cgImage(forProposedRect: &imageRect, context: nil, hints: nil) else { fatalError("cannot get cgImage") }
+ctx.draw(cgSrc, in: squircleRect)
+ctx.restoreGState()
+
+guard let cgOut = ctx.makeImage() else { fatalError("cannot finalise image") }
+let rep = NSBitmapImageRep(cgImage: cgOut)
+rep.size = NSSize(width: canvas, height: canvas)
+guard let png = rep.representation(using: .png, properties: [:]) else { fatalError("cannot encode png") }
+try png.write(to: URL(fileURLWithPath: outputPath))
+`;
+
+function squircleArgsFor(size) {
+  // Scale the safe-area math so every iconset slot keeps the same proportions.
+  const scale = size / CANVAS;
+  const squircle = SQUIRCLE_SIZE * scale;
+  const radius = SQUIRCLE_RADIUS * scale;
+  const inset = (size - squircle) / 2;
+  return [String(size), String(squircle), String(radius), String(inset)];
+}
+
+function run(cmd, args) {
+  const result = spawnSync(cmd, args, { stdio: "inherit" });
+  if (result.status !== 0) {
+    throw new Error(`${cmd} ${args.join(" ")} failed (${result.status})`);
+  }
+}
+
+function writeIcns(iconsetPath, outputPath, entries) {
+  const chunks = entries.map(([, name, icnsType]) => {
+    if (typeof icnsType !== "string" || icnsType.length !== 4) {
+      throw new Error(`invalid ICNS type for ${name}`);
+    }
+    const data = readFileSync(path.join(iconsetPath, name));
+    const header = Buffer.alloc(8);
+    header.write(icnsType, 0, "ascii");
+    header.writeUInt32BE(data.length + header.length, 4);
+    return Buffer.concat([header, data]);
+  });
+  const totalLength = 8 + chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const header = Buffer.alloc(8);
+  header.write("icns", 0, "ascii");
+  header.writeUInt32BE(totalLength, 4);
+  writeFileSync(outputPath, Buffer.concat([header, ...chunks], totalLength));
+}
+
+const workDir = mkdtempSync(path.join(tmpdir(), "ambient-bridge-icon-"));
+const swiftSrc = path.join(workDir, "squircle.swift");
+const iconset = path.join(workDir, "icon.iconset");
+
+try {
+  writeFileSync(swiftSrc, SQUIRCLE_SWIFT);
+  run("mkdir", ["-p", iconset]);
+
+  // Render the 1024 master with transparent corners and Apple safe-area inset.
+  run("swift", [swiftSrc, markPath, sourceOut, ...squircleArgsFor(CANVAS)]);
+
+  // Render each iconset size directly from the mark so the corner radius scales
+  // exactly with the bitmap (avoids alpha blurring from sips downscaling).
+  const sizes = [
+    [16, "icon_16x16.png", "icp4"],
+    [32, "icon_16x16@2x.png", "ic11"],
+    [32, "icon_32x32.png", "icp5"],
+    [64, "icon_32x32@2x.png", "ic12"],
+    [128, "icon_128x128.png", "ic07"],
+    [256, "icon_128x128@2x.png", "ic13"],
+    [256, "icon_256x256.png", "ic08"],
+    [512, "icon_256x256@2x.png", "ic14"],
+    [512, "icon_512x512.png", "ic09"],
+    [1024, "icon_512x512@2x.png", "ic10"],
+  ];
+
+  for (const [size, name] of sizes) {
+    run("swift", [
+      swiftSrc,
+      markPath,
+      path.join(iconset, name),
+      ...squircleArgsFor(size),
+    ]);
+  }
+
+  writeIcns(iconset, icnsOut, sizes);
+
+  console.log(`[build-app-icon] wrote ${sourceOut}`);
+  console.log(`[build-app-icon] wrote ${icnsOut}`);
+} finally {
+  rmSync(workDir, { recursive: true, force: true });
+}

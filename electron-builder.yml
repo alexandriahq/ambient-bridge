@@ -1,0 +1,58 @@
+appId: com.alexandria.ambient.bridge
+productName: Ambient Bridge
+extraMetadata:
+  name: ambient-bridge
+  main: dist/electron/main.js
+directories:
+  output: dist-packaged
+asar: false
+files:
+  - dist/**/*
+  - package.json
+  - node_modules/**/*
+extraResources:
+  - from: resources/bridge-icon.ico
+    to: bridge-icon.ico
+  - from: node_modules/openai
+    to: node_modules/openai
+  - from: node_modules/zod
+    to: node_modules/zod
+  - from: node_modules/@ai-sdk/provider
+    to: node_modules/@ai-sdk/provider
+  - from: node_modules/@ai-sdk/provider-utils
+    to: node_modules/@ai-sdk/provider-utils
+  - from: node_modules/eventsource-parser
+    to: node_modules/eventsource-parser
+npmRebuild: false
+mac:
+  category: public.app-category.productivity
+  gatekeeperAssess: false
+  hardenedRuntime: true
+  icon: resources/bridge-icon.icns
+  target:
+    - target: dmg
+      arch:
+        - arm64
+    - target: zip
+      arch:
+        - arm64
+win:
+  icon: resources/bridge-icon.ico
+  signAndEditExecutable: false
+  target:
+    - target: nsis
+      arch:
+        - x64
+nsis:
+  installerIcon: resources/bridge-icon.ico
+  uninstallerIcon: resources/bridge-icon.ico
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+publish:
+  provider: generic
+  url: https://api.alexandria.so/updates/apps/ambient-bridge/alpha/darwin/arm64/
+protocols:
+  name: Ambient Bridge Auth
+  schemes:
+    - ambient-bridge

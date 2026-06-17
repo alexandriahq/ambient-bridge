@@ -1,0 +1,34 @@
+{
+  "name": "@ambient/shared",
+  "version": "0.1.0",
+  "description": "Shared Ambient UI components and contracts consumed as source by ambient-app and bridge.",
+  "private": true,
+  "type": "module",
+  "svelte": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "build": "tsc --project tsconfig.harness.json",
+    "typecheck": "tsc --project tsconfig.json && tsc --project tsconfig.harness.json --noEmit"
+  },
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "svelte": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./harness": {
+      "types": "./src/harness/index.ts",
+      "default": "./dist/harness/index.js"
+    }
+  },
+  "dependencies": {
+    "effect": "3.21.2"
+  },
+  "peerDependencies": {
+    "svelte": "^5.0.0"
+  },
+  "devDependencies": {
+    "svelte": "^5.56.3",
+    "typescript": "^5.8.3"
+  }
+}
