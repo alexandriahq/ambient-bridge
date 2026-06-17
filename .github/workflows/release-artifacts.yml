@@ -1,0 +1,64 @@
+name: Release Artifacts
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  macos:
+    name: macOS artifacts
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.7.1 --activate
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build unsigned macOS release artifacts
+        run: CSC_IDENTITY_AUTO_DISCOVERY=false pnpm release:bundle:mac
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ambient-bridge-macos
+          path: |
+            dist-packaged/*.dmg
+            dist-packaged/*.zip
+            dist-packaged/*.blockmap
+            dist-packaged/*-mac.yml
+            dist-packaged/SHA256SUMS
+            dist-packaged/SHA512SUMS
+            dist-packaged/artifact-manifest.json
+
+  windows:
+    name: Windows artifacts
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Enable pnpm
+        shell: pwsh
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.7.1 --activate
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build unsigned Windows release artifacts
+        run: pnpm release:bundle:win
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ambient-bridge-windows
+          path: |
+            dist-packaged/*.exe
+            dist-packaged/*.blockmap
+            dist-packaged/latest.yml
+            dist-packaged/SHA256SUMS
+            dist-packaged/SHA512SUMS
+            dist-packaged/artifact-manifest.json

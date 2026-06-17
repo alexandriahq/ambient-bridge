@@ -34,6 +34,14 @@ Build a macOS directory package:
 pnpm build
 ```
 
+Build release artifacts and checksums:
+
+```sh
+CSC_IDENTITY_AUTO_DISCOVERY=false pnpm release:bundle:mac
+```
+
+See [Build and Release Verification](docs/build-verification.md) for checksum verification and notes about signed vs unsigned artifact hashes.
+
 ## Configuration
 
 By default, Bridge talks to `https://api.alexandria.so`. For local development, set:
