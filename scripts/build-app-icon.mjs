@@ -7,6 +7,7 @@
 // Outputs:
 //   resources/bridge-icon-source.png  — 1024x1024 squircle (transparent corners)
 //   resources/bridge-icon.icns        — multi-size .icns for electron-builder
+//   resources/bridge-icon.ico          — multi-size, full-bleed .ico for Windows
 //
 // Strategy mirrors ambient-app/devtools/scripts/build-rounded-app-icon.mjs: a
 // tiny Swift helper rasterises the mark inside a squircle clip path using Core
@@ -35,14 +36,21 @@ const resourcesRoot = path.join(projectRoot, "resources");
 const markPath = path.join(resourcesRoot, "bridge-icon-mark.png");
 const sourceOut = path.join(resourcesRoot, "bridge-icon-source.png");
 const icnsOut = path.join(resourcesRoot, "bridge-icon.icns");
+const icoOut = path.join(resourcesRoot, "bridge-icon.ico");
 
-// The bridge mark already ships with generous internal padding, so unlike the
-// main app icon we let the rounded white card fill the full 1024×1024 canvas
-// (only the corners are clipped transparent). This keeps the lock glyph from
-// reading too small once the source's own padding is accounted for.
+// macOS (.icns) + dev dock: match the main app icon's safe area exactly (see
+// ambient-app/devtools/scripts/build-rounded-app-icon.mjs): an 824×824 squircle
+// centred in a 1024×1024 canvas, leaving 100 px of transparent padding on every
+// side so both apps read the same size in the dock.
 const CANVAS = 1024;
-const SQUIRCLE_SIZE = 1024;
-const SQUIRCLE_RADIUS = 230; // ~22.5% of 1024, Apple's squircle approximation
+const SQUIRCLE_SIZE = 824;
+const SQUIRCLE_RADIUS = 185; // ~22.5% of 824, Apple's squircle approximation
+
+// Windows (.ico): no dock safe-area convention — taskbar/tray icons fill their
+// frame. Render the .ico full-bleed (squircle fills the whole canvas, corners
+// clipped) so it matches the Ambient app's .ico. Keep in sync with that script.
+const ICO_CANVAS = 1024;
+const ICO_RADIUS = 230; // ~22.5% of 1024
 
 const SQUIRCLE_SWIFT = `
 import Cocoa
@@ -106,6 +114,12 @@ function squircleArgsFor(size) {
   return [String(size), String(squircle), String(radius), String(inset)];
 }
 
+function fullBleedArgsFor(size) {
+  // Full-bleed: the squircle fills the whole canvas (no safe-area inset).
+  const scale = size / ICO_CANVAS;
+  return [String(size), String(size), String(ICO_RADIUS * scale), "0"];
+}
+
 function run(cmd, args) {
   const result = spawnSync(cmd, args, { stdio: "inherit" });
   if (result.status !== 0) {
@@ -129,6 +143,34 @@ function writeIcns(iconsetPath, outputPath, entries) {
   header.write("icns", 0, "ascii");
   header.writeUInt32BE(totalLength, 4);
   writeFileSync(outputPath, Buffer.concat([header, ...chunks], totalLength));
+}
+
+function writeIco(outputPath, entries) {
+  const header = Buffer.alloc(6);
+  header.writeUInt16LE(0, 0);
+  header.writeUInt16LE(1, 2);
+  header.writeUInt16LE(entries.length, 4);
+
+  const directory = Buffer.alloc(entries.length * 16);
+  const images = [];
+  let imageOffset = header.length + directory.length;
+
+  entries.forEach(({ size, filePath }, index) => {
+    const data = readFileSync(filePath);
+    const offset = index * 16;
+    directory.writeUInt8(size >= 256 ? 0 : size, offset);
+    directory.writeUInt8(size >= 256 ? 0 : size, offset + 1);
+    directory.writeUInt8(0, offset + 2);
+    directory.writeUInt8(0, offset + 3);
+    directory.writeUInt16LE(1, offset + 4);
+    directory.writeUInt16LE(32, offset + 6);
+    directory.writeUInt32LE(data.length, offset + 8);
+    directory.writeUInt32LE(imageOffset, offset + 12);
+    images.push(data);
+    imageOffset += data.length;
+  });
+
+  writeFileSync(outputPath, Buffer.concat([header, directory, ...images]));
 }
 
 const workDir = mkdtempSync(path.join(tmpdir(), "ambient-bridge-icon-"));
@@ -168,8 +210,23 @@ try {
 
   writeIcns(iconset, icnsOut, sizes);
 
+  const icoSizes = [16, 24, 32, 48, 64, 128, 256];
+  const icoEntries = [];
+  for (const size of icoSizes) {
+    const filePath = path.join(iconset, `ico_${size}.png`);
+    run("swift", [
+      swiftSrc,
+      markPath,
+      filePath,
+      ...fullBleedArgsFor(size),
+    ]);
+    icoEntries.push({ size, filePath });
+  }
+  writeIco(icoOut, icoEntries);
+
   console.log(`[build-app-icon] wrote ${sourceOut}`);
   console.log(`[build-app-icon] wrote ${icnsOut}`);
+  console.log(`[build-app-icon] wrote ${icoOut}`);
 } finally {
   rmSync(workDir, { recursive: true, force: true });
 }

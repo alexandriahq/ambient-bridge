@@ -6,6 +6,10 @@ export type InferenceUsage = {
   totalTokens: number;
 };
 
+/**
+ * Tracks the attestation check every inference request runs: `pending` while the
+ * enclave identity is being verified, then `verified` or `failed`.
+ */
 export type NetworkRequestAttestation = "pending" | "verified" | "failed";
 
 export type NetworkRequestStatus = "active" | "completed" | "failed" | "cancelled";
@@ -25,6 +29,8 @@ export type NetworkRequestRecord = {
   path: InferenceProxyPath;
   startedAt: number;
   completedAt: number | null;
+  responseHeadersAt: number | null;
+  firstChunkAt: number | null;
   status: NetworkRequestStatus;
   statusCode: number | null;
   requestBytes: number | null;
@@ -103,6 +109,8 @@ export type StartNetworkRequestInput = {
   path: InferenceProxyPath;
   startedAt: number;
   requestBytes?: number | null;
+  /** Initial attestation state; defaults to `pending`. */
+  attestation?: NetworkRequestAttestation;
 };
 
 /**
@@ -111,14 +119,15 @@ export type StartNetworkRequestInput = {
  * -> completion) and snapshotted on read so the renderer never shares state.
  */
 export class NetworkRequestHistory {
-  private readonly records: NetworkRequestRecord[] = [];
+  private readonly records: Array<{ readonly key: string; readonly record: NetworkRequestRecord }> = [];
 
   constructor(private readonly limit = 100) {}
 
-  start(input: StartNetworkRequestInput): NetworkRequestRecord {
+  start(input: StartNetworkRequestInput, key = input.requestId): NetworkRequestRecord {
     const record: NetworkRequestRecord = {
-      attestation: "pending",
+      attestation: input.attestation ?? "pending",
       completedAt: null,
+      firstChunkAt: null,
       ehbpResponseNonce: null,
       encryption: "ehbp",
       error: null,
@@ -127,6 +136,7 @@ export class NetworkRequestHistory {
       path: input.path,
       requestBytes: input.requestBytes ?? null,
       requestId: input.requestId,
+      responseHeadersAt: null,
       startedAt: input.startedAt,
       status: "active",
       statusCode: null,
@@ -135,30 +145,47 @@ export class NetworkRequestHistory {
       wireCaptured: false,
     };
 
-    const existingIndex = this.records.findIndex((entry) => entry.requestId === record.requestId);
+    const existingIndex = this.records.findIndex((entry) => entry.key === key);
     if (existingIndex !== -1) {
       this.records.splice(existingIndex, 1);
     }
-    this.records.unshift(record);
+    this.records.unshift({ key, record });
     if (this.records.length > this.limit) {
       this.records.length = this.limit;
     }
     return record;
   }
 
-  patch(requestId: string, patch: Partial<NetworkRequestRecord>): NetworkRequestRecord | null {
-    const record = this.records.find((entry) => entry.requestId === requestId);
-    if (!record) return null;
-    Object.assign(record, patch);
-    return record;
+  patch(key: string, patch: Partial<NetworkRequestRecord>): NetworkRequestRecord | null {
+    const entry = this.records.find((candidate) => candidate.key === key);
+    if (!entry) return null;
+    Object.assign(entry.record, patch);
+    return entry.record;
+  }
+
+  /** Best-effort adapter for observers that only see the public wire request id. */
+  patchLatestByRequestId(requestId: string, patch: Partial<NetworkRequestRecord>): NetworkRequestRecord | null {
+    const entry = this.records.find((candidate) => candidate.record.requestId === requestId);
+    if (!entry) return null;
+    Object.assign(entry.record, patch);
+    return entry.record;
   }
 
   list(): NetworkRequestRecord[] {
-    return this.records.map((record) => ({ ...record }));
+    return this.records.map(({ record }) => ({ ...record }));
   }
 
   latest(): NetworkRequestRecord | null {
-    const record = this.records[0];
-    return record ? { ...record } : null;
+    const entry = this.records[0];
+    return entry ? { ...entry.record } : null;
+  }
+
+  get(requestId: string): NetworkRequestRecord | null {
+    const entry = this.records.find((candidate) => candidate.record.requestId === requestId);
+    return entry ? { ...entry.record } : null;
+  }
+
+  clear(): void {
+    this.records.length = 0;
   }
 }

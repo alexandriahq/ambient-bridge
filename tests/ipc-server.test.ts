@@ -1,15 +1,17 @@
 import { existsSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
+import { EventEmitter, once } from "node:events";
+import { createConnection } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { MemoryAuditSink } from "../electron/diagnostics/audit.js";
 import { PairingStore } from "../electron/ipc-server/pairing.js";
-import { encodeBinaryFrame, FrameDecoder } from "../electron/ipc-server/protocol.js";
+import { encodeBinaryFrame, encodeFrame, FrameDecoder } from "../electron/ipc-server/protocol.js";
 import { BridgeIpcServer, writeIpcHandlerResult } from "../electron/ipc-server/socket.js";
 
 describe("Bridge IPC server socket lifecycle", () => {
-  it("rebinds the socket after the file is externally removed", async () => {
+  it.skipIf(process.platform === "win32")("rebinds the socket after the file is externally removed", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "ambient-bridge-ipc-rebind-"));
     const server = new BridgeIpcServer({
       audit: new MemoryAuditSink(),
@@ -35,7 +37,113 @@ describe("Bridge IPC server socket lifecycle", () => {
       await rm(dir, { force: true, recursive: true });
     }
   });
+
+  it("starts and stops idempotently", async () => {
+    const dir = process.platform === "win32"
+      ? null
+      : await mkdtemp(path.join(os.tmpdir(), "ambient-bridge-ipc-idempotent-"));
+    const server = new BridgeIpcServer({
+      audit: new MemoryAuditSink(),
+      handlers: { "bridge.health": async () => ({ ok: true }) },
+      pairingStore: new PairingStore(),
+      socketPath: testSocketPath(dir, "idempotent"),
+    });
+
+    try {
+      await Promise.all([server.start(), server.start()]);
+      const client = createConnection(server.socketPath);
+      await once(client, "connect");
+      client.destroy();
+      await Promise.all([server.stop(), server.stop()]);
+      await server.stop();
+    } finally {
+      await server.stop();
+      if (dir) await rm(dir, { force: true, recursive: true });
+    }
+  });
+
+  it("restarts when start races an in-progress stop", async () => {
+    const dir = process.platform === "win32"
+      ? null
+      : await mkdtemp(path.join(os.tmpdir(), "ambient-bridge-ipc-restart-race-"));
+    const server = new BridgeIpcServer({
+      audit: new MemoryAuditSink(),
+      handlers: { "bridge.health": async () => ({ ok: true }) },
+      pairingStore: new PairingStore(),
+      socketPath: testSocketPath(dir, "restart-race"),
+    });
+
+    try {
+      await server.start();
+      const firstClient = createConnection(server.socketPath);
+      firstClient.on("error", () => undefined);
+      await once(firstClient, "connect");
+
+      await Promise.all([server.stop(), server.start()]);
+
+      const secondClient = createConnection(server.socketPath);
+      await once(secondClient, "connect");
+      secondClient.destroy();
+    } finally {
+      await server.stop();
+      if (dir) await rm(dir, { force: true, recursive: true });
+    }
+  });
+
+  it("stops with a live status stream and signals socketClosed", async () => {
+    const dir = process.platform === "win32"
+      ? null
+      : await mkdtemp(path.join(os.tmpdir(), "ambient-bridge-ipc-live-stream-"));
+    let socketClosedObserved!: () => void;
+    const socketClosedWasObserved = new Promise<void>((resolve) => {
+      socketClosedObserved = resolve;
+    });
+    const server = new BridgeIpcServer({
+      audit: new MemoryAuditSink(),
+      handlers: {
+        "bridge.statusSubscribe": async function* (_frame, context) {
+          yield { status: "ready" };
+          await context.socketClosed;
+          socketClosedObserved();
+        },
+      },
+      pairingStore: new PairingStore(),
+      publicMethods: new Set(["bridge.statusSubscribe"]),
+      socketPath: testSocketPath(dir, "live-stream"),
+    });
+
+    try {
+      await server.start();
+      const client = createConnection(server.socketPath);
+      client.on("error", () => undefined);
+      await once(client, "connect");
+      client.write(encodeFrame({ type: "request", id: "status-1", method: "bridge.statusSubscribe" }));
+      await once(client, "data");
+
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      const outcome = await Promise.race([
+        server.stop().then(() => "stopped"),
+        new Promise<string>((resolve) => {
+          timeout = setTimeout(() => resolve("timed-out"), 1_000);
+        }),
+      ]);
+      if (timeout) clearTimeout(timeout);
+      expect(outcome).toBe("stopped");
+      await socketClosedWasObserved;
+      expect(client.destroyed).toBe(true);
+    } finally {
+      await server.stop();
+      if (dir) await rm(dir, { force: true, recursive: true });
+    }
+  });
 });
+
+function testSocketPath(dir: string | null, suffix: string): string {
+  if (process.platform === "win32") {
+    return `\\\\.\\pipe\\ambient-bridge-ipc-${suffix}-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  }
+  return path.join(dir!, "bridge.sock");
+}
 
 describe("Bridge IPC server result writer", () => {
   it("decodes binary upload frames", () => {
@@ -78,6 +186,110 @@ describe("Bridge IPC server result writer", () => {
       { event: "delta", id: "req_stream", payload: { kind: "openai.response.chunk", data: "two" }, type: "stream" },
       { event: "end", id: "req_stream", type: "stream" },
     ]);
+  });
+
+  it("pauses a response stream until a backpressured socket drains", async () => {
+    const chunks: Buffer[] = [];
+    const events = new EventEmitter();
+    let writes = 0;
+    let pulls = 0;
+    let releaseBackpressure!: () => void;
+    const backpressureObserved = new Promise<void>((resolve) => {
+      releaseBackpressure = resolve;
+    });
+    const socket = Object.assign(events, {
+      destroyed: false,
+      writableEnded: false,
+      write: (chunk: Uint8Array | string) => {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        writes += 1;
+        if (writes === 2) {
+          releaseBackpressure();
+          return false;
+        }
+        return true;
+      },
+    });
+
+    const pending = writeIpcHandlerResult({
+      audit: new MemoryAuditSink(),
+      frame: { id: "req_slow_reader", method: "inference.responses" },
+      result: (async function* () {
+        pulls += 1;
+        yield { data: "one" };
+        pulls += 1;
+        yield { data: "two" };
+      })(),
+      socket,
+    });
+
+    await backpressureObserved;
+    await Promise.resolve();
+    expect(pulls).toBe(1);
+    expect(writes).toBe(2);
+
+    events.emit("drain");
+    await pending;
+
+    expect(pulls).toBe(2);
+    const decoder = new FrameDecoder();
+    expect(chunks.flatMap((chunk) => decoder.push(chunk))).toEqual([
+      { event: "start", id: "req_slow_reader", type: "stream" },
+      { event: "delta", id: "req_slow_reader", payload: { data: "one" }, type: "stream" },
+      { event: "delta", id: "req_slow_reader", payload: { data: "two" }, type: "stream" },
+      { event: "end", id: "req_slow_reader", type: "stream" },
+    ]);
+  });
+
+  it("cancels a backpressured response stream when the socket closes", async () => {
+    const audit = new MemoryAuditSink();
+    const events = new EventEmitter();
+    let writes = 0;
+    let iteratorFinalized = false;
+    let releaseBackpressure!: () => void;
+    const backpressureObserved = new Promise<void>((resolve) => {
+      releaseBackpressure = resolve;
+    });
+    const socket = Object.assign(events, {
+      destroyed: false,
+      writableEnded: false,
+      write: () => {
+        writes += 1;
+        if (writes === 2) {
+          releaseBackpressure();
+          return false;
+        }
+        return true;
+      },
+    });
+
+    const pending = writeIpcHandlerResult({
+      audit,
+      frame: { id: "req_disconnected_reader", method: "inference.responses" },
+      result: (async function* () {
+        try {
+          yield { data: "one" };
+          yield { data: "two" };
+        } finally {
+          iteratorFinalized = true;
+        }
+      })(),
+      socket,
+    });
+
+    await backpressureObserved;
+    socket.destroyed = true;
+    events.emit("close");
+    await pending;
+
+    expect(iteratorFinalized).toBe(true);
+    expect(writes).toBe(2);
+    expect(audit.recent()).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        name: "ipc.stream_cancelled",
+        fields: expect.objectContaining({ reason: "connection_closed" }),
+      }),
+    ]));
   });
 
   it("returns the sanitized stream failure message to the requester", async () => {

@@ -81,6 +81,8 @@ describe("NetworkRequestHistory", () => {
     expect(record.encryption).toBe("ehbp");
     expect(record.status).toBe("active");
     expect(record.usage).toBeNull();
+    expect(record.responseHeadersAt).toBeNull();
+    expect(record.firstChunkAt).toBeNull();
   });
 
   it("re-starting the same request id de-duplicates and moves it to the front", () => {
@@ -119,5 +121,27 @@ describe("NetworkRequestHistory", () => {
     start(history, "a");
     expect(history.patch("missing", { status: "failed" })).toBeNull();
     expect(history.latest()?.status).toBe("active");
+  });
+
+  it("isolates identical external request ids by an internal owner key", () => {
+    const history = new NetworkRequestHistory();
+    const input = {
+      feature: "inference.responses",
+      model: "gpt",
+      path: "/v1/responses" as const,
+      requestId: "same-id",
+      startedAt: 1,
+    };
+    history.start(input, "client-a:same-id");
+    history.start({ ...input, startedAt: 2 }, "client-b:same-id");
+
+    history.patch("client-a:same-id", { status: "cancelled", completedAt: 3 });
+
+    const records = history.list();
+    expect(records).toHaveLength(2);
+    expect(records.map((record) => record.requestId)).toEqual(["same-id", "same-id"]);
+    expect(records.map((record) => record.status)).toEqual(["active", "cancelled"]);
+    history.patchLatestByRequestId("same-id", { wireCaptured: true });
+    expect(history.list().map((record) => record.wireCaptured)).toEqual([true, false]);
   });
 });

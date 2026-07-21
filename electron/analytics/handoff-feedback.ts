@@ -16,9 +16,10 @@ export type HandoffFeedbackForwarderOptions = {
   audit: AuditSink;
   readSession: () => Promise<WorkOsSession>;
   refreshSession: (session: SignedInWorkOsSession) => Promise<WorkOsSession>;
-  onUnauthorized: (reason: string) => Promise<void>;
+  onUnauthorized: (reason: string, session: SignedInWorkOsSession) => Promise<boolean>;
   onResponse?: (response: Response) => Promise<void>;
   fetchImpl?: typeof fetch;
+  timeoutMs?: number;
 };
 
 /**
@@ -45,6 +46,8 @@ export async function forwardHandoffFeedback(
   }
 
   const fetchImpl = options.fetchImpl ?? fetch;
+  const timeoutMs = options.timeoutMs ?? 15_000;
+  const timeoutSignal = AbortSignal.timeout(timeoutMs);
   try {
     const response = await fetchImpl(new URL(HANDOFF_FEEDBACK_ANALYTICS_PATH, options.serverBaseUrl), {
       body: JSON.stringify(payload),
@@ -54,14 +57,23 @@ export async function forwardHandoffFeedback(
         "Content-Type": "application/json",
       },
       method: "POST",
+      signal: timeoutSignal,
     });
     await options.onResponse?.(response);
-    const body = (await response.json().catch(() => null)) as Record<string, unknown> | null;
+    let body: Record<string, unknown> | null;
+    try {
+      body = (await response.json()) as Record<string, unknown>;
+    } catch {
+      if (timeoutSignal.aborted) {
+        throw new Error(`Ambient analytics request timed out after ${timeoutMs} ms.`);
+      }
+      body = null;
+    }
 
     if (!response.ok) {
       options.audit.record("analytics.handoff_feedback_failed", { requestId, status: response.status });
       if (response.status === 401) {
-        await options.onUnauthorized("analytics handoff feedback request returned 401");
+        await options.onUnauthorized("analytics handoff feedback request returned 401", session);
       }
       const serverError = body && typeof body.error === "string" ? body.error : null;
       return {

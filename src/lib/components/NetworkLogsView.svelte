@@ -1,333 +1,489 @@
 <script lang="ts">
-  import { ChevronRight, LockKeyhole, RefreshCw } from "@lucide/svelte";
+  import { Button, Card, Dialog, Icon, Pill, cn } from "@ambient/shared/design";
   import type {
-    BridgeActivityEvent,
     BridgeInferenceRequestStatus,
     BridgeStatus,
     BridgeWireCapture,
   } from "../bridge-api";
-  import {
-    eventCategory,
-    formatBytes,
-    formatClock,
-    formatDuration,
-    formatEventFields,
-    formatRelative,
-    hexDump,
-    hostFromOrigin,
-    humanizeEventName,
-    routeLabel,
-    truncate,
-  } from "../format";
+  import { formatBytes, formatDuration, formatRelative, routeLabel } from "../format";
+  import { statusDotClass } from "../status-dot";
 
-  let {
-    status,
-    now,
-    loadWire,
-  }: {
-    status: BridgeStatus;
-    now: number;
-    loadWire: (requestId: string) => Promise<BridgeWireCapture | null>;
-  } = $props();
+  let { status, now }: { status: BridgeStatus; now: number } = $props();
 
-  let expanded = $state<Record<string, boolean>>({});
-  let activeCategory = $state<string>("all");
-  let wireById = $state<Record<string, BridgeWireCapture | null>>({});
-  let wireLoading = $state<Record<string, boolean>>({});
-
-  const WIRE_DUMP_BYTES = 1024;
-
-  const requests = $derived(status.inference.requests);
-  const activity = $derived(status.activity);
-
-  const categories = $derived([
-    "all",
-    ...Array.from(new Set(activity.map((event) => eventCategory(event.name)))).sort(),
-  ]);
-
-  const filteredActivity = $derived(
-    activeCategory === "all"
-      ? activity
-      : activity.filter((event) => eventCategory(event.name) === activeCategory),
+  let detailsOpen = $state(false);
+  let selectedRequestId = $state<string | null>(null);
+  let selectedRequestSnapshot = $state<BridgeInferenceRequestStatus | null>(null);
+  const selectedRequestLive = $derived(
+    status.inference.requests.find((request) => request.requestId === selectedRequestId) ?? null,
   );
-
-  const verifiedRequests = $derived(
-    requests.filter((request) => request.attestation === "verified").length,
+  const selectedRequest = $derived(
+    selectedRequestLive ?? selectedRequestSnapshot,
   );
+  let wireCapture = $state<BridgeWireCapture | null>(null);
+  let wireCaptureState = $state<"idle" | "available" | "evicted" | "not_captured" | "pending">("idle");
+  let wireCaptureLoading = $state(false);
+  let wireCaptureError = $state<string | null>(null);
+  let wireCaptureLookupKey = $state<string | null>(null);
+  let cipherIdentity = $state<{ fingerprint: string; randomart: string } | null>(null);
+  let rawCopyState = $state<"idle" | "copied" | "failed">("idle");
+  let detailsScrolling = $state(false);
+  let detailsScrollTimeout: ReturnType<typeof setTimeout> | null = null;
+  let detailsThumbHeight = $state(32);
+  let detailsThumbTop = $state(0);
+  let detailsCanScroll = $state(false);
+  let wireCaptureLoadSequence = 0;
 
-  function toggle(request: BridgeInferenceRequestStatus): void {
-    const open = !expanded[request.requestId];
-    expanded = { ...expanded, [request.requestId]: open };
-    if (open && request.wireCaptured && wireById[request.requestId] === undefined) {
-      void loadWireFor(request.requestId);
-    }
-  }
+  $effect(() => () => {
+    if (detailsScrollTimeout) clearTimeout(detailsScrollTimeout);
+  });
 
-  async function loadWireFor(requestId: string): Promise<void> {
-    wireLoading = { ...wireLoading, [requestId]: true };
-    try {
-      wireById = { ...wireById, [requestId]: await loadWire(requestId) };
-    } finally {
-      wireLoading = { ...wireLoading, [requestId]: false };
-    }
-  }
+  $effect(() => {
+    if (!detailsOpen || !selectedRequest) return;
+    const lookupKey = `${selectedRequest.requestId}:${selectedRequest.status}:${selectedRequest.wireCaptured}:${status.inference.wireCaptureRevision}`;
+    if (wireCaptureLookupKey === lookupKey) return;
+    void loadWireCapture(selectedRequest.requestId, lookupKey);
+  });
 
-  function latencyMs(request: BridgeInferenceRequestStatus): number {
+  $effect(() => {
+    if (!detailsOpen || !selectedRequestId || selectedRequestLive) return;
+    closeInspector();
+  });
+
+  $effect(() => {
+    if (detailsOpen) return;
+    releaseInspector();
+  });
+
+  function latency(request: BridgeInferenceRequestStatus): number {
     return (request.completedAt ?? now) - request.startedAt;
   }
 
-  function statusLabel(request: BridgeInferenceRequestStatus): string {
+  function requestStatus(request: BridgeInferenceRequestStatus): string {
     if (request.status === "active") return "In flight";
-    if (request.statusCode) return `${request.status} · ${request.statusCode}`;
-    return request.status;
+    return request.statusCode ? `${request.status} · ${request.statusCode}` : request.status;
   }
 
-  function attestationLabel(state: BridgeInferenceRequestStatus["attestation"]): string {
-    if (state === "verified") return "Attested enclave";
-    if (state === "failed") return "Attestation failed";
-    return "Verifying enclave";
+  function statusTone(request: BridgeInferenceRequestStatus): string {
+    if (request.status === "failed" || request.status === "cancelled") return "text-danger";
+    if (request.status === "active") return "text-success";
+    return "text-ink-secondary";
   }
 
-  function traceEvents(requestId: string): BridgeActivityEvent[] {
-    return activity.filter((event) => event.fields.requestId === requestId);
+  function formatTimestamp(value: number | null): string {
+    if (value === null) return "—";
+    return new Intl.DateTimeFormat(undefined, {
+      dateStyle: "medium",
+      timeStyle: "medium",
+    }).format(value);
+  }
+
+  function base64Bytes(value: string): Uint8Array {
+    const binary = atob(value);
+    return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  }
+
+  function randomart(bytes: Uint8Array): string {
+    const width = 17;
+    const height = 9;
+    const board = Array.from({ length: height }, () => Array<number>(width).fill(0));
+    const symbols = " .o+=*BOX@%&#/^";
+    const startX = Math.floor(width / 2);
+    const startY = Math.floor(height / 2);
+    let x = startX;
+    let y = startY;
+
+    for (const byte of bytes) {
+      for (let shift = 0; shift < 8; shift += 2) {
+        const direction = (byte >> shift) & 3;
+        x = Math.max(0, Math.min(width - 1, x + (direction & 1 ? 1 : -1)));
+        y = Math.max(0, Math.min(height - 1, y + (direction & 2 ? 1 : -1)));
+        board[y][x] += 1;
+      }
+    }
+
+    const rows = board.map((row) => row.map((visits) => symbols[Math.min(visits, symbols.length - 1)]).join(""));
+    rows[startY] = `${rows[startY].slice(0, startX)}S${rows[startY].slice(startX + 1)}`;
+    rows[y] = `${rows[y].slice(0, x)}E${rows[y].slice(x + 1)}`;
+    return rows.join("\n");
+  }
+
+  async function analyzeCiphertext(base64: string): Promise<{ fingerprint: string; randomart: string }> {
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", base64Bytes(base64)));
+    const digestBinary = Array.from(digest, (byte) => String.fromCharCode(byte)).join("");
+    return {
+      fingerprint: `SHA256:${btoa(digestBinary).replace(/=+$/, "")}`,
+      randomart: randomart(digest),
+    };
+  }
+
+  function wireHeader(name: string): string {
+    return wireCapture?.request.headers.find((header) => header.name === name)?.value ?? "—";
+  }
+
+  function handleDetailsScroll(event: Event): void {
+    const scroller = event.currentTarget as HTMLElement;
+    const scrollRange = scroller.scrollHeight - scroller.clientHeight;
+    detailsCanScroll = scrollRange > 0;
+    detailsThumbHeight = Math.max(32, (scroller.clientHeight / scroller.scrollHeight) * scroller.clientHeight);
+    const thumbRange = scroller.clientHeight - detailsThumbHeight;
+    detailsThumbTop = scrollRange > 0 ? (scroller.scrollTop / scrollRange) * thumbRange : 0;
+    detailsScrolling = true;
+    if (detailsScrollTimeout) clearTimeout(detailsScrollTimeout);
+    detailsScrollTimeout = setTimeout(() => {
+      detailsScrolling = false;
+      detailsScrollTimeout = null;
+    }, 700);
+  }
+
+  async function copyRawPayload(): Promise<void> {
+    if (!wireCapture || !selectedRequest) return;
+    const requestId = selectedRequest.requestId;
+    try {
+      const result = await window.ambientBridge?.copyWirePayload(requestId);
+      if (!detailsOpen || selectedRequestId !== requestId) return;
+      if (!result || result.status !== "copied") {
+        if (result?.status === "evicted" || result?.status === "not_captured" || result?.status === "pending") {
+          wireCaptureState = result.status;
+          wireCapture = null;
+          cipherIdentity = null;
+        }
+        throw new Error("Clipboard unavailable");
+      }
+      rawCopyState = "copied";
+    } catch {
+      if (!detailsOpen || selectedRequestId !== requestId) return;
+      rawCopyState = "failed";
+    }
+  }
+
+  function retryWireCapture(): void {
+    wireCaptureError = null;
+    wireCaptureLookupKey = null;
+  }
+
+  async function loadWireCapture(requestId: string, lookupKey: string): Promise<void> {
+    const loadSequence = ++wireCaptureLoadSequence;
+    const preserveCurrentCapture = wireCapture?.requestId === requestId;
+    wireCaptureLookupKey = lookupKey;
+    if (!preserveCurrentCapture) {
+      wireCapture = null;
+      cipherIdentity = null;
+    }
+    rawCopyState = "idle";
+    wireCaptureError = null;
+    wireCaptureLoading = !preserveCurrentCapture;
+    try {
+      const result = await window.ambientBridge?.getWireCapture(requestId);
+      if (loadSequence !== wireCaptureLoadSequence || !detailsOpen || selectedRequestId !== requestId) return;
+      wireCaptureState = result?.state ?? "not_captured";
+      if (result?.state === "available") {
+        const nextIdentity = await analyzeCiphertext(result.capture.request.body.base64);
+        if (loadSequence !== wireCaptureLoadSequence || !detailsOpen || selectedRequestId !== requestId) return;
+        wireCapture = result.capture;
+        cipherIdentity = nextIdentity;
+      } else {
+        wireCapture = null;
+        cipherIdentity = null;
+      }
+    } catch (cause) {
+      if (loadSequence !== wireCaptureLoadSequence || !detailsOpen || selectedRequestId !== requestId) return;
+      wireCapture = null;
+      cipherIdentity = null;
+      wireCaptureError = cause instanceof Error ? cause.message : "Could not load the captured payload.";
+    } finally {
+      if (loadSequence === wireCaptureLoadSequence) wireCaptureLoading = false;
+    }
+  }
+
+  function inspectRequest(request: BridgeInferenceRequestStatus): void {
+    releaseInspector();
+    selectedRequestId = request.requestId;
+    selectedRequestSnapshot = request;
+    detailsOpen = true;
+  }
+
+  function closeInspector(): void {
+    detailsOpen = false;
+    releaseInspector();
+  }
+
+  function releaseInspector(): void {
+    wireCaptureLoadSequence += 1;
+    selectedRequestId = null;
+    selectedRequestSnapshot = null;
+    wireCaptureLookupKey = null;
+    wireCaptureState = "idle";
+    wireCapture = null;
+    cipherIdentity = null;
+    rawCopyState = "idle";
+    wireCaptureError = null;
+    wireCaptureLoading = false;
   }
 </script>
 
-<section class="net-view" aria-label="Network logs">
-  <header class="net-intro">
-    <h2 class="net-intro-title">
-      <LockKeyhole size={16} aria-hidden="true" />
-      Encrypted traffic
-    </h2>
-    <p>
-      Every request is sealed on this device (EHBP / HPKE) and decrypts only inside the attested
-      Tinfoil enclave — neither Bridge nor the Ambient server can read it.
-    </p>
-    <dl class="net-metrics">
-      <div>
-        <dd>{status.inference.activeRequests}</dd>
-        <dt>In flight</dt>
-      </div>
-      <div>
-        <dd>{requests.length}</dd>
-        <dt>Requests</dt>
-      </div>
-      <div>
-        <dd>{verifiedRequests}/{requests.length}</dd>
-        <dt>Attested</dt>
-      </div>
-      <div>
-        <dd title={status.inference.serverOrigin}>{hostFromOrigin(status.inference.serverOrigin)}</dd>
-        <dt>Enclave via</dt>
-      </div>
-    </dl>
+<section class="flex h-full min-h-0 flex-col gap-4" aria-label="Requests">
+  <header class="flex flex-none items-end justify-between gap-4">
+    <div>
+      <h1 class="text-2xl font-semibold tracking-tight text-ink">Requests</h1>
+      <p class="mt-1 text-sm text-ink-tertiary">Encrypted inference traffic through this Bridge.</p>
+    </div>
+    <Pill tone="soft" class="text-success"><Icon name="lock" size={12} /> EHBP / HPKE</Pill>
   </header>
 
-  <section class="net-block" aria-labelledby="transfers-title">
-    <h3 id="transfers-title" class="net-label">Outbound inference</h3>
-
-    {#if requests.length === 0}
-      <p class="empty-line">No data has left this device yet.</p>
-    {:else}
-      <ol class="request-log">
-        {#each requests as request (request.requestId)}
-          <li class="request-item" data-status={request.status}>
-            <button
-              type="button"
-              class="request-row"
-              aria-expanded={Boolean(expanded[request.requestId])}
-              onclick={() => toggle(request)}
-            >
-              <span class="chevron" data-open={Boolean(expanded[request.requestId])} aria-hidden="true">
-                <ChevronRight size={14} />
-              </span>
-              <span class="status-dot" data-state={request.status} aria-hidden="true"></span>
-              <span class="route-badge">{routeLabel(request.path)}</span>
-              <span class="request-model" title={request.model ?? undefined}>{request.model ?? "—"}</span>
-              <span class="seal-chip" data-state={request.attestation} title={attestationLabel(request.attestation)}>
-                <LockKeyhole size={11} aria-hidden="true" />EHBP
-              </span>
-              <span class="request-meta">
-                <span class="request-status">{statusLabel(request)}</span>
-                <span class="request-num">{formatDuration(latencyMs(request))}</span>
-                <span class="request-num">{formatBytes(request.requestBytes)}</span>
-                <time>{formatRelative(request.startedAt, now)}</time>
-              </span>
-            </button>
-
-            {#if expanded[request.requestId]}
-              <div class="request-detail">
-                <div class="spec">
-                  <div class="spec-head">
-                    <span class="spec-label">Encryption envelope</span>
-                    <span class="attest" data-state={request.attestation}>{attestationLabel(request.attestation)}</span>
-                  </div>
-                  <p class="sealed-line">
-                    Body sealed with HPKE before egress — Bridge cannot read it.
-                    <strong>{formatBytes(request.requestBytes)}</strong> sealed.
-                  </p>
-                  <dl class="kv">
-                    <div><dt>Scheme</dt><dd>EHBP (HPKE) · decrypts only in enclave</dd></div>
-                    <div><dt>Route</dt><dd>{request.path}</dd></div>
-                    <div><dt>Request id</dt><dd class="mono">{request.requestId}</dd></div>
-                    {#if request.ehbpResponseNonce}
-                      <div><dt>Response nonce</dt><dd class="mono">{request.ehbpResponseNonce}</dd></div>
-                    {/if}
-                    {#if request.tinfoilRequestId}
-                      <div><dt>Enclave req</dt><dd class="mono">{request.tinfoilRequestId}</dd></div>
-                    {/if}
-                    {#if request.usage}
-                      <div>
-                        <dt>Tokens</dt>
-                        <dd>{request.usage.totalTokens} total · {request.usage.promptTokens} in / {request.usage.completionTokens} out</dd>
-                      </div>
-                    {/if}
-                    <div><dt>Started</dt><dd>{formatClock(request.startedAt)}</dd></div>
-                  </dl>
-                  {#if request.error}
-                    <p class="error-text">{truncate(request.error, 200)}</p>
-                  {/if}
-                </div>
-
-                {#if traceEvents(request.requestId).length > 0}
-                  <div class="spec">
-                    <span class="spec-label">Trace</span>
-                    <ol class="trace-list" aria-label="Request trace">
-                      {#each traceEvents(request.requestId) as event}
-                        <li>
-                          <time>{formatClock(event.at)}</time>
-                          <span>{humanizeEventName(event.name)}</span>
-                        </li>
-                      {/each}
-                    </ol>
-                  </div>
-                {/if}
-
-                {#if request.wireCaptured}
-                  {@const wire = wireById[request.requestId]}
-                  <div class="spec">
-                    <div class="spec-head">
-                      <span class="spec-label">On the wire</span>
-                      <span class="spec-note">exact bytes sent to {hostFromOrigin(status.inference.serverOrigin)} · unreadable without the enclave key</span>
-                      <button
-                        type="button"
-                        class="spec-refresh"
-                        title="Refresh capture"
-                        aria-label="Refresh wire capture"
-                        disabled={Boolean(wireLoading[request.requestId])}
-                        onclick={() => loadWireFor(request.requestId)}
-                      >
-                        <span class:spin={Boolean(wireLoading[request.requestId])}>
-                          <RefreshCw size={12} aria-hidden="true" />
-                        </span>
-                      </button>
-                    </div>
-
-                    {#if wire === undefined || (wireLoading[request.requestId] && !wire)}
-                      <p class="hint">Reading captured bytes…</p>
-                    {:else if !wire}
-                      <p class="hint">This capture is no longer retained (only the most recent requests keep raw bytes).</p>
-                    {:else}
-                      {@const reqDump = hexDump(wire.request.body.base64, WIRE_DUMP_BYTES)}
-                      <div class="wire-part">
-                        <p class="wire-line">
-                          <span class="wire-verb">{wire.request.method}</span>{wire.request.url}
-                        </p>
-                        <dl class="kv">
-                          {#each wire.request.headers as header}
-                            <div>
-                              <dt>{header.name}</dt>
-                              <dd class="mono">{truncate(header.value, 96)}</dd>
-                            </div>
-                          {/each}
-                        </dl>
-                        <p class="wire-bytes-label">
-                          Sealed request body ·
-                          {formatBytes(wire.request.body.byteLength ?? wire.request.body.capturedBytes)}{wire.request.body.truncated ? "+" : ""}
-                        </p>
-                        {#if reqDump.text}
-                          <pre class="hexdump">{reqDump.text}</pre>
-                          {#if reqDump.total > reqDump.shown}
-                            <p class="hint">Showing first {reqDump.shown} of {reqDump.total}{wire.request.body.truncated ? "+" : ""} captured bytes.</p>
-                          {/if}
-                        {:else}
-                          <p class="hint">No request body.</p>
-                        {/if}
-                      </div>
-
-                      {#if wire.response}
-                        {@const respDump = hexDump(wire.response.body.base64, WIRE_DUMP_BYTES)}
-                        <div class="wire-part">
-                          <p class="wire-line">
-                            <span class="wire-verb">←</span>HTTP {wire.response.status}
-                          </p>
-                          <dl class="kv">
-                            {#each wire.response.headers as header}
-                              <div>
-                                <dt>{header.name}</dt>
-                                <dd class="mono">{truncate(header.value, 96)}</dd>
-                              </div>
-                            {/each}
-                          </dl>
-                          <p class="wire-bytes-label">
-                            Encrypted response body ·
-                            {formatBytes(wire.response.body.byteLength ?? wire.response.body.capturedBytes)}{wire.response.body.truncated ? "+" : ""}
-                          </p>
-                          {#if respDump.text}
-                            <pre class="hexdump">{respDump.text}</pre>
-                            {#if respDump.total > respDump.shown}
-                              <p class="hint">Showing first {respDump.shown} of {respDump.total}{wire.response.body.truncated ? "+" : ""} captured bytes.</p>
-                            {/if}
-                          {/if}
-                        </div>
-                      {:else}
-                        <p class="hint">Encrypted response not captured yet — refresh after it completes.</p>
-                      {/if}
-                    {/if}
-                  </div>
-                {/if}
-              </div>
-            {/if}
-          </li>
-        {/each}
-      </ol>
-    {/if}
-  </section>
-
-  <section class="net-block" aria-labelledby="stream-title">
-    <div class="net-block-head">
-      <h3 id="stream-title" class="net-label">Event stream</h3>
-      <div class="filter-chips" role="group" aria-label="Filter events by category">
-        {#each categories as category (category)}
-          <button
-            type="button"
-            class="filter-chip"
-            data-active={activeCategory === category}
-            onclick={() => (activeCategory = category)}
-          >
-            {category}
-          </button>
-        {/each}
-      </div>
+  <section class="flex min-h-0 flex-1 flex-col gap-2" aria-labelledby="request-list-title">
+    <div class="flex flex-none items-center justify-between px-1">
+      <h2 id="request-list-title" class="text-sm font-semibold text-ink">All requests</h2>
+      <span class="tnum text-xs text-ink-faint">{status.inference.requests.length} total</span>
     </div>
 
-    {#if filteredActivity.length === 0}
-      <p class="empty-line">No events recorded yet.</p>
-    {:else}
-      <ol class="event-stream">
-        {#each filteredActivity as event}
-          <li data-level={event.fields.level ?? "info"}>
-            <time>{formatClock(event.at)}</time>
-            <span class="event-cat">{eventCategory(event.name)}</span>
-            <div class="event-body">
-              <strong>{humanizeEventName(event.name)}</strong>
-              {#if formatEventFields(event)}
-                <p title={formatEventFields(event)}>{truncate(formatEventFields(event), 160)}</p>
-              {/if}
-            </div>
-          </li>
-        {/each}
-      </ol>
-    {/if}
+    <Card class="min-h-0 flex-1 overflow-hidden p-0">
+      {#if status.inference.requests.length === 0}
+        <div class="grid h-full place-items-center px-5 text-center">
+          <div>
+            <Icon name="lock" size={20} class="mx-auto text-ink-faint" />
+            <p class="mt-2 text-sm font-medium text-ink">No inference traffic yet</p>
+            <p class="mt-1 text-xs text-ink-tertiary">Requests will appear here as they pass through the Bridge.</p>
+          </div>
+        </div>
+      {:else}
+        <ol class="h-full overflow-y-auto overscroll-contain divide-y divide-line" data-testid="request-list">
+          {#each status.inference.requests as request (request.requestId)}
+            <li>
+              <button
+                type="button"
+                class="group grid min-h-16 w-full cursor-pointer grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-3 px-4 py-3 text-left transition-colors hover:bg-ink/[0.035] focus-visible:bg-ink/[0.05] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary/40"
+                aria-label={`Inspect ${routeLabel(request.path)} request ${request.requestId}`}
+                onclick={() => inspectRequest(request)}
+              >
+                <span class={cn("size-2 rounded-full ring-[3px]", statusDotClass(request.status))} aria-hidden="true"></span>
+                <div class="min-w-0">
+                  <div class="flex min-w-0 items-baseline gap-2">
+                    <strong class="flex-none text-sm font-medium text-ink">{routeLabel(request.path)}</strong>
+                    <span class="truncate font-mono text-xs text-ink-tertiary">{request.model ?? "—"}</span>
+                  </div>
+                  <div class="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-ink-faint">
+                    <span class="font-mono">{request.requestId}</span>
+                    <span class="tnum">{formatDuration(latency(request))}</span>
+                    <span class="tnum">{formatBytes(request.requestBytes)}</span>
+                    <span>{formatRelative(request.startedAt, now)}</span>
+                  </div>
+                </div>
+                <div class="flex items-center gap-2">
+                  <Pill tone="soft" size="sm" class={request.attestation === "verified" ? "text-success" : request.attestation === "failed" ? "text-danger" : "text-warning"}>
+                    <Icon name="lock" size={11} /> {request.attestation === "verified" ? "Attested" : request.attestation}
+                  </Pill>
+                  <Pill tone="soft" size="sm" class={statusTone(request)} dot>{requestStatus(request)}</Pill>
+                  <span class="text-xs text-ink-faint transition-transform group-hover:translate-x-0.5" aria-hidden="true">›</span>
+                </div>
+              </button>
+            </li>
+          {/each}
+        </ol>
+      {/if}
+    </Card>
   </section>
 </section>
+
+<Dialog
+  bind:open={detailsOpen}
+  title={selectedRequest ? `${routeLabel(selectedRequest.path)} request` : "Request details"}
+  class="flex h-[calc(100dvh-3rem)] max-w-[760px] flex-col"
+  bodyClass="min-h-0 flex-1 overflow-hidden p-0"
+>
+  {#if selectedRequest}
+    <div class="relative h-full min-h-0">
+      <!-- svelte-ignore a11y_no_noninteractive_tabindex (The overflow region must be keyboard-scrollable.) -->
+      <div
+        class="request-detail-scroll h-full overflow-y-auto overscroll-contain"
+        class:is-scrolling={detailsScrolling}
+        data-testid="request-details"
+        role="region"
+        aria-label="Request details"
+        tabindex="0"
+        onscroll={handleDetailsScroll}
+      >
+      <section class="sticky top-0 z-10 border-b border-line bg-surface px-4 py-3" aria-label="Ciphertext identity" data-testid="cipher-summary">
+        {#if wireCaptureLoading}
+          <div class="grid h-[220px] place-items-center rounded-[var(--radius-lg)] border border-line bg-surface-2/50 text-sm text-ink-secondary" role="status">Building ciphertext identity…</div>
+        {:else if wireCaptureError}
+          <div class="flex items-center justify-between gap-4 rounded-[var(--radius-md)] border border-danger/30 bg-danger/[0.04] px-4 py-3 text-sm text-danger" role="alert">
+            <span>{wireCaptureError}</span>
+            <Button variant="ghost" size="sm" onclick={retryWireCapture}>Retry</Button>
+          </div>
+        {:else if wireCaptureState === "pending"}
+          <div class="rounded-[var(--radius-md)] border border-line bg-surface-2/40 px-4 py-5 text-sm text-ink-secondary" role="status">The sealed request is still being captured. This inspector will refresh automatically.</div>
+        {:else if wireCaptureState === "evicted"}
+          <div class="rounded-[var(--radius-md)] border border-line px-4 py-5 text-sm text-ink-secondary">This ciphertext was captured, but its bounded in-memory copy has since expired.</div>
+        {:else if wireCaptureState === "not_captured" || !wireCapture}
+          <div class="rounded-[var(--radius-md)] border border-line px-4 py-5 text-sm text-ink-secondary">No sealed wire payload is available for this request.</div>
+        {:else if cipherIdentity}
+          <div class="grid overflow-hidden rounded-[var(--radius-lg)] border border-line min-[600px]:grid-cols-[220px_minmax(0,1fr)]">
+            <div class="relative grid content-between overflow-hidden bg-primary p-3 text-on-primary">
+              <div class="pointer-events-none absolute -right-10 -top-10 size-32 rounded-full border border-on-primary/10"></div>
+              <div class="relative flex items-center justify-between gap-3">
+                <span class="text-2xs font-semibold uppercase tracking-[0.18em] text-on-primary/60">{wireCapture.request.body.truncated ? "Prefix cipherprint" : "Cipherprint"}</span>
+                <Icon name="lock" size={14} class="text-on-primary/60" />
+              </div>
+              <pre
+                class="relative m-0 justify-self-center font-mono text-2xs leading-[1.12] tracking-[0.12em] text-on-primary"
+                role="img"
+                aria-label={wireCapture.request.body.truncated
+                  ? "SSH-style randomart generated from the captured ciphertext prefix fingerprint"
+                  : "SSH-style randomart generated from the captured ciphertext fingerprint"}
+              >{cipherIdentity.randomart}</pre>
+              <div class="relative flex items-center justify-between gap-2 text-2xs text-on-primary/60">
+                <span>[SHA256]</span>
+                <span>EHBP · HPKE</span>
+              </div>
+            </div>
+
+            <div class="grid content-between gap-3 bg-surface p-3">
+              <div>
+                <div class="flex items-center justify-between gap-3">
+                  <span class="text-2xs font-semibold uppercase tracking-wider text-ink-faint">{wireCapture.request.body.truncated ? "Sealed request · captured prefix" : "Sealed request"}</span>
+                  <div class="flex items-center gap-1.5">
+                    {#if wireCapture.request.body.truncated}
+                      <Pill tone="soft" size="sm" class="text-warning">Truncated</Pill>
+                    {/if}
+                    <Pill tone="soft" size="sm" class={selectedRequest.attestation === "verified" ? "text-success" : selectedRequest.attestation === "failed" ? "text-danger" : "text-warning"} dot>
+                      {selectedRequest.attestation === "verified" ? "Attested" : selectedRequest.attestation}
+                    </Pill>
+                  </div>
+                </div>
+                <p class="mt-2 truncate whitespace-nowrap font-mono text-2xs tracking-tight text-ink" title={cipherIdentity.fingerprint} data-testid="cipher-fingerprint">{cipherIdentity.fingerprint}</p>
+              </div>
+
+              <dl class="grid grid-cols-2 gap-x-5 gap-y-2">
+                <div>
+                  <dt class="text-2xs text-ink-faint">Sealed payload</dt>
+                  <dd class="tnum mt-0.5 text-sm font-semibold text-ink">
+                    {wireCapture.request.body.truncated
+                      ? wireCapture.request.body.byteLength === null
+                        ? `${formatBytes(wireCapture.request.body.capturedBytes)} captured`
+                        : `${formatBytes(wireCapture.request.body.capturedBytes)} of ${formatBytes(wireCapture.request.body.byteLength)}`
+                      : formatBytes(wireCapture.request.body.byteLength)}
+                  </dd>
+                </div>
+                <div>
+                  <dt class="text-2xs text-ink-faint">Fingerprint input</dt>
+                  <dd class="tnum mt-0.5 text-sm font-semibold text-ink">{formatBytes(wireCapture.request.body.capturedBytes)}</dd>
+                </div>
+                <div>
+                  <dt class="text-2xs text-ink-faint">Encrypted response</dt>
+                  <dd class="tnum mt-0.5 text-sm font-semibold text-ink">{formatBytes(wireCapture.response?.body.byteLength)}</dd>
+                </div>
+                <div>
+                  <dt class="text-2xs text-ink-faint">Enclave request</dt>
+                  <dd class="mt-0.5 truncate font-mono text-sm font-semibold text-ink">{selectedRequest.tinfoilRequestId ?? "Pending"}</dd>
+                </div>
+              </dl>
+
+              <div class="min-w-0 border-t border-line pt-3">
+                <p class="text-2xs text-ink-faint">Encapsulated key</p>
+                <p class="mt-0.5 truncate font-mono text-2xs text-ink-secondary" title={wireHeader("ehbp-encapsulated-key")}>{wireHeader("ehbp-encapsulated-key")}</p>
+              </div>
+            </div>
+          </div>
+        {/if}
+      </section>
+
+      <div class="space-y-4 px-4 py-4">
+        <section aria-labelledby="metadata-title">
+          <h3 id="metadata-title" class="mb-2 text-2xs font-semibold uppercase tracking-wider text-ink-faint">Request metadata</h3>
+          <dl class="grid grid-cols-3 overflow-hidden rounded-[var(--radius-md)] border border-line bg-surface-2/40 text-xs">
+          <div class="min-w-0 border-b border-r border-line p-2">
+            <dt class="text-ink-faint">Route</dt>
+            <dd class="mt-1 truncate font-mono text-ink" title={selectedRequest.path}>{selectedRequest.path}</dd>
+          </div>
+          <div class="min-w-0 border-b border-r border-line p-2">
+            <dt class="text-ink-faint">Model</dt>
+            <dd class="mt-1 truncate font-mono text-ink">{selectedRequest.model ?? "—"}</dd>
+          </div>
+          <div class="min-w-0 border-b border-line p-2">
+            <dt class="text-ink-faint">Feature</dt>
+            <dd class="mt-1 truncate text-ink">{selectedRequest.feature}</dd>
+          </div>
+          <div class="min-w-0 border-r border-line p-2">
+            <dt class="text-ink-faint">Status</dt>
+            <dd class={cn("mt-1 truncate font-medium capitalize", statusTone(selectedRequest))}>{requestStatus(selectedRequest)}</dd>
+          </div>
+          <div class="min-w-0 border-r border-line p-2">
+            <dt class="text-ink-faint">Duration</dt>
+            <dd class="tnum mt-1 text-ink">{formatDuration(latency(selectedRequest))}</dd>
+          </div>
+          <div class="min-w-0 p-2">
+            <dt class="text-ink-faint">Started</dt>
+            <dd class="tnum mt-1 truncate text-ink" title={formatTimestamp(selectedRequest.startedAt)}>{formatRelative(selectedRequest.startedAt, now)}</dd>
+          </div>
+          {#if selectedRequest.usage}
+            <div class="col-span-3 flex items-center justify-between gap-3 border-t border-line px-2 py-1.5 text-2xs">
+              <dt class="text-ink-faint">Token usage</dt>
+              <dd class="tnum text-ink-secondary">{selectedRequest.usage.promptTokens} input · {selectedRequest.usage.completionTokens} output · {selectedRequest.usage.totalTokens} total</dd>
+            </div>
+          {/if}
+          </dl>
+        </section>
+
+        {#if wireCapture}
+          <section aria-labelledby="raw-payload-title">
+            <div class="mb-1.5 flex items-center justify-between gap-3">
+              <div class="min-w-0">
+                <h3 id="raw-payload-title" class="text-2xs font-semibold uppercase tracking-wider text-ink-faint">{wireCapture.request.body.truncated ? "Captured sealed payload prefix · Base64" : "Raw sealed payload · Base64"}</h3>
+                <p class={cn("mt-0.5 text-2xs", wireCapture.request.body.truncated ? "text-warning" : "text-ink-tertiary")}>
+                  {wireCapture.request.body.truncated
+                    ? wireCapture.request.body.byteLength === null
+                      ? `${formatBytes(wireCapture.request.body.capturedBytes)} captured · total size unavailable · incomplete`
+                      : `${formatBytes(wireCapture.request.body.capturedBytes)} of ${formatBytes(wireCapture.request.body.byteLength)} captured · incomplete`
+                    : `${formatBytes(wireCapture.request.body.capturedBytes)} complete capture`}
+                </p>
+              </div>
+              <Button
+                variant="ghost"
+                size="sm"
+                icon={rawCopyState === "copied" ? "check" : "clipboard"}
+                aria-label={wireCapture.request.body.truncated ? "Copy captured sealed payload prefix" : "Copy raw sealed payload"}
+                onclick={() => void copyRawPayload()}
+              >
+                {rawCopyState === "copied" ? "Copied" : rawCopyState === "failed" ? "Copy failed" : wireCapture.request.body.truncated ? "Copy prefix" : "Copy raw"}
+              </Button>
+            </div>
+            <!-- svelte-ignore a11y_no_noninteractive_tabindex (The selectable payload must be keyboard-focusable.) -->
+            <pre
+              role="region"
+              tabindex="0"
+              aria-label={wireCapture.request.body.truncated ? "Captured sealed request payload prefix in Base64" : "Raw sealed request payload in Base64"}
+              data-testid="raw-payload"
+              class="m-0 min-h-14 w-full select-text whitespace-pre-wrap break-all rounded-[var(--radius-md)] border border-line bg-ink/[0.035] px-3 py-2 font-mono text-2xs leading-4 text-ink-secondary outline-none selection:bg-primary/20 focus-visible:ring-2 focus-visible:ring-primary/40"
+            >
+              {wireCapture.request.body.base64}
+            </pre>
+          </section>
+        {/if}
+      </div>
+
+      </div>
+      <div
+        class={cn(
+          "pointer-events-none absolute right-0.5 top-0 z-20 w-3 rounded-full bg-ink-faint/50 transition-opacity duration-150",
+          detailsScrolling && detailsCanScroll ? "opacity-100" : "opacity-0",
+        )}
+        style={`height: ${detailsThumbHeight}px; transform: translateY(${detailsThumbTop}px);`}
+        data-testid="request-scroll-thumb"
+        aria-hidden="true"
+      ></div>
+    </div>
+  {/if}
+</Dialog>
+
+<style>
+  .request-detail-scroll {
+    scrollbar-gutter: auto;
+    scrollbar-width: none;
+  }
+
+  .request-detail-scroll::-webkit-scrollbar {
+    display: none;
+    width: 0;
+    height: 0;
+  }
+</style>

@@ -1,9 +1,20 @@
 <script lang="ts">
-  import { RefreshCw, UserCircle } from "@lucide/svelte";
-  import type { BridgeStatus, BridgeUpdateStatus, BridgeView } from "../lib/bridge-api";
-  import TopBar from "../lib/components/TopBar.svelte";
+  import { SessionGuardCard } from "@ambient/shared";
+  import { Button, Card } from "@ambient/shared/design";
+  import { AmbientToaster } from "@ambient/shared/notifications";
+  import { ModeWatcher } from "mode-watcher";
+  import type { BridgeExperimentalBuildsSnapshot, BridgeStatus, BridgeUpdateStatus } from "../lib/bridge-api";
+  import {
+    BRIDGE_GUARD_ACTION_CHECK_STATUS,
+    BRIDGE_GUARD_ACTION_RESTART_SIGN_IN,
+    BRIDGE_GUARD_ACTION_RETRY_REACHABILITY,
+    BRIDGE_GUARD_ACTION_SIGN_IN,
+    composeBridgeSessionGuard,
+  } from "../lib/session-guard";
+  import BridgeSettings from "../lib/components/BridgeSettings.svelte";
   import NetworkLogsView from "../lib/components/NetworkLogsView.svelte";
-  import OverviewView from "../lib/components/OverviewView.svelte";
+  import TopBar from "../lib/components/TopBar.svelte";
+  import { startBridgeUpdateNotifications } from "../lib/update-notifications";
 
   const fallbackStatus: BridgeStatus = {
     account: { kind: "signed_out" },
@@ -22,12 +33,23 @@
       responsePrivacy: "decrypts_in_bridge",
       serverAuth: "workos_session",
       serverOrigin: "unknown",
+      wireCaptureRevision: 0,
     },
     pairedClientList: [],
     pairedClients: 0,
     pairingRequests: [],
     serverReachable: false,
     serverReachability: "checking",
+    serverReachabilityCheckedAt: null,
+    serverReachabilityHttpStatus: null,
+    serverReachabilityMessage: "Server reachability has not been checked yet.",
+    serverReachabilityReason: "not_checked",
+    sessionRefresh: {
+      attempt: 0,
+      message: null,
+      nextRetryAt: null,
+      state: "ready",
+    },
     socketReady: false,
   };
 
@@ -45,25 +67,48 @@
 
   let status = $state<BridgeStatus>(fallbackStatus);
   let updateStatus = $state<BridgeUpdateStatus>(fallbackUpdateStatus);
-  let view = $state<BridgeView>("network");
   let now = $state<number>(Date.now());
-  let loading = $state(false);
+  let loading = $state(true);
+  let statusLoaded = $state(false);
+  let statusError = $state<string | null>(null);
   let authBusy = $state(false);
-  let switchingOrganizationId = $state<string | null>(null);
   let updateBusy = $state(false);
-  let pairingBusy = $state<string | null>(null);
+  let settingsOpen = $state(false);
+  let statusRefreshSequence = 0;
 
-  async function refreshStatus() {
+  const sessionGuard = $derived(composeBridgeSessionGuard({ authBusy, loading, status }));
+  const devtoolsEnabled = $derived(
+    status.account.kind === "signed_in" && status.account.featureFlags.capabilities.devtooling,
+  );
+
+  async function refreshStatus(options: { readonly reachability?: boolean } = {}) {
+    const refreshSequence = ++statusRefreshSequence;
     loading = true;
     try {
-      status = (await window.ambientBridge?.getStatus()) ?? fallbackStatus;
+      const api = window.ambientBridge;
+      if (!api) throw new Error("The Bridge runtime API is unavailable.");
+      const nextStatus = options.reachability
+        ? await api.retryReachability()
+        : await api.getStatus();
+      if (refreshSequence !== statusRefreshSequence) return;
+      status = nextStatus;
+      statusLoaded = true;
+      statusError = null;
+    } catch (cause) {
+      if (refreshSequence !== statusRefreshSequence) return;
+      statusError = cause instanceof Error ? cause.message : "Could not read Bridge status.";
     } finally {
-      loading = false;
+      if (refreshSequence === statusRefreshSequence) loading = false;
     }
   }
 
   async function refreshUpdateStatus() {
-    updateStatus = (await window.ambientBridge?.getUpdateStatus()) ?? fallbackUpdateStatus;
+    try {
+      updateStatus = (await window.ambientBridge?.getUpdateStatus()) ?? fallbackUpdateStatus;
+    } catch {
+      // Update controls retain their last known state; the main status error is
+      // surfaced separately and should not create an unhandled poll rejection.
+    }
   }
 
   async function startLogin() {
@@ -86,16 +131,6 @@
     }
   }
 
-  async function switchOrganization(organizationId: string) {
-    switchingOrganizationId = organizationId;
-    try {
-      await window.ambientBridge?.switchOrganization(organizationId);
-      await refreshStatus();
-    } finally {
-      switchingOrganizationId = null;
-    }
-  }
-
   async function checkForUpdates() {
     updateBusy = true;
     try {
@@ -114,28 +149,66 @@
     }
   }
 
-  async function completePairing(requestId: string, approved: boolean) {
-    pairingBusy = requestId;
+  async function checkForStableUpdates() {
+    const api = window.ambientBridge;
+    const checkStable = api?.checkForStableUpdates ?? api?.checkForUpdates;
+    if (!checkStable) throw new Error("Bridge main release update checks are unavailable in this window.");
+    updateBusy = true;
     try {
-      await window.ambientBridge?.completePairing(requestId, approved);
-      await refreshStatus();
+      updateStatus = await checkStable();
     } finally {
-      pairingBusy = null;
+      updateBusy = false;
     }
   }
 
-  async function revokeClient(clientId: string) {
-    pairingBusy = clientId;
+  async function listExperimentalBuilds(): Promise<BridgeExperimentalBuildsSnapshot> {
+    const api = window.ambientBridge;
+    if (!api?.listExperimentalBuilds) {
+      throw new Error("Experimental build listing is unavailable in this window.");
+    }
+    return api.listExperimentalBuilds();
+  }
+
+  async function installExperimentalBuild(releaseKey: string) {
+    const api = window.ambientBridge;
+    if (!api?.installExperimentalBuild) {
+      throw new Error("Experimental build installation is unavailable in this window.");
+    }
+    updateBusy = true;
     try {
-      await window.ambientBridge?.revokeClient(clientId);
-      await refreshStatus();
+      updateStatus = await api.installExperimentalBuild(releaseKey);
     } finally {
-      pairingBusy = null;
+      updateBusy = false;
     }
   }
 
-  function loadWireCapture(requestId: string) {
-    return window.ambientBridge?.getWireCapture(requestId) ?? Promise.resolve(null);
+  function openSettings(): void {
+    settingsOpen = true;
+    void refreshUpdateStatus();
+  }
+
+  function handleWindowKeydown(event: KeyboardEvent): void {
+    if (sessionGuard.model) return;
+    const key = event.key.toLowerCase();
+    const isComma = key === "," || event.code === "Comma";
+    const hasShortcutModifier = (event.metaKey && !event.ctrlKey) || (event.ctrlKey && !event.metaKey);
+    if (!isComma || !hasShortcutModifier || event.altKey || event.shiftKey) return;
+    event.preventDefault();
+    openSettings();
+  }
+
+  function handleGuardAction(actionId: string): void {
+    if (actionId === BRIDGE_GUARD_ACTION_SIGN_IN || actionId === BRIDGE_GUARD_ACTION_RESTART_SIGN_IN) {
+      void startLogin();
+      return;
+    }
+    if (actionId === BRIDGE_GUARD_ACTION_RETRY_REACHABILITY) {
+      void refreshStatus({ reachability: true });
+      return;
+    }
+    if (actionId === BRIDGE_GUARD_ACTION_CHECK_STATUS) {
+      void refreshStatus();
+    }
   }
 
   $effect(() => {
@@ -144,7 +217,7 @@
     const offStatusChanged = window.ambientBridge?.onStatusChanged(() => {
       void refreshStatus();
     });
-    const offUpdateStatusChanged = window.ambientBridge?.onUpdateStatusChanged((nextStatus) => {
+    const stopUpdateNotifications = startBridgeUpdateNotifications((nextStatus) => {
       updateStatus = nextStatus;
     });
     const interval = window.setInterval(() => {
@@ -155,8 +228,14 @@
     return () => {
       window.clearInterval(interval);
       offStatusChanged?.();
-      offUpdateStatusChanged?.();
+      stopUpdateNotifications();
     };
+  });
+
+  $effect(() => {
+    if (typeof window !== "undefined" && window.location.hash) {
+      window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
+    }
   });
 </script>
 
@@ -164,78 +243,82 @@
   <title>Ambient Bridge</title>
 </svelte:head>
 
-<div class="window-drag" aria-hidden="true"></div>
+<svelte:window onkeydown={handleWindowKeydown} />
+<ModeWatcher />
+<AmbientToaster />
 
-{#if status.account.kind !== "signed_in"}
-  <main class="auth-shell">
-    <section class="auth-gate" aria-labelledby="auth-title">
-      <div class="brand auth-brand">
-        <div class="brand-mark">A</div>
-        <div>
-          <h1>Ambient Bridge</h1>
-          <p>{status.appVersion}</p>
-        </div>
+{#if loading && !statusLoaded}
+  <div class="drag pointer-events-none fixed inset-x-0 top-0 z-10 h-9" aria-hidden="true"></div>
+  <main class="grid h-full w-full min-h-0 place-items-center overflow-y-auto bg-bg p-8 text-ink">
+    <Card class="w-[min(100%,560px)] p-6" role="status">
+      <h1 class="text-base font-semibold text-ink">Loading Bridge status…</h1>
+      <p class="mt-2 text-sm text-ink-secondary">Reading the local account, connection, and request state.</p>
+    </Card>
+  </main>
+{:else if statusError && !statusLoaded}
+  <div class="drag pointer-events-none fixed inset-x-0 top-0 z-10 h-9" aria-hidden="true"></div>
+  <main class="grid h-full w-full min-h-0 place-items-center overflow-y-auto bg-bg p-8 text-ink">
+    <Card class="w-[min(100%,560px)] p-6" role="alert">
+      <h1 class="text-base font-semibold text-ink">Bridge status unavailable</h1>
+      <p class="mt-2 text-sm text-ink-secondary">{statusError}</p>
+      <Button class="mt-5" size="sm" disabled={loading} onclick={() => void refreshStatus()}>{loading ? "Trying…" : "Try again"}</Button>
+    </Card>
+  </main>
+{:else if sessionGuard.model}
+  <div class="drag pointer-events-none fixed inset-x-0 top-0 z-10 h-9" aria-hidden="true"></div>
+  <main
+    class="grid h-full w-full min-h-0 place-items-center content-center gap-8 overflow-y-auto overflow-x-hidden bg-bg p-8 text-ink"
+  >
+    <div class="flex w-[min(100%,560px)] min-w-0 items-center gap-3">
+      <div
+        class="grid size-9 flex-none place-items-center rounded-[var(--radius-md)] border border-line bg-primary text-sm font-bold leading-none text-on-primary"
+      >
+        A
       </div>
-
-      <div class="auth-copy">
-        <p class="eyebrow">Account required</p>
-        <h2 id="auth-title">
-          {status.account.kind === "login_pending" ? "Complete sign-in in your browser" : "Sign in to continue"}
-        </h2>
-        {#if status.account.kind === "login_pending"}
-          <p>Bridge is waiting for the server callback.</p>
-        {:else}
-          <p>Bridge stays locked until this device is signed in.</p>
-        {/if}
-        {#if status.authError}
-          <p class="error-text auth-error">{status.authError}</p>
-        {/if}
+      <div>
+        <h1 class="text-base font-semibold text-ink">Ambient Bridge</h1>
+        <p class="text-sm text-ink-secondary">{status.appVersion}</p>
       </div>
-
-      <div class="auth-actions">
-        {#if status.account.kind === "login_pending"}
-          <button class="text-button" onclick={refreshStatus} disabled={loading || authBusy}>
-            <span class:spin={loading}>
-              <RefreshCw size={17} />
-            </span>
-            Check status
-          </button>
-        {:else}
-          <button class="primary-button" onclick={startLogin} disabled={authBusy}>
-            <UserCircle size={17} />Sign in
-          </button>
-        {/if}
-      </div>
-    </section>
+    </div>
+    <SessionGuardCard model={sessionGuard.model} onAction={handleGuardAction} />
   </main>
 {:else}
-  <main class="bridge-shell">
-    <TopBar
-      {status}
-      {updateStatus}
-      {view}
-      {authBusy}
-      {switchingOrganizationId}
-      {updateBusy}
-      onSelectView={(next) => (view = next)}
-      onSignOut={signOut}
-      onSwitchOrganization={(organizationId) => void switchOrganization(organizationId)}
-      onCheckForUpdates={checkForUpdates}
-      onInstallUpdate={installUpdate}
-    />
+  <main
+    class="flex h-full w-full min-h-0 flex-col overflow-hidden bg-surface text-ink"
+    data-testid="bridge-window-shell"
+  >
+      <TopBar
+        {status}
+        {authBusy}
+        onSignIn={startLogin}
+        onSignOut={signOut}
+        onOpenSettings={openSettings}
+      />
 
-    <div class="view-scroll">
-      {#if view === "network"}
-        <NetworkLogsView {status} {now} loadWire={loadWireCapture} />
-      {:else}
-        <OverviewView
-          {status}
-          {updateStatus}
-          {pairingBusy}
-          onCompletePairing={completePairing}
-          onRevokeClient={revokeClient}
-        />
+      {#if statusError}
+        <div class="flex flex-none items-center justify-between gap-4 border-b border-warning/25 bg-warning/[0.05] px-4 py-2 text-xs text-warning" role="alert">
+          <span>Showing the last known Bridge status. {statusError}</span>
+          <Button variant="ghost" size="sm" disabled={loading} onclick={() => void refreshStatus()}>{loading ? "Retrying…" : "Retry"}</Button>
+        </div>
       {/if}
-    </div>
+
+      <div class="min-h-0 flex-1 overflow-hidden">
+        <div class="mx-auto h-full max-w-[860px] px-7 py-6">
+          <NetworkLogsView {status} {now} />
+        </div>
+      </div>
   </main>
 {/if}
+
+<BridgeSettings
+  bind:open={settingsOpen}
+  appVersion={status.appVersion}
+  {devtoolsEnabled}
+  {updateStatus}
+  {updateBusy}
+  onCheckForUpdates={checkForUpdates}
+  onCheckForStableUpdates={checkForStableUpdates}
+  onInstallUpdate={installUpdate}
+  onListExperimentalBuilds={listExperimentalBuilds}
+  onInstallExperimentalBuild={installExperimentalBuild}
+/>

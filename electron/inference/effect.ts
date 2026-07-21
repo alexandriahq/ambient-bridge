@@ -1,11 +1,20 @@
-import { Context, Data, Effect } from "effect";
-import { SecureClient, type TransportMode } from "tinfoil";
+import { Context, Data, Effect, Schedule } from "effect";
+import { SecureClient } from "tinfoil";
 import type { AuditSink } from "../diagnostics/audit.js";
 import type { JsonValue } from "../ipc-server/protocol.js";
 import type { SignedInWorkOsSession, WorkOsSession } from "../workos/session.js";
 import { errorMessage } from "../error-message.js";
 
 export type InferenceProxyPath = "/v1/chat/completions" | "/v1/responses" | "/v1/audio/transcriptions";
+
+/**
+ * Time budget for the *response* phase of a secure inference fetch — i.e. how long
+ * we wait for the enclave to send back HTTP headers. This deliberately does NOT
+ * bound the streaming body: once the response resolves, token streaming may take as
+ * long as the model needs. Without this cap a stalled enclave fetch (seen under
+ * server-side 429 rate limiting) hangs forever and the request stays "In Flight".
+ */
+export const DEFAULT_INFERENCE_RESPONSE_TIMEOUT_MS = 120_000;
 
 export class BridgeSignedOutError extends Data.TaggedError("BridgeSignedOutError")<{
   readonly message: string;
@@ -39,7 +48,10 @@ export class BridgeAuditService extends Context.Tag("bridge/BridgeAuditService")
 
 export interface BridgeSecureClientShape {
   readonly ready: () => Effect.Effect<void, BridgeInferenceRequestError>;
-  readonly fetch: (path: InferenceProxyPath, init: RequestInit) => Effect.Effect<Response, BridgeInferenceRequestError>;
+  readonly fetch: (
+    path: InferenceProxyPath,
+    init: RequestInit,
+  ) => Effect.Effect<Response, BridgeInferenceRequestError>;
 }
 
 export class BridgeSecureClient extends Context.Tag("bridge/BridgeSecureClient")<
@@ -55,12 +67,37 @@ export type SecureClientLike = {
 export type BridgeSecureClientOptions = {
   readonly attestationBundleURL?: string;
   readonly baseURL?: string;
-  readonly configRepo?: string;
-  readonly enclaveURL?: string;
-  readonly transport?: TransportMode;
 };
 
 export type SecureClientFactory = (options: BridgeSecureClientOptions) => SecureClientLike;
+
+/**
+ * Secure inference client. Always uses the fully attestation-verifying Tinfoil
+ * `SecureClient`: every request seals its body to the attested enclave key, and the
+ * ambient-server relays both the attestation bundle (from `attestationBundleURL`)
+ * and the sealed request. There is no unattested path — a self-hosted enclave must
+ * produce a real attestation the server passes through, so nothing changes here.
+ */
+// The Tinfoil SDK rejects responses that lack EHBP envelope headers. That
+// happens when an edge/proxy hop answers for the enclave (load-balancer 5xx,
+// gateway timeout, connection reset) with a plain unencrypted error response —
+// a transient condition, so the fetch is retried before failing the request.
+// The request body has not produced a consumable Response yet at that point,
+// so re-sending it is safe.
+const TRANSIENT_SECURE_FETCH_PATTERNS = [
+  /missing ehbp-response-nonce header/i,
+  /missing ehbp-encapsulated-key header/i,
+];
+
+const SECURE_FETCH_RETRY_SCHEDULE = Schedule.exponential("250 millis").pipe(
+  Schedule.jittered,
+  Schedule.compose(Schedule.recurs(2)),
+);
+
+export function isTransientSecureFetchError(error: unknown): boolean {
+  if (!(error instanceof BridgeInferenceRequestError)) return false;
+  return TRANSIENT_SECURE_FETCH_PATTERNS.some((pattern) => pattern.test(error.message));
+}
 
 export function createBridgeSecureClient(input: {
   readonly serverBaseUrl: string;
@@ -77,7 +114,7 @@ export function createBridgeSecureClient(input: {
       Effect.tryPromise({
         try: () => client.ready(),
         catch: (cause) => new BridgeInferenceRequestError({
-          message: `Tinfoil secure client verification failed: ${errorMessage(cause)}`,
+          message: `Secure client verification failed: ${errorMessage(cause)}`,
           cause,
         }),
       }),
@@ -85,10 +122,15 @@ export function createBridgeSecureClient(input: {
       Effect.tryPromise({
         try: () => client.fetch(path, init),
         catch: (cause) => new BridgeInferenceRequestError({
-          message: `Tinfoil secure request failed: ${errorMessage(cause)}`,
+          message: `Secure request failed: ${errorMessage(cause)}`,
           cause,
         }),
-      }),
+      }).pipe(
+        Effect.retry({
+          while: (error) => isTransientSecureFetchError(error) && init.signal?.aborted !== true,
+          schedule: SECURE_FETCH_RETRY_SCHEDULE,
+        }),
+      ),
   };
 }
 
@@ -134,6 +176,7 @@ export function secureInferenceResponse(input: {
   readonly accept?: string;
   readonly requestId: string;
   readonly signal: AbortSignal;
+  readonly responseTimeoutMs?: number;
 }): Effect.Effect<
   Response,
   BridgeInferenceError,
@@ -153,6 +196,8 @@ export function secureInferenceResponse(input: {
       return yield* Effect.fail(new BridgeSignedOutError({ message: "Bridge is not signed in." }));
     }
 
+    const modelId = modelIdFromPayload(input.payload);
+
     yield* audit.record("inference.secure_client_ready_start", {
       feature: input.feature,
       path: input.path,
@@ -167,7 +212,6 @@ export function secureInferenceResponse(input: {
       "X-Ambient-Feature": input.feature,
       "X-Ambient-Request-Id": input.requestId,
     });
-    const modelId = modelIdFromPayload(input.payload);
     if (modelId) headers.set("X-Ambient-Model-Id", modelId);
     if (input.contentType !== null) {
       headers.set("Content-Type", input.contentType ?? "application/json");
@@ -182,12 +226,32 @@ export function secureInferenceResponse(input: {
       requestBytes: bodyInitSize(input.body),
     });
 
-    const response = yield* secureClient.fetch(input.path, {
-      body: input.body ?? JSON.stringify(input.payload ?? {}),
-      headers,
-      method: "POST",
-      signal: input.signal,
-    });
+    const timeoutMs = input.responseTimeoutMs && input.responseTimeoutMs > 0
+      ? input.responseTimeoutMs
+      : DEFAULT_INFERENCE_RESPONSE_TIMEOUT_MS;
+
+    // Abort the fetch if the enclave never sends response headers within the budget.
+    // The timer is cleared as soon as the response resolves, so it can never abort an
+    // in-progress token stream; user cancellation still flows through `input.signal`.
+    const response = yield* Effect.acquireUseRelease(
+      Effect.sync(() => {
+        const timeoutController = new AbortController();
+        const timer = setTimeout(() => {
+          timeoutController.abort(
+            new DOMException(`Inference response timed out after ${timeoutMs}ms`, "TimeoutError"),
+          );
+        }, timeoutMs);
+        timer.unref?.();
+        return { timeoutController, timer };
+      }),
+      ({ timeoutController }) => secureClient.fetch(input.path, {
+        body: input.body ?? JSON.stringify(input.payload ?? {}),
+        headers,
+        method: "POST",
+        signal: AbortSignal.any([input.signal, timeoutController.signal]),
+      }),
+      ({ timer }) => Effect.sync(() => clearTimeout(timer)),
+    );
 
     yield* audit.record("inference.secure_fetch_response", {
       feature: input.feature,

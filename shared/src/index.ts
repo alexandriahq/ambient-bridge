@@ -1,5 +1,5 @@
-export { default as UserCard } from "./UserCard.svelte";
-export { default as Avatar } from "./Avatar.svelte";
+export { default as UserCard } from "./design/components/UserCard.svelte";
+export { default as SessionGuardCard } from "./design/components/SessionGuardCard.svelte";
 export {
   accountDisplayName,
   accountInitials,
@@ -7,3 +7,11 @@ export {
   type SharedAuthOrganization,
   type SharedSignedInAccount,
 } from "./auth.js";
+export {
+  sessionGuardTone,
+  type SessionGuardAction,
+  type SessionGuardCardModel,
+  type SessionGuardRow,
+  type SessionGuardStatus,
+  type SessionGuardTone,
+} from "./session-guard.js";

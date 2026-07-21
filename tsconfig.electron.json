@@ -7,6 +7,7 @@
     "outDir": "dist/electron",
     "rootDir": "electron",
     "skipLibCheck": true,
+    "sourceMap": true,
     "strict": true,
     "target": "ES2023",
     "types": ["node"]

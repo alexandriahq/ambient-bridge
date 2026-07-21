@@ -1,11 +1,14 @@
 appId: com.alexandria.ambient.bridge
 productName: Ambient Bridge
+electronVersion: 42.3.3
 extraMetadata:
   name: ambient-bridge
   main: dist/electron/main.js
 directories:
   output: dist-packaged
-asar: false
+# Injects the macOS 26/Tahoe Icon Composer icon (Assets.car + CFBundleIconName)
+# into the .app before signing. See scripts/afterpack-tahoe-icon.cjs.
+afterPack: ./scripts/afterpack-tahoe-icon.cjs
 files:
   - dist/**/*
   - package.json
@@ -13,16 +16,12 @@ files:
 extraResources:
   - from: resources/bridge-icon.ico
     to: bridge-icon.ico
-  - from: node_modules/openai
-    to: node_modules/openai
-  - from: node_modules/zod
-    to: node_modules/zod
-  - from: node_modules/@ai-sdk/provider
-    to: node_modules/@ai-sdk/provider
-  - from: node_modules/@ai-sdk/provider-utils
-    to: node_modules/@ai-sdk/provider-utils
-  - from: node_modules/eventsource-parser
-    to: node_modules/eventsource-parser
+  - from: resources/bridge-icon-source.png
+    to: bridge-icon-source.png
+  - from: resources/bridge-tray-iconTemplate.png
+    to: bridge-tray-iconTemplate.png
+  - from: resources/bridge-tray-iconTemplate@2x.png
+    to: bridge-tray-iconTemplate@2x.png
 npmRebuild: false
 mac:
   category: public.app-category.productivity
@@ -38,7 +37,11 @@ mac:
         - arm64
 win:
   icon: resources/bridge-icon.ico
-  signAndEditExecutable: false
+  # Must stay true so electron-builder's rcedit step embeds bridge-icon.ico into
+  # the packaged .exe; disabling it leaves the stock Electron icon on the
+  # executable, taskbar, and Start menu. No signing cert is configured, so
+  # electron-builder edits the exe icon but skips signing.
+  signAndEditExecutable: true
   target:
     - target: nsis
       arch:

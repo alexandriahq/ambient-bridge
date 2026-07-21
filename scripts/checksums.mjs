@@ -54,6 +54,7 @@ artifacts.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
 const manifest = {
   app: packageJson.name,
   version: packageJson.version,
+  source: await optionalJsonFile(resolve(".ambient-source.json")),
   gitCommit: args["commit-sha"] ?? gitCommitSha(),
   sourceTreeStatus: gitTreeStatus(),
   nodeVersion: process.version,
@@ -67,11 +68,11 @@ const manifest = {
 await mkdir(outputDir, { recursive: true });
 await writeFile(
   join(outputDir, "SHA256SUMS"),
-  artifacts.map((artifact) => `${artifact.sha256}  ${artifact.relativePath}`).join("\n") + "\n",
+  `${artifacts.map((artifact) => `${artifact.sha256}  ${artifact.relativePath}`).join("\n")}\n`,
 );
 await writeFile(
   join(outputDir, "SHA512SUMS"),
-  artifacts.map((artifact) => `${artifact.sha512Hex}  ${artifact.relativePath}`).join("\n") + "\n",
+  `${artifacts.map((artifact) => `${artifact.sha512Hex}  ${artifact.relativePath}`).join("\n")}\n`,
 );
 await writeFile(join(outputDir, "artifact-manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
 
@@ -93,9 +94,7 @@ async function listDistributableFiles(root) {
   for (const entry of entries) {
     if (!entry.isFile()) continue;
     const absolutePath = join(root, entry.name);
-    if (isDistributableFile(entry.name)) {
-      files.push({ path: absolutePath });
-    }
+    if (isDistributableFile(entry.name)) files.push({ path: absolutePath });
   }
   return files;
 }
@@ -108,17 +107,17 @@ function isDistributableFile(fileName) {
   return DISTRIBUTABLE_EXTENSIONS.has(ext);
 }
 
-function extension(path) {
-  if (path.endsWith(".AppImage")) return ".AppImage";
-  if (path.endsWith(".blockmap")) return ".blockmap";
-  return path.slice(path.lastIndexOf("."));
+function extension(filePath) {
+  if (filePath.endsWith(".AppImage")) return ".AppImage";
+  if (filePath.endsWith(".blockmap")) return ".blockmap";
+  return filePath.slice(filePath.lastIndexOf("."));
 }
 
-async function hashFile(path) {
+async function hashFile(filePath) {
   const sha256 = createHash("sha256");
   const sha512 = createHash("sha512");
   await new Promise((resolvePromise, reject) => {
-    const stream = createReadStream(path);
+    const stream = createReadStream(filePath);
     stream.on("data", (chunk) => {
       sha256.update(chunk);
       sha512.update(chunk);
@@ -135,9 +134,17 @@ async function hashFile(path) {
   };
 }
 
-async function optionalFileSha256(path) {
+async function optionalFileSha256(filePath) {
   try {
-    return (await hashFile(path)).sha256;
+    return (await hashFile(filePath)).sha256;
+  } catch {
+    return null;
+  }
+}
+
+async function optionalJsonFile(filePath) {
+  try {
+    return JSON.parse(await readFile(filePath, "utf8"));
   } catch {
     return null;
   }
@@ -186,6 +193,6 @@ function pnpmVersion() {
   }
 }
 
-function normalizePath(path) {
-  return path.split("\\").join("/");
+function normalizePath(filePath) {
+  return filePath.split("\\").join("/");
 }

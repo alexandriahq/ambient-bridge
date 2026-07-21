@@ -1,11 +1,21 @@
 import { contextBridge, ipcRenderer } from "electron";
+import type {
+  BridgeCopyWirePayloadResult,
+  BridgeWireCaptureResult,
+} from "./bridge-ui-contract.js";
 
 type BridgeUiApi = {
   checkForUpdates(): Promise<unknown>;
+  checkForStableUpdates(): Promise<unknown>;
+  copyWirePayload(requestId: string): Promise<BridgeCopyWirePayloadResult>;
   getStatus(): Promise<unknown>;
   getUpdateStatus(): Promise<unknown>;
-  getWireCapture(requestId: string): Promise<unknown>;
+  getWireCapture(requestId: string): Promise<BridgeWireCaptureResult>;
   installUpdate(): Promise<unknown>;
+  retryReachability(): Promise<unknown>;
+  viewUpdateReleaseNotes(): Promise<unknown>;
+  listExperimentalBuilds(): Promise<unknown>;
+  installExperimentalBuild(version: string): Promise<unknown>;
   onStatusChanged(callback: () => void): () => void;
   onUpdateStatusChanged(callback: (status: unknown) => void): () => void;
   completePairing(requestId: string, approved: boolean): Promise<unknown>;
@@ -17,10 +27,16 @@ type BridgeUiApi = {
 
 const api: BridgeUiApi = {
   checkForUpdates: () => ipcRenderer.invoke("bridge:check-for-updates"),
+  checkForStableUpdates: () => ipcRenderer.invoke("bridge:check-stable-updates"),
+  copyWirePayload: (requestId) => ipcRenderer.invoke("bridge:copy-wire-payload", requestId),
   getStatus: () => ipcRenderer.invoke("bridge:get-status"),
   getUpdateStatus: () => ipcRenderer.invoke("bridge:get-update-status"),
   getWireCapture: (requestId) => ipcRenderer.invoke("bridge:get-wire-capture", requestId),
   installUpdate: () => ipcRenderer.invoke("bridge:install-update"),
+  retryReachability: () => ipcRenderer.invoke("bridge:retry-reachability"),
+  viewUpdateReleaseNotes: () => ipcRenderer.invoke("bridge:view-update-release-notes"),
+  listExperimentalBuilds: () => ipcRenderer.invoke("bridge:experimental-builds"),
+  installExperimentalBuild: (version) => ipcRenderer.invoke("bridge:install-experimental", version),
   onStatusChanged: (callback) => {
     const listener = () => callback();
     ipcRenderer.on("bridge:status-changed", listener);

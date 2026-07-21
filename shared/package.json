@@ -1,34 +1,52 @@
 {
   "name": "@ambient/shared",
   "version": "0.1.0",
-  "description": "Shared Ambient UI components and contracts consumed as source by ambient-app and bridge.",
   "private": true,
   "type": "module",
   "svelte": "./src/index.ts",
   "types": "./src/index.ts",
-  "scripts": {
-    "build": "tsc --project tsconfig.harness.json",
-    "typecheck": "tsc --project tsconfig.json && tsc --project tsconfig.harness.json --noEmit"
-  },
   "exports": {
     ".": {
       "types": "./src/index.ts",
       "svelte": "./src/index.ts",
       "default": "./src/index.ts"
     },
-    "./harness": {
-      "types": "./src/harness/index.ts",
-      "default": "./dist/harness/index.js"
+    "./design": {
+      "types": "./src/design/index.ts",
+      "svelte": "./src/design/index.ts",
+      "default": "./src/design/index.ts"
+    },
+    "./design/app.css": "./src/design/app.css",
+    "./notifications": {
+      "types": "./src/notifications/index.ts",
+      "svelte": "./src/notifications/index.ts",
+      "default": "./src/notifications/index.ts"
+    },
+    "./observability": {
+      "types": "./src/observability/index.d.ts",
+      "default": "./src/observability/index.js"
+    },
+    "./update-core": {
+      "types": "./src/update-core.d.ts",
+      "default": "./src/update-core.js"
+    },
+    "./compact-auth-window": {
+      "types": "./src/compact-auth-window.d.ts",
+      "default": "./src/compact-auth-window.js"
+    },
+    "./window-capture": {
+      "types": "./src/window-capture.d.ts",
+      "default": "./src/window-capture.js"
     }
   },
   "dependencies": {
-    "effect": "3.21.2"
+    "@fontsource-variable/inter": "^5.1.0",
+    "@fontsource/stix-two-text": "^5.2.8",
+    "clsx": "^2.1.1",
+    "svelte-sonner": "^1.1.1",
+    "tailwind-merge": "^3.5.0"
   },
   "peerDependencies": {
     "svelte": "^5.0.0"
-  },
-  "devDependencies": {
-    "svelte": "^5.56.3",
-    "typescript": "^5.8.3"
   }
 }

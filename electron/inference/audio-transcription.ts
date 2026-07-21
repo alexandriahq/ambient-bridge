@@ -43,7 +43,7 @@ export function audioTranscriptionRequestFromPayload(
 
   const mediaType = mediaTypeValue(typeof payload.mediaType === "string" ? payload.mediaType : null);
   const fileName = fileNameValue(typeof payload.fileName === "string" ? payload.fileName : null);
-  const model = typeof payload.model === "string" && payload.model ? payload.model : "voxtral-small-24b";
+  const model = typeof payload.model === "string" && payload.model ? payload.model : "whisper-large-v3-turbo";
   const prompt = typeof payload.prompt === "string" ? payload.prompt.trim() : "";
   const temperature = typeof payload.temperature === "number" ? String(payload.temperature) : "0";
   const responseFormat = typeof payload.responseFormat === "string" && payload.responseFormat ? payload.responseFormat : "json";

@@ -1,27 +1,74 @@
-import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { existsSync, readFileSync, unwatchFile, watchFile } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
+import { fileURLToPath } from "node:url";
+import {
+  acquireDevProductLock,
+  assertDevRendererPortReady,
+  extractViteLocalUrl,
+  rendererVitePortArgs,
+  resolveDevRendererPort,
+} from "./dev-renderer.mjs";
 
-const port = Number(process.env.AMBIENT_BRIDGE_DEV_PORT ?? 5174);
-const url = `http://127.0.0.1:${port}`;
+const bridgeRoot = new URL("..", import.meta.url);
+const repoRoot = new URL("..", bridgeRoot);
+const buildConfigGeneratorPath = fileURLToPath(new URL("./generate-build-config.mjs", import.meta.url));
+const generatedBuildConfigPath = fileURLToPath(new URL("../electron/generated/build-config.ts", import.meta.url));
+const portConfig = resolveDevRendererPort({
+  defaultPort: 5174,
+  env: process.env,
+  envName: "AMBIENT_BRIDGE_DEV_PORT",
+});
+const initialUrl = portConfig.url;
 const children = new Set();
 const packageManager = process.platform === "win32" ? (process.env.ComSpec ?? "cmd.exe") : "pnpm";
+const devLock = acquireDevProductLock({
+  lockName: "ambient-bridge",
+  productName: "Ambient Bridge",
+  repoRoot,
+});
 
-let electronStarted = false;
+let electronChild;
+let electronRestartTimer;
+let restartAfterElectronExit = false;
 let shuttingDown = false;
+let rendererUrl = initialUrl;
+let rendererUrlResolved = portConfig.strict;
+let rendererOutputBuffer = "";
+let tscOutputBuffer = "";
+let tscRebuildPending = false;
+let resolveRendererUrl;
+const rendererUrlReady = portConfig.strict
+  ? Promise.resolve(initialUrl)
+  : new Promise((resolve) => {
+    resolveRendererUrl = resolve;
+  });
 
 process.on("SIGINT", () => shutdown(0));
 process.on("SIGTERM", () => shutdown(0));
+process.on("exit", () => devLock.release());
+
+await assertDevRendererPortReady(portConfig, "Bridge renderer");
+
+// electron/generated/build-config.ts is gitignored and required for tsc; make
+// sure it exists before the watch build starts. There is no runtime server-URL
+// override, so dev uses the same production API default as packaged releases.
+// Set AMBIENT_BRIDGE_BUILD_SERVER_URL to deliberately bake a staging or local
+// target (the `stack` flow sets it to the local server).
+refreshBuildConfig({ alwaysLog: true });
+watchFile(buildConfigGeneratorPath, { interval: 500 }, (current, previous) => {
+  if (shuttingDown || current.mtimeMs === previous.mtimeMs) return;
+  refreshBuildConfigAfterStartup();
+});
 
 const vite = start("vite", [
   "exec",
   "vite",
   "--host",
   "127.0.0.1",
-  "--port",
-  String(port),
-  "--strictPort",
+  ...rendererVitePortArgs(portConfig),
 ], {
+  onOutput: inspectRendererOutput,
   readyPattern: /ready in|Local:\s+http:\/\/127\.0\.0\.1:/,
 });
 
@@ -33,31 +80,57 @@ const tsc = start("tsc", [
   "--watch",
   "--preserveWatchOutput",
 ], {
+  onOutput: inspectTscOutput,
   readyPattern: /Found 0 errors|Watching for file changes/,
 });
 
-void waitForDevReady();
+void waitForDevReady().catch((error) => {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(`[bridge dev] ${message}`);
+  shutdown(1);
+});
 
 async function waitForDevReady() {
+  const activeRendererUrl = await rendererUrlReady;
   await Promise.all([vite.ready, tsc.ready]);
   await waitForFile("dist/electron/main.js");
-  await waitForHttp(url);
-  startElectron();
+  await waitForHttp(activeRendererUrl);
+  startElectron(activeRendererUrl);
 }
 
-function startElectron() {
-  if (electronStarted) return;
-  electronStarted = true;
-  start("electron", ["exec", "electron", "."], {
+function startElectron(activeRendererUrl) {
+  if (electronChild || shuttingDown) return;
+  // Expose the Chrome DevTools Protocol on a fixed localhost port so tools like
+  // the Claude Code preview can attach and drive the renderer while all the
+  // normal Electron IPC keeps working. Uses a different port from the Ambient
+  // app (9222) so both can run at once. Override with
+  // AMBIENT_BRIDGE_DEVTOOLS_PORT, or set it to 0 to disable.
+  const devtoolsPort = process.env.AMBIENT_BRIDGE_DEVTOOLS_PORT ?? "9223";
+  const devtoolsArgs = devtoolsPort === "0"
+    ? []
+    : [`--remote-debugging-port=${devtoolsPort}`, "--remote-allow-origins=*"];
+  if (devtoolsArgs.length > 0) {
+    console.log(`[electron] Chrome DevTools Protocol on http://127.0.0.1:${devtoolsPort}`);
+  }
+  let launched;
+  launched = start("electron", ["exec", "electron", ".", ...devtoolsArgs], {
     env: {
       ...process.env,
       AMBIENT_BRIDGE_OPEN_DEVTOOLS: process.env.AMBIENT_BRIDGE_OPEN_DEVTOOLS ?? "0",
       ELECTRON_ENABLE_LOGGING: "1",
       ELECTRON_ENABLE_STACK_DUMPING: "1",
-      VITE_DEV_SERVER_URL: url,
+      VITE_DEV_SERVER_URL: activeRendererUrl,
     },
     exitEndsSession: true,
+    onExit: () => {
+      if (electronChild === launched.child) electronChild = undefined;
+      if (!restartAfterElectronExit || shuttingDown) return false;
+      restartAfterElectronExit = false;
+      startElectron(rendererUrl);
+      return true;
+    },
   });
+  electronChild = launched.child;
 }
 
 function start(label, args, options = {}) {
@@ -65,7 +138,7 @@ function start(label, args, options = {}) {
     ? ["/d", "/s", "/c", "pnpm", ...args]
     : args;
   const child = spawn(packageManager, packageManagerArgs, {
-    cwd: new URL("..", import.meta.url),
+    cwd: bridgeRoot,
     env: options.env ?? process.env,
     stdio: ["inherit", "pipe", "pipe"],
   });
@@ -80,22 +153,116 @@ function start(label, args, options = {}) {
   child.stdout.on("data", (data) => {
     const text = data.toString();
     prefix(label, text, false);
+    options.onOutput?.(text);
     if (options.readyPattern?.test(text)) markReady();
   });
 
   child.stderr.on("data", (data) => {
     const text = data.toString();
     prefix(label, text, true);
+    options.onOutput?.(text);
     if (options.readyPattern?.test(text)) markReady();
   });
 
   child.on("exit", (code, signal) => {
     children.delete(child);
     console.log(`[${label}] exited code=${code ?? "null"} signal=${signal ?? "null"}`);
-    if (options.exitEndsSession) shutdown(code ?? (signal ? 1 : 0));
+    const exitHandled = options.onExit?.(code, signal) === true;
+    if (!exitHandled && (options.exitEndsSession || (!shuttingDown && code !== 0))) {
+      shutdown(code ?? (signal ? 1 : 0));
+    }
   });
 
   return { child, ready };
+}
+
+function inspectRendererOutput(text) {
+  if (rendererUrlResolved) return;
+  rendererOutputBuffer = `${rendererOutputBuffer}${text}`.slice(-4_000);
+  const detectedUrl = extractViteLocalUrl(rendererOutputBuffer);
+  if (!detectedUrl) return;
+  rendererUrl = detectedUrl;
+  rendererUrlResolved = true;
+  if (rendererUrl !== initialUrl) {
+    console.log(`[vite] default port ${portConfig.port} unavailable; using ${rendererUrl}`);
+  }
+  resolveRendererUrl(rendererUrl);
+}
+
+function inspectTscOutput(text) {
+  tscOutputBuffer = `${tscOutputBuffer}${text}`;
+  const lines = tscOutputBuffer.split(/\r?\n/);
+  tscOutputBuffer = lines.pop() ?? "";
+
+  for (const line of lines) {
+    if (line.includes("File change detected")) {
+      tscRebuildPending = true;
+      continue;
+    }
+    if (tscRebuildPending && line.includes("Found 0 errors")) {
+      tscRebuildPending = false;
+      // A branch switch can change both Electron source and the script that
+      // generates the baked server target. Compile that generated update before
+      // replacing main so the restarted process cannot keep an old realm.
+      if (refreshBuildConfigAfterStartup()) continue;
+      scheduleElectronRestart();
+    }
+  }
+}
+
+function refreshBuildConfig({ alwaysLog = false } = {}) {
+  const previous = readOptionalFile(generatedBuildConfigPath);
+  const output = execFileSync(process.execPath, [buildConfigGeneratorPath], {
+    encoding: "utf8",
+    env: process.env,
+    stdio: ["ignore", "pipe", "inherit"],
+  });
+  const changed = previous !== readOptionalFile(generatedBuildConfigPath);
+  if ((alwaysLog || changed) && output) process.stdout.write(output);
+  return changed;
+}
+
+function refreshBuildConfigAfterStartup() {
+  try {
+    return refreshBuildConfig();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[bridge dev] could not refresh baked build config: ${message}`);
+    shutdown(1);
+    return true;
+  }
+}
+
+function readOptionalFile(path) {
+  return existsSync(path) ? readFileSync(path, "utf8") : null;
+}
+
+function scheduleElectronRestart() {
+  if (!electronChild || shuttingDown) return;
+  clearTimeout(electronRestartTimer);
+  electronRestartTimer = setTimeout(() => {
+    electronRestartTimer = undefined;
+    if (!electronChild || shuttingDown) return;
+    console.log("[electron] main-process build changed; restarting Electron");
+    restartAfterElectronExit = true;
+    if (!terminateChild(electronChild)) {
+      restartAfterElectronExit = false;
+      console.error("[electron] could not stop the stale main process after rebuild");
+    }
+  }, 150);
+}
+
+function terminateChild(child) {
+  if (process.platform !== "win32") return child.kill("SIGTERM");
+  if (!child.pid) return false;
+  try {
+    // The Windows launcher is cmd.exe -> pnpm -> Electron. Terminating only the
+    // wrapper orphans Electron and leaves the Bridge single-instance lock held.
+    execFileSync("taskkill", ["/pid", String(child.pid), "/t", "/f"], { stdio: "ignore" });
+    return true;
+  } catch {
+    return child.exitCode !== null || child.signalCode !== null;
+  }
 }
 
 async function waitForFile(path) {
@@ -138,8 +305,14 @@ function once(fn) {
 function shutdown(code) {
   if (shuttingDown) return;
   shuttingDown = true;
+  clearTimeout(electronRestartTimer);
+  restartAfterElectronExit = false;
+  unwatchFile(buildConfigGeneratorPath);
   for (const child of children) {
-    child.kill("SIGTERM");
+    terminateChild(child);
   }
-  setTimeout(() => process.exit(code), 100).unref();
+  setTimeout(() => {
+    devLock.release();
+    process.exit(code);
+  }, 100).unref();
 }

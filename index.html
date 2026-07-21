@@ -4,6 +4,20 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Ambient Bridge</title>
+    <script>
+      // Pre-paint theme bootstrap — add `.dark` before first paint so there is
+      // no flash. Honors a persisted mode-watcher choice, else the OS setting.
+      (function () {
+        try {
+          var m = localStorage.getItem("mode-watcher-mode");
+          var dark =
+            m === "dark" ||
+            ((m === null || m === "system") &&
+              window.matchMedia("(prefers-color-scheme: dark)").matches);
+          if (dark) document.documentElement.classList.add("dark");
+        } catch (e) {}
+      })();
+    </script>
   </head>
   <body>
     <div id="app"></div>

@@ -1,4 +1,15 @@
-export type BridgeView = "network" | "overview";
+import type {
+  BridgeCopyWirePayloadResult,
+  BridgeWireCaptureResult,
+} from "../../electron/bridge-ui-contract.js";
+
+export type {
+  BridgeCopyWirePayloadResult,
+  BridgeWireBody,
+  BridgeWireCapture,
+  BridgeWireCaptureResult,
+  BridgeWireHeader,
+} from "../../electron/bridge-ui-contract.js";
 
 export type BridgeOrganization = {
   id: string;
@@ -58,11 +69,29 @@ export type BridgeConnectionState =
   | "ready"
   | "starting"
   | "checking"
+  | "retrying"
+  | "degraded"
   | "proxy_unavailable"
   | "attestation_invalid"
   | "offline";
 
 export type BridgeServerReachabilityState = "checking" | "reachable" | "unavailable";
+
+export type BridgeServerReachabilityReason =
+  | "not_checked"
+  | "ok"
+  | "offline"
+  | "dns_failure"
+  | "timeout"
+  | "server_error"
+  | "network_error";
+
+export type BridgeSessionRefreshSnapshot = {
+  attempt: number;
+  message: string | null;
+  nextRetryAt: number | null;
+  state: "ready" | "refreshing" | "retrying" | "degraded";
+};
 
 export type BridgeActivityEvent = {
   name: string;
@@ -96,6 +125,7 @@ export type BridgeInferenceStatus = {
   responsePrivacy: "decrypts_in_bridge";
   serverAuth: "workos_session";
   serverOrigin: string;
+  wireCaptureRevision: number;
 };
 
 export type BridgeAttestationCheck = {
@@ -132,31 +162,6 @@ export type BridgeInferenceRequestStatus = {
   wireCaptured: boolean;
 };
 
-export type BridgeWireHeader = { name: string; value: string };
-
-export type BridgeWireBody = {
-  base64: string;
-  capturedBytes: number;
-  byteLength: number | null;
-  truncated: boolean;
-};
-
-export type BridgeWireCapture = {
-  requestId: string;
-  at: number;
-  request: {
-    method: string;
-    url: string;
-    headers: BridgeWireHeader[];
-    body: BridgeWireBody;
-  };
-  response: {
-    status: number;
-    headers: BridgeWireHeader[];
-    body: BridgeWireBody;
-  } | null;
-};
-
 export type BridgeStatus = {
   account: BridgeAccountState;
   activity: BridgeActivityEvent[];
@@ -168,8 +173,32 @@ export type BridgeStatus = {
   pairingRequests: BridgePairingRequest[];
   serverReachable: boolean;
   serverReachability: BridgeServerReachabilityState;
+  serverReachabilityCheckedAt: number | null;
+  serverReachabilityHttpStatus: number | null;
+  serverReachabilityMessage: string;
+  serverReachabilityReason: BridgeServerReachabilityReason;
+  sessionRefresh: BridgeSessionRefreshSnapshot;
   appVersion: string;
   socketReady: boolean;
+};
+
+export type BridgeExperimentalBuildsSnapshot = {
+  channel: string;
+  platform: string;
+  arch: string;
+  currentVersion: string;
+  releasesUrl: string | null;
+  builds: readonly {
+    id: string | null;
+    releaseKey: string;
+    version: string;
+    channel: string;
+    platform: string;
+    arch: string;
+    commitSha: string;
+    notes: string | null;
+    releasedAt: string;
+  }[];
 };
 
 export type BridgeUpdateStatus = {
@@ -182,18 +211,28 @@ export type BridgeUpdateStatus = {
   feedUrl: string | null;
   latestVersion?: string;
   reason?: string;
+  releaseNotesUrl?: string | null;
+  downloadPercent?: number | null;
+  lastCheckedAtMs?: number;
+  lastUpdatedAtMs?: number;
   updateAvailable: boolean;
   updateError?: string;
 };
 
 export type BridgeUiApi = {
+  copyWirePayload(requestId: string): Promise<BridgeCopyWirePayloadResult>;
   getStatus(): Promise<BridgeStatus>;
   getUpdateStatus(): Promise<BridgeUpdateStatus>;
-  getWireCapture(requestId: string): Promise<BridgeWireCapture | null>;
+  getWireCapture(requestId: string): Promise<BridgeWireCaptureResult>;
   onStatusChanged(callback: () => void): () => void;
   onUpdateStatusChanged(callback: (status: BridgeUpdateStatus) => void): () => void;
   checkForUpdates(): Promise<BridgeUpdateStatus>;
+  checkForStableUpdates?(): Promise<BridgeUpdateStatus>;
   installUpdate(): Promise<BridgeUpdateStatus>;
+  retryReachability(): Promise<BridgeStatus>;
+  viewUpdateReleaseNotes(): Promise<boolean>;
+  listExperimentalBuilds(): Promise<BridgeExperimentalBuildsSnapshot>;
+  installExperimentalBuild(version: string): Promise<BridgeUpdateStatus>;
   startLogin(): Promise<void>;
   signOut(): Promise<void>;
   switchOrganization(organizationId: string): Promise<void>;

@@ -1,114 +1,59 @@
 <script lang="ts">
-  import { Download, ListTree, RefreshCw, SlidersHorizontal } from "@lucide/svelte";
   import { UserCard } from "@ambient/shared";
-  import type { BridgeStatus, BridgeUpdateStatus, BridgeView } from "../bridge-api";
-  import { connectionLabel } from "../format";
+  import { cn } from "@ambient/shared/design";
+  import type { BridgeStatus } from "../bridge-api";
+  import { connectionLabel, hostFromOrigin } from "../format";
+  import { statusDotClass } from "../status-dot";
 
   let {
     status,
-    updateStatus,
-    view,
     authBusy,
-    switchingOrganizationId = null,
-    updateBusy,
-    onSelectView,
+    onSignIn,
     onSignOut,
-    onSwitchOrganization,
-    onCheckForUpdates,
-    onInstallUpdate,
+    onOpenSettings,
   }: {
     status: BridgeStatus;
-    updateStatus: BridgeUpdateStatus;
-    view: BridgeView;
     authBusy: boolean;
-    switchingOrganizationId?: string | null;
-    updateBusy: boolean;
-    onSelectView: (view: BridgeView) => void;
+    onSignIn: () => void;
     onSignOut: () => void;
-    onSwitchOrganization: (organizationId: string) => void;
-    onCheckForUpdates: () => void;
-    onInstallUpdate: () => void;
+    onOpenSettings: () => void;
   } = $props();
 
-  const tabs: { id: BridgeView; label: string; icon: typeof ListTree }[] = [
-    { icon: ListTree, id: "network", label: "Network Logs" },
-    { icon: SlidersHorizontal, id: "overview", label: "Overview" },
-  ];
+  const enclaveHost = $derived(hostFromOrigin(status.inference.serverOrigin));
+  const passedAttestationChecks = $derived(status.inference.attestationChecks.filter((check) => check.status === "passed").length);
 
-  function updateState(): "checking" | "current" | "disabled" | "failed" | "ready" {
-    if (updateStatus.updateError) return "failed";
-    if (updateStatus.downloaded || updateStatus.updateAvailable) return "ready";
-    if (updateStatus.checking || updateStatus.downloading || updateBusy) return "checking";
-    if (!updateStatus.enabled) return "disabled";
-    return "current";
-  }
-
-  function updateLabel(): string {
-    if (updateStatus.downloaded) return "Update ready";
-    if (updateStatus.downloading) return "Downloading";
-    if (updateStatus.checking || updateBusy) return "Checking";
-    if (updateStatus.updateAvailable) return "Update available";
-    if (!updateStatus.enabled) return "Updates off";
-    return "Current";
-  }
+  const isMac = typeof navigator !== "undefined" && /mac/i.test(navigator.platform);
 </script>
 
-<header class="top-bar">
-  <div class="top-bar-brand">
-    <div class="brand-mark" aria-hidden="true">A</div>
-    <div class="top-bar-titles">
-      <strong>Ambient Bridge</strong>
-      <span>{status.appVersion}</span>
-    </div>
+<header
+  class="drag frost grid h-[46px] flex-none grid-cols-[minmax(48px,1fr)_minmax(0,auto)_minmax(48px,1fr)] items-center border-b border-line px-4 {isMac ? 'grid-cols-[minmax(76px,1fr)_minmax(0,auto)_minmax(76px,1fr)]' : ''}"
+  data-testid="bridge-toolbar"
+>
+  <div
+    class="no-drag col-start-2 flex h-8 min-w-0 max-w-full items-center gap-2.5 justify-self-center rounded-[var(--radius-md)] border border-line bg-surface/80 px-2.5"
+    role="status"
+    data-testid="bridge-toolbar-status"
+    aria-label={`Bridge ${connectionLabel(status.connection)}. ${enclaveHost}. ${passedAttestationChecks} of ${status.inference.attestationChecks.length} attested.`}
+  >
+    <span class={cn("animate-heartbeat size-2 rounded-full", statusDotClass(status.connection))} aria-hidden="true"></span>
+    <strong class="text-xs font-semibold capitalize text-ink">{connectionLabel(status.connection)}</strong>
+    <span class="h-3.5 w-px shrink-0 bg-line max-[560px]:hidden" aria-hidden="true"></span>
+    <span class="min-w-0 max-w-[150px] truncate font-mono text-xs text-ink-secondary max-[560px]:hidden" title={status.inference.serverOrigin}>{enclaveHost}</span>
+    <span class="h-3.5 w-px shrink-0 bg-line" aria-hidden="true"></span>
+    <span class="whitespace-nowrap text-xs text-ink-secondary"><strong class="tnum font-semibold text-ink">{passedAttestationChecks}/{status.inference.attestationChecks.length}</strong> attested</span>
   </div>
 
-  <nav class="view-tabs" aria-label="Bridge views">
-    {#each tabs as tab (tab.id)}
-      <button
-        type="button"
-        class="view-tab"
-        data-active={view === tab.id}
-        aria-pressed={view === tab.id}
-        onclick={() => onSelectView(tab.id)}
-      >
-        <tab.icon size={15} aria-hidden="true" />
-        <span>{tab.label}</span>
-      </button>
-    {/each}
-  </nav>
-
-  <div class="top-bar-actions">
-    <span class="connection-chip" data-state={status.connection}>
-      <span class="status-dot" data-state={status.connection} aria-hidden="true"></span>
-      <span>{connectionLabel(status.connection)}</span>
-    </span>
-    {#if updateStatus.enabled}
-      <button
-        class="icon-button compact-action"
-        type="button"
-        title={updateLabel()}
-        aria-label={updateLabel()}
-        data-state={updateState()}
-        onclick={updateStatus.downloaded ? onInstallUpdate : onCheckForUpdates}
-        disabled={updateStatus.checking || updateStatus.downloading || updateBusy}
-      >
-        {#if updateStatus.downloaded}
-          <Download size={14} aria-hidden="true" />
-        {:else}
-          <span class:spin={updateStatus.checking || updateStatus.downloading || updateBusy}>
-            <RefreshCw size={14} aria-hidden="true" />
-          </span>
-        {/if}
-      </button>
-    {/if}
+  <div class="no-drag col-start-3 flex items-center justify-self-end" data-testid="bridge-toolbar-account">
     <UserCard
       account={status.account}
       compact
       align="end"
+      menuSize="compact"
       busy={authBusy}
-      switchingOrganizationId={switchingOrganizationId}
+      onSignIn={onSignIn}
+      onRestartSignIn={onSignIn}
       onSignOut={onSignOut}
-      onSwitchOrganization={onSwitchOrganization}
+      onOpenSettings={onOpenSettings}
     />
   </div>
 </header>

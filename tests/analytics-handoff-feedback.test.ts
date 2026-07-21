@@ -87,18 +87,23 @@ describe("handoff feedback analytics forwarding", () => {
   it("clears the stored session on a 401 and reports the server error", async () => {
     const fetchImpl = vi.fn().mockResolvedValue(jsonResponse(401, { error: "Ambient session validation failed" }));
     const onUnauthorized = vi.fn();
+    const requestSession = session();
 
     const result = await forwardHandoffFeedback("req_1", PAYLOAD, {
       audit: new MemoryAuditSink(),
       fetchImpl,
       onUnauthorized,
-      readSession: async () => session(),
+      readSession: async () => requestSession,
       refreshSession: vi.fn(),
       serverBaseUrl: "https://api.example.test",
     });
 
     expect(result).toEqual({ ok: false, id: null, error: "Ambient session validation failed" });
     expect(onUnauthorized).toHaveBeenCalledTimes(1);
+    expect(onUnauthorized).toHaveBeenCalledWith(
+      "analytics handoff feedback request returned 401",
+      requestSession,
+    );
   });
 
   it("resolves with ok=false when the network request fails", async () => {
@@ -113,6 +118,39 @@ describe("handoff feedback analytics forwarding", () => {
 
     expect(result.ok).toBe(false);
     expect(result.error).toContain("ECONNREFUSED");
+  });
+
+  it("bounds a stalled analytics upload", async () => {
+    const result = await forwardHandoffFeedback("req_1", PAYLOAD, {
+      audit: new MemoryAuditSink(),
+      fetchImpl: abortAwareHangingFetch(),
+      onUnauthorized: vi.fn(),
+      readSession: async () => session(),
+      refreshSession: vi.fn(),
+      serverBaseUrl: "https://api.example.test",
+      timeoutMs: 1,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toBeTruthy();
+  });
+
+  it("keeps the timeout active while consuming the analytics response body", async () => {
+    const result = await forwardHandoffFeedback("req_1", PAYLOAD, {
+      audit: new MemoryAuditSink(),
+      fetchImpl: responseWithStalledBody(),
+      onUnauthorized: vi.fn(),
+      readSession: async () => session(),
+      refreshSession: vi.fn(),
+      serverBaseUrl: "https://api.example.test",
+      timeoutMs: 5,
+    });
+
+    expect(result).toEqual({
+      ok: false,
+      id: null,
+      error: "Ambient analytics request timed out after 5 ms.",
+    });
   });
 
   it("rejects non-object payloads before contacting the server", async () => {
@@ -150,4 +188,24 @@ function jsonResponse(status: number, body: unknown): Response {
     headers: { "Content-Type": "application/json" },
     status,
   });
+}
+
+function abortAwareHangingFetch(): typeof fetch {
+  return vi.fn((_input: URL | RequestInfo, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+    init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+  })) as unknown as typeof fetch;
+}
+
+function responseWithStalledBody(): typeof fetch {
+  return vi.fn(async (_input: URL | RequestInfo, init?: RequestInit) => {
+    const signal = init?.signal;
+    return new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        signal?.addEventListener("abort", () => controller.error(signal.reason), { once: true });
+      },
+    }), {
+      headers: { "Content-Type": "application/json" },
+      status: 200,
+    });
+  }) as unknown as typeof fetch;
 }

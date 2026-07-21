@@ -12,12 +12,12 @@ const parsed = parseVersion(currentVersion);
 const logPrefix = args["log-prefix"] ?? "release";
 const preid = args.preid ?? parsed.preid ?? "alpha";
 const runNumber = args["run-number"] ?? process.env.GITHUB_RUN_NUMBER;
+const prNumber = args["pr-number"] ?? process.env.GITHUB_PR_NUMBER;
+const runId = args["run-id"] ?? process.env.GITHUB_RUN_ID;
+const runAttempt = args["run-attempt"] ?? process.env.GITHUB_RUN_ATTEMPT;
+const prerelease = ciPrerelease({ preid, prNumber, runAttempt, runId, runNumber });
 
-if (!runNumber || !/^[1-9]\d*$/.test(runNumber)) {
-  throw new Error("A positive --run-number value or GITHUB_RUN_NUMBER is required.");
-}
-
-const nextVersion = `${parsed.major}.${parsed.minor}.${parsed.patch}-${preid}.${runNumber}`;
+const nextVersion = `${parsed.major}.${parsed.minor}.${parsed.patch}-${prerelease}`;
 
 if (!args["dry-run"]) {
   packageJson.version = nextVersion;
@@ -38,6 +38,35 @@ function parseArgs(values) {
     parsed[key] = rawValue;
   }
   return parsed;
+}
+
+function ciPrerelease({ preid, prNumber, runAttempt, runId, runNumber }) {
+  // PR-scoped iff a --pr-number is supplied. runId is not a selector here: it
+  // falls back to the always-present GITHUB_RUN_ID, so gating on it would force
+  // every channel-scoped release (which passes no --pr-number) down this path
+  // and fail. Channel-scoped releases fall through to the run-number form below.
+  if (prNumber) {
+    if (!/^[1-9]\d*$/.test(prNumber)) {
+      throw new Error("A positive --pr-number value is required when stamping a PR-scoped CI version.");
+    }
+    if (!runId || !/^[1-9]\d*$/.test(runId)) {
+      throw new Error("A positive --run-id value or GITHUB_RUN_ID is required when stamping a PR-scoped CI version.");
+    }
+
+    const parts = [preid, `pr${prNumber}`, runId];
+    if (runAttempt && runAttempt !== "1") {
+      if (!/^[1-9]\d*$/.test(runAttempt)) {
+        throw new Error("--run-attempt or GITHUB_RUN_ATTEMPT must be a positive integer when provided.");
+      }
+      parts.push(`attempt${runAttempt}`);
+    }
+    return parts.join(".");
+  }
+
+  if (!runNumber || !/^[1-9]\d*$/.test(runNumber)) {
+    throw new Error("A positive --run-number value or GITHUB_RUN_NUMBER is required.");
+  }
+  return `${preid}.${runNumber}`;
 }
 
 function parseVersion(value) {

@@ -15,7 +15,7 @@ type Harness = {
   server: BridgeIpcServer;
   client: Socket;
   audit: MemoryAuditSink;
-  reads: Map<string, Promise<Buffer>>;
+  reads: Map<string, Array<Promise<Buffer>>>;
   cleanup: () => Promise<void>;
 };
 
@@ -26,15 +26,17 @@ afterEach(async () => {
 });
 
 async function startHarness(): Promise<Harness> {
-  const dir = await mkdtemp(path.join(os.tmpdir(), "ambient-bridge-binary-"));
+  const dir = process.platform === "win32"
+    ? null
+    : await mkdtemp(path.join(os.tmpdir(), "ambient-bridge-binary-"));
   const audit = new MemoryAuditSink();
-  const reads = new Map<string, Promise<Buffer>>();
+  const reads = new Map<string, Array<Promise<Buffer>>>();
   const server = new BridgeIpcServer({
     audit,
     handlers: {
       [UPLOAD_METHOD]: async (frame, context: IpcHandlerContext) => {
         const read = context.readBinaryUpload();
-        reads.set(frame.id, read);
+        reads.set(frame.id, [...(reads.get(frame.id) ?? []), read]);
         // Swallow here; tests assert on the stored promise.
         await read.catch(() => undefined);
         return {};
@@ -42,7 +44,7 @@ async function startHarness(): Promise<Harness> {
     },
     pairingStore: new PairingStore(),
     publicMethods: new Set([UPLOAD_METHOD]),
-    socketPath: path.join(dir, "bridge.sock"),
+    socketPath: testSocketPath(dir),
   });
   await server.start();
   const client = createConnection(server.socketPath);
@@ -51,10 +53,17 @@ async function startHarness(): Promise<Harness> {
   const cleanup = async (): Promise<void> => {
     client.destroy();
     await server.stop();
-    await rm(dir, { force: true, recursive: true });
+    if (dir) await rm(dir, { force: true, recursive: true });
   };
   cleanups.push(cleanup);
   return { server, client, audit, reads, cleanup };
+}
+
+function testSocketPath(dir: string | null): string {
+  if (process.platform === "win32") {
+    return `\\\\.\\pipe\\ambient-bridge-binary-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  }
+  return path.join(dir!, "bridge.sock");
 }
 
 function requestUpload(client: Socket, id: string): void {
@@ -64,16 +73,17 @@ function requestUpload(client: Socket, id: string): void {
 // Wraps the read promise in an object so awaiting the lookup does not also
 // await (and auto-flatten) the pending read itself.
 async function readFor(
-  reads: Map<string, Promise<Buffer>>,
+  reads: Map<string, Array<Promise<Buffer>>>,
   id: string,
+  index = 0,
   timeoutMs = 2_000,
 ): Promise<{ read: Promise<Buffer> }> {
   const deadline = Date.now() + timeoutMs;
-  while (!reads.has(id)) {
+  while ((reads.get(id)?.length ?? 0) <= index) {
     if (Date.now() > deadline) throw new Error(`handler for ${id} never started`);
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
-  return { read: reads.get(id)! };
+  return { read: reads.get(id)![index]! };
 }
 
 describe("Bridge IPC binary upload lifecycle", () => {
@@ -131,5 +141,52 @@ describe("Bridge IPC binary upload lifecycle", () => {
     }
 
     await expect(read).rejects.toThrow(/Binary upload exceeds/);
+  });
+
+  it("isolates identical binary request ids across client sockets", async () => {
+    const { server, client: firstClient, reads } = await startHarness();
+    const secondClient = createConnection(server.socketPath);
+    secondClient.on("error", () => undefined);
+    await once(secondClient, "connect");
+    cleanups.push(async () => {
+      secondClient.destroy();
+    });
+
+    requestUpload(firstClient, "shared-id");
+    const { read: firstRead } = await readFor(reads, "shared-id", 0);
+    requestUpload(secondClient, "shared-id");
+    const { read: secondRead } = await readFor(reads, "shared-id", 1);
+
+    firstClient.write(encodeBinaryFrame({
+      type: "binary",
+      id: "shared-id",
+      event: "chunk",
+      seq: 0,
+      bytes: Buffer.from("first"),
+    }));
+    firstClient.write(encodeBinaryFrame({
+      type: "binary",
+      id: "shared-id",
+      event: "end",
+      seq: 1,
+      bytes: Buffer.alloc(0),
+    }));
+    secondClient.write(encodeBinaryFrame({
+      type: "binary",
+      id: "shared-id",
+      event: "chunk",
+      seq: 0,
+      bytes: Buffer.from("second"),
+    }));
+    secondClient.write(encodeBinaryFrame({
+      type: "binary",
+      id: "shared-id",
+      event: "end",
+      seq: 1,
+      bytes: Buffer.alloc(0),
+    }));
+
+    await expect(firstRead).resolves.toEqual(Buffer.from("first"));
+    await expect(secondRead).resolves.toEqual(Buffer.from("second"));
   });
 });

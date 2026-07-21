@@ -31,6 +31,10 @@ export type PairingStoreSnapshot = {
   clients: PairedClient[];
 };
 
+const PENDING_PAIRING_REQUEST_TTL_MS = 10 * 60 * 1000;
+const MAX_PENDING_PAIRING_REQUESTS = 100;
+const MAX_PAIRED_CLIENTS = 50;
+
 export class PairingStore {
   private readonly requests = new Map<string, PairingRequest>();
   private readonly clients = new Map<string, PairedClient>();
@@ -59,6 +63,7 @@ export class PairingStore {
   }
 
   start(clientName: string, now = Date.now()): PairingRequest {
+    this.pruneStalePendingRequests(now);
     const request: PairingRequest = {
       clientName,
       id: randomUUID(),
@@ -66,10 +71,12 @@ export class PairingStore {
       status: "pending",
     };
     this.requests.set(request.id, request);
+    this.prunePendingRequestsToLimit();
     return request;
   }
 
   complete(requestId: string, approved: boolean, now = Date.now()): PairedClient | undefined {
+    this.pruneStalePendingRequests(now);
     const request = this.requests.get(requestId);
     if (!request || request.status !== "pending") {
       return undefined;
@@ -92,6 +99,7 @@ export class PairingStore {
     };
     request.clientId = client.id;
     this.clients.set(client.id, client);
+    this.pruneClientsToLimit(client.id);
     return client;
   }
 
@@ -101,6 +109,7 @@ export class PairingStore {
       return false;
     }
     client.credential.revokedAt = now;
+    this.pruneClientsToLimit();
     return true;
   }
 
@@ -149,6 +158,52 @@ export class PairingStore {
       schemaVersion: 1,
     };
   }
+
+  private pruneStalePendingRequests(now: number): void {
+    for (const request of this.requests.values()) {
+      if (request.status === "pending" && now - request.requestedAt > PENDING_PAIRING_REQUEST_TTL_MS) {
+        this.requests.delete(request.id);
+      }
+    }
+  }
+
+  private prunePendingRequestsToLimit(): void {
+    const pending = [...this.requests.values()]
+      .filter((request) => request.status === "pending")
+      .sort(compareRequestsByRequestedAt);
+
+    while (pending.length > MAX_PENDING_PAIRING_REQUESTS) {
+      const request = pending.shift();
+      if (!request) return;
+      this.requests.delete(request.id);
+    }
+  }
+
+  private pruneClientsToLimit(protectedClientId?: string): void {
+    while (this.clients.size > MAX_PAIRED_CLIENTS) {
+      const client = this.clientToEvict(protectedClientId);
+      if (!client) return;
+      this.clients.delete(client.id);
+    }
+  }
+
+  private clientToEvict(protectedClientId?: string): PairedClient | undefined {
+    const candidates = [...this.clients.values()].filter((client) => client.id !== protectedClientId);
+    const revoked = candidates.filter((client) => client.credential.revokedAt !== undefined);
+    return oldestClient(revoked) ?? oldestClient(candidates);
+  }
+}
+
+function compareRequestsByRequestedAt(left: PairingRequest, right: PairingRequest): number {
+  return left.requestedAt - right.requestedAt || left.id.localeCompare(right.id);
+}
+
+function oldestClient(clients: PairedClient[]): PairedClient | undefined {
+  return clients.sort(compareClientsByPairedAt)[0];
+}
+
+function compareClientsByPairedAt(left: PairedClient, right: PairedClient): number {
+  return left.pairedAt - right.pairedAt || left.id.localeCompare(right.id);
 }
 
 function parsePairingRequest(value: unknown): PairingRequest | null {

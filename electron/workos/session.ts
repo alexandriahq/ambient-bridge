@@ -3,6 +3,8 @@ export type WorkOsOrganization = {
   name: string;
 };
 
+export type WorkOsFeatureFlagsByOrganization = Record<string, readonly string[]>;
+
 export type WorkOsSession =
   | { kind: "signed_out" }
   | {
@@ -22,6 +24,7 @@ export type WorkOsSession =
       organizationName?: string;
       organizations?: WorkOsOrganization[];
       featureFlags?: string[];
+      featureFlagsByOrganization?: WorkOsFeatureFlagsByOrganization;
     };
 
 export type SignedInWorkOsSession = Extract<WorkOsSession, { kind: "signed_in" }>;

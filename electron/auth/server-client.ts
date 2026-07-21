@@ -1,3 +1,5 @@
+import { BUILD_DEFAULT_SERVER_URL } from "../generated/build-config.js";
+
 export type AuthBrokerUser = {
   id: string;
   email: string | null;
@@ -20,8 +22,14 @@ export type AuthOrganization = {
   name: string;
 };
 
+export type AuthOrganizationFeatureFlags = {
+  organizationId: string;
+  featureFlags: string[];
+};
+
 export type AuthOrganizationsResponse = {
   organizations: AuthOrganization[];
+  featureFlagsByOrganization: AuthOrganizationFeatureFlags[];
   organizationId: string | null;
   // Present when validating the session rotated the WorkOS refresh token; the
   // caller must persist this session or the stored one becomes unrefreshable.
@@ -43,10 +51,18 @@ type ServerDelegatedIntegrationTokenResponse = Omit<DelegatedIntegrationTokenRes
 export type AuthServerClientOptions = {
   baseUrl: string;
   fetchImpl?: typeof fetch;
+  requestTimeoutMs?: number;
 };
 
 export type AuthServerHealthOptions = {
   timeoutMs?: number;
+};
+
+export type AuthServerHealthResult = {
+  readonly reachable: boolean;
+  readonly reason: "ok" | "offline" | "dns_failure" | "timeout" | "server_error" | "network_error";
+  readonly message: string;
+  readonly httpStatus?: number | null;
 };
 
 export class AuthServerRequestError extends Error {
@@ -59,20 +75,35 @@ export class AuthServerRequestError extends Error {
   }
 }
 
+export class AuthServerTimeoutError extends Error {
+  readonly _tag = "AuthServerTimeoutError";
+
+  constructor(readonly timeoutMs: number) {
+    super(`Ambient auth server request timed out after ${timeoutMs} ms.`);
+    this.name = "AuthServerTimeoutError";
+  }
+}
+
 export type BridgeAuthCallback =
   | { kind: "success"; ticket: string; clientState: string }
   | { kind: "error"; error: string; errorDescription?: string; clientState: string };
 
 export const BRIDGE_RETURN_URI = "ambient-bridge://auth/callback";
-const DEFAULT_SERVER_URL = "https://api.alexandria.so";
+// Baked at build time by scripts/generate-build-config.mjs. Every standard
+// release channel defaults to production; deliberate staging/local builds use
+// the explicit build-time override. There is no runtime server-URL override, so
+// a shipped app can never be pointed at an arbitrary URL.
+const DEFAULT_SERVER_URL = BUILD_DEFAULT_SERVER_URL;
 
 export class AuthServerClient {
   private readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;
+  private readonly requestTimeoutMs: number;
 
   constructor(options: AuthServerClientOptions) {
     this.baseUrl = normalizeAuthServerBaseUrl(options.baseUrl);
     this.fetchImpl = options.fetchImpl ?? fetch;
+    this.requestTimeoutMs = options.requestTimeoutMs ?? 15_000;
   }
 
   createLoginUrl(clientState: string, returnUri = BRIDGE_RETURN_URI, organizationId?: string): string {
@@ -103,8 +134,18 @@ export class AuthServerClient {
     return this.validateSession(sessionToken, { organizationId });
   }
 
-  listOrganizations(sessionToken: string): Promise<AuthOrganizationsResponse> {
-    return this.postJson("/auth/organizations", { sessionToken }, parseOrganizationsResponse);
+  listOrganizations(
+    sessionToken: string,
+    options: { readonly includeFeatureFlags?: boolean } = {},
+  ): Promise<AuthOrganizationsResponse> {
+    return this.postJson(
+      "/auth/organizations",
+      {
+        ...(options.includeFeatureFlags ? { includeFeatureFlags: true } : {}),
+        sessionToken,
+      },
+      parseOrganizationsResponse,
+    );
   }
 
   async createIntegrationToken(sessionToken: string): Promise<DelegatedIntegrationTokenResponse> {
@@ -117,6 +158,10 @@ export class AuthServerClient {
   }
 
   async checkHealth(options: AuthServerHealthOptions = {}): Promise<boolean> {
+    return (await this.checkHealthDetailed(options)).reachable;
+  }
+
+  async checkHealthDetailed(options: AuthServerHealthOptions = {}): Promise<AuthServerHealthResult> {
     const timeoutMs = options.timeoutMs ?? 2_500;
     const controller = new AbortController();
     const timeout = globalThis.setTimeout(() => controller.abort(), timeoutMs);
@@ -127,9 +172,22 @@ export class AuthServerClient {
         method: "GET",
         signal: controller.signal,
       });
-      return response.ok;
-    } catch {
-      return false;
+      if (response.ok) {
+        return {
+          httpStatus: response.status,
+          message: "Ambient server is reachable.",
+          reachable: true,
+          reason: "ok",
+        };
+      }
+      return {
+        httpStatus: response.status,
+        message: `Ambient server health check returned HTTP ${response.status}.`,
+        reachable: false,
+        reason: "server_error",
+      };
+    } catch (error) {
+      return healthResultFromError(error);
     } finally {
       globalThis.clearTimeout(timeout);
     }
@@ -149,13 +207,31 @@ export class AuthServerClient {
     body: Record<string, unknown>,
     parse: (value: unknown) => T,
   ): Promise<T> {
-    const response = await this.fetchImpl(new URL(path, this.baseUrl), {
-      body: JSON.stringify(body),
-      headers: { "Content-Type": "application/json" },
-      method: "POST",
-    });
+    const timeoutSignal = AbortSignal.timeout(this.requestTimeoutMs);
+    let response: Response;
+    try {
+      response = await this.fetchImpl(new URL(path, this.baseUrl), {
+        body: JSON.stringify(body),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+        signal: timeoutSignal,
+      });
+    } catch (error) {
+      if (timeoutSignal.aborted || isAbortError(error) || isTimeoutError(error)) {
+        throw new AuthServerTimeoutError(this.requestTimeoutMs);
+      }
+      throw error;
+    }
 
-    const responseBody = await response.json().catch(() => ({}));
+    let responseBody: unknown;
+    try {
+      responseBody = await response.json();
+    } catch (error) {
+      if (timeoutSignal.aborted || isTimeoutError(error)) {
+        throw new AuthServerTimeoutError(this.requestTimeoutMs);
+      }
+      responseBody = {};
+    }
     if (!response.ok) {
       const message = asRecord(responseBody).error;
       throw new AuthServerRequestError(response.status, typeof message === "string" ? message : undefined);
@@ -165,8 +241,8 @@ export class AuthServerClient {
   }
 }
 
-export function serverBaseUrlFromEnv(env: NodeJS.ProcessEnv = process.env): string {
-  return normalizeAuthServerBaseUrl(env.AMBIENT_SERVER_URL ?? env.AMBIENT_AUTH_SERVER_URL ?? DEFAULT_SERVER_URL);
+export function resolveServerBaseUrl(): string {
+  return normalizeAuthServerBaseUrl(DEFAULT_SERVER_URL);
 }
 
 export function createAuthLoginUrl(input: {
@@ -189,6 +265,60 @@ export function normalizeAuthServerBaseUrl(rawValue: string): string {
   url.hash = "";
   url.search = "";
   return url.toString().replace(/\/+$/, "");
+}
+
+function healthResultFromError(error: unknown): AuthServerHealthResult {
+  if (isAbortError(error)) {
+    return {
+      message: "Ambient server health check timed out.",
+      reachable: false,
+      reason: "timeout",
+    };
+  }
+
+  const code = errorCode(error);
+  if (code === "ENETUNREACH" || code === "EHOSTUNREACH" || code === "ENETDOWN") {
+    return {
+      message: "No internet route is available for Ambient Bridge.",
+      reachable: false,
+      reason: "offline",
+    };
+  }
+  if (code === "ENOTFOUND" || code === "EAI_AGAIN") {
+    return {
+      message: "DNS lookup for the Ambient server failed.",
+      reachable: false,
+      reason: "dns_failure",
+    };
+  }
+  if (code === "ETIMEDOUT") {
+    return {
+      message: "Ambient server health check timed out.",
+      reachable: false,
+      reason: "timeout",
+    };
+  }
+
+  return {
+    message: "Ambient Bridge could not reach the Ambient server.",
+    reachable: false,
+    reason: "network_error",
+  };
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
+function isTimeoutError(error: unknown): boolean {
+  return error instanceof Error && error.name === "TimeoutError";
+}
+
+function errorCode(error: unknown, depth = 0): string | null {
+  if (!error || typeof error !== "object" || depth > 4) return null;
+  const record = error as { readonly code?: unknown; readonly cause?: unknown };
+  if (typeof record.code === "string" && record.code) return record.code;
+  return errorCode(record.cause, depth + 1);
 }
 
 export function parseBridgeAuthCallback(rawValue: string, expectedClientState?: string): BridgeAuthCallback {
@@ -273,10 +403,28 @@ function parseOrganizationsResponse(value: unknown): AuthOrganizationsResponse {
     organizations.push({ id, name });
   }
   return {
+    featureFlagsByOrganization: parseFeatureFlagsByOrganization(body.featureFlagsByOrganization),
     organizations,
     organizationId: expectOptionalNullableString(body.organizationId),
     session: body.session ? parseSessionResponse(body.session) : null,
   };
+}
+
+function parseFeatureFlagsByOrganization(value: unknown): AuthOrganizationFeatureFlags[] {
+  if (!Array.isArray(value)) return [];
+  const entries: AuthOrganizationFeatureFlags[] = [];
+  for (const item of value) {
+    const entry = asRecord(item);
+    const organizationId = typeof entry.organizationId === "string" && entry.organizationId
+      ? entry.organizationId
+      : null;
+    if (!organizationId) continue;
+    entries.push({
+      featureFlags: parseFeatureFlagSlugs(entry.featureFlags),
+      organizationId,
+    });
+  }
+  return entries.sort((a, b) => a.organizationId.localeCompare(b.organizationId));
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

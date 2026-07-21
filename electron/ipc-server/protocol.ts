@@ -163,5 +163,69 @@ function parseFrame(body: Buffer): Exclude<BridgeFrame, BridgeBinaryFrame> {
   if (parsed.type === "binary") {
     throw new Error("Binary IPC frames must use binary framing");
   }
-  return parsed as Exclude<BridgeFrame, BridgeBinaryFrame>;
+  if (!isValidFrame(parsed)) {
+    throw new Error("Invalid IPC frame");
+  }
+  return parsed;
+}
+
+function isValidFrame(frame: BridgeFrame): frame is Exclude<BridgeFrame, BridgeBinaryFrame> {
+  switch (frame.type) {
+    case "request":
+      return typeof frame.id === "string"
+        && frame.id.length > 0
+        && typeof frame.method === "string"
+        && frame.method.length > 0
+        && optionalJsonValue(frame.payload)
+        && optionalAuth(frame.auth);
+    case "response":
+      return typeof frame.id === "string"
+        && frame.id.length > 0
+        && optionalJsonValue(frame.payload);
+    case "stream":
+      return typeof frame.id === "string"
+        && frame.id.length > 0
+        && (frame.event === "start" || frame.event === "delta" || frame.event === "end")
+        && optionalJsonValue(frame.payload);
+    case "error":
+      return typeof frame.id === "string"
+        && frame.id.length > 0
+        && typeof frame.code === "string"
+        && frame.code.length > 0
+        && typeof frame.message === "string";
+    case "cancel":
+      return typeof frame.id === "string"
+        && frame.id.length > 0
+        && optionalAuth(frame.auth);
+    case "binary":
+      return false;
+    default:
+      return false;
+  }
+}
+
+function optionalAuth(auth: BridgeRequestAuth | undefined): boolean {
+  return auth === undefined || (
+    typeof auth === "object"
+    && auth !== null
+    && typeof auth.credentialId === "string"
+    && typeof auth.timestamp === "number"
+    && Number.isFinite(auth.timestamp)
+    && typeof auth.nonce === "string"
+    && typeof auth.bodyHash === "string"
+    && typeof auth.signature === "string"
+  );
+}
+
+function optionalJsonValue(value: JsonValue | undefined): boolean {
+  return value === undefined || isJsonValue(value);
+}
+
+function isJsonValue(value: unknown, depth = 0): value is JsonValue {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (depth > 64) return false;
+  if (Array.isArray(value)) return value.every((item) => isJsonValue(item, depth + 1));
+  if (typeof value !== "object") return false;
+  return Object.values(value as Record<string, unknown>).every((item) => isJsonValue(item, depth + 1));
 }

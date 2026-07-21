@@ -1,6 +1,6 @@
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
-import type { WorkOsSession } from "./session.js";
+import type { SignedInWorkOsSession, WorkOsSession } from "./session.js";
 
 export type TokenCrypto = {
   encryptString(value: string): Buffer;
@@ -8,8 +8,11 @@ export type TokenCrypto = {
   isEncryptionAvailable(): boolean;
 };
 
+export type SessionStoreWriteResult = "session_changed" | "signed_out" | "written";
+
 export class EncryptedSessionStore {
   private cached: WorkOsSession | undefined;
+  private mutationQueue: Promise<void> = Promise.resolve();
   private readPromise: Promise<WorkOsSession> | undefined;
   private revision = 0;
 
@@ -44,6 +47,49 @@ export class EncryptedSessionStore {
   }
 
   async write(session: WorkOsSession): Promise<void> {
+    await this.mutate(async () => this.writeUnlocked(session));
+  }
+
+  async clear(): Promise<void> {
+    await this.mutate(async () => this.clearUnlocked());
+  }
+
+  async clearIfCurrent(expectedSession: SignedInWorkOsSession): Promise<boolean> {
+    return await this.mutate(async () => {
+      const current = await this.read();
+      if (
+        current.kind !== "signed_in"
+        || current.user.id !== expectedSession.user.id
+        || current.sessionToken !== expectedSession.sessionToken
+      ) {
+        return false;
+      }
+
+      await this.clearUnlocked();
+      return true;
+    });
+  }
+
+  async writeIfCurrent(
+    nextSession: SignedInWorkOsSession,
+    expectedSession: SignedInWorkOsSession,
+  ): Promise<SessionStoreWriteResult> {
+    return await this.mutate(async () => {
+      const current = await this.read();
+      if (current.kind !== "signed_in") return "signed_out";
+      if (
+        current.user.id !== expectedSession.user.id
+        || current.sessionToken !== expectedSession.sessionToken
+      ) {
+        return "session_changed";
+      }
+
+      await this.writeUnlocked(nextSession);
+      return "written";
+    });
+  }
+
+  private async writeUnlocked(session: WorkOsSession): Promise<void> {
     if (!this.crypto.isEncryptionAvailable()) {
       throw new Error("OS-backed encryption is unavailable");
     }
@@ -55,10 +101,19 @@ export class EncryptedSessionStore {
     this.cached = session;
   }
 
-  async clear(): Promise<void> {
+  private async clearUnlocked(): Promise<void> {
     this.revision += 1;
     this.cached = { kind: "signed_out" };
     this.readPromise = undefined;
     await rm(this.path, { force: true });
+  }
+
+  private mutate<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.mutationQueue.then(operation);
+    this.mutationQueue = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
   }
 }

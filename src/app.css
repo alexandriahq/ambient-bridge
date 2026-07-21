@@ -1,0 +1,38 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "@ambient/shared/design/app.css";
+@source "../shared/src/design";
+@source "../shared/src/notifications";
+
+/*
+ * Bridge renderer — app-shell chrome only. The design language (colors, type,
+ * radius, dark variant) is owned by @ambient/shared/design and imported above;
+ * components read its semantic tokens.
+ * Only genuinely-global window chrome that isn't expressible as component
+ * utility classes lives here.
+ */
+
+html,
+body,
+#app {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
+body {
+  margin: 0;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Electron titlebar: the whole window drags except interactive controls. */
+button,
+input,
+a,
+select,
+textarea {
+  -webkit-app-region: no-drag;
+}

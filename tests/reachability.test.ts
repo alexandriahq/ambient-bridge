@@ -28,14 +28,14 @@ describe("ServerReachabilityMonitor", () => {
       ttlMs: 8_000,
     });
 
-    expect(monitor.current()).toBe("checking");
-    expect(monitor.current()).toBe("checking");
+    expect(monitor.current()).toMatchObject({ reason: "not_checked", state: "checking" });
+    expect(monitor.current()).toMatchObject({ state: "checking" });
     expect(probe).toHaveBeenCalledTimes(1);
 
     probeResult.resolve(true);
     await flushPromises();
 
-    expect(monitor.current()).toBe("reachable");
+    expect(monitor.current()).toMatchObject({ reason: "ok", state: "reachable" });
   });
 
   it("keeps the last visible state while a later stale check runs", async () => {
@@ -56,20 +56,41 @@ describe("ServerReachabilityMonitor", () => {
       ttlMs: 8_000,
     });
 
-    expect(monitor.current()).toBe("checking");
+    expect(monitor.current()).toMatchObject({ state: "checking" });
     probeResults[0]?.resolve(true);
     await flushPromises();
-    expect(monitor.current()).toBe("reachable");
+    expect(monitor.current()).toMatchObject({ state: "reachable" });
 
     now += 8_001;
-    expect(monitor.current()).toBe("reachable");
+    expect(monitor.current()).toMatchObject({ state: "reachable" });
     expect(probe).toHaveBeenCalledTimes(2);
 
     probeResults[1]?.resolve(false);
     await flushPromises();
 
-    expect(monitor.current()).toBe("unavailable");
-    expect(onReachabilityChange).toHaveBeenCalledWith(false);
+    expect(monitor.current()).toMatchObject({ reason: "network_error", state: "unavailable" });
+    expect(onReachabilityChange).toHaveBeenCalledWith(false, expect.objectContaining({ state: "unavailable" }));
     expect(onStateChange).toHaveBeenCalledTimes(2);
+  });
+
+  it("exposes sanitized failure reasons from detailed probes", async () => {
+    const monitor = new ServerReachabilityMonitor({
+      clock: () => 1_700_000_000_000,
+      probe: async () => ({
+        httpStatus: 503,
+        message: "Ambient server health check returned HTTP 503.",
+        reachable: false,
+        reason: "server_error",
+      }),
+      ttlMs: 8_000,
+    });
+
+    await expect(monitor.refresh()).resolves.toMatchObject({
+      checkedAt: 1_700_000_000_000,
+      httpStatus: 503,
+      message: "Ambient server health check returned HTTP 503.",
+      reason: "server_error",
+      state: "unavailable",
+    });
   });
 });

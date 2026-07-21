@@ -31,4 +31,32 @@ describe("IPC protocol framing", () => {
 
     expect(decoder.push(encodeFrame(frame))).toEqual([frame]);
   });
+
+  it("rejects malformed frames before they reach handlers", () => {
+    const missingMethod = { id: "req_1", type: "request" };
+    const invalidStreamEvent = { event: "sideways", id: "req_2", type: "stream" };
+    const invalidAuth = {
+      auth: { bodyHash: "hash", credentialId: "cred", nonce: "nonce", signature: "sig", timestamp: "soon" },
+      id: "req_3",
+      method: "bridge.status",
+      type: "request",
+    };
+
+    for (const frame of [missingMethod, invalidStreamEvent, invalidAuth]) {
+      const decoder = new FrameDecoder();
+      expect(() => decoder.push(encodeFrame(frame as never))).toThrow(/Invalid IPC frame/);
+    }
+  });
+
+  it("rejects frames above the decoder byte limit", () => {
+    const decoder = new FrameDecoder(16);
+    const frame: BridgeFrame = {
+      id: "req_large",
+      method: "bridge.health",
+      payload: { message: "this frame is intentionally too large" },
+      type: "request",
+    };
+
+    expect(() => decoder.push(encodeFrame(frame))).toThrow(/IPC frame exceeds 16 bytes/);
+  });
 });

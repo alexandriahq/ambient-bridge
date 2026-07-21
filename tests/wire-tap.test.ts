@@ -8,7 +8,7 @@ function host(fetchImpl: FetchHost["fetch"]): FetchHost {
 }
 
 function sealedRequest(requestId: string, body: Uint8Array, extraHeaders: Record<string, string> = {}): Request {
-  return new Request("https://api.alexandria.so/v1/chat/completions", {
+  return new Request("https://ambientserver-staging.up.railway.app/v1/chat/completions", {
     body,
     headers: {
       "authorization": "Bearer super-secret-session-token",
@@ -40,7 +40,7 @@ describe("WireTap", () => {
     const capture = tap.get("req_1");
     expect(capture).not.toBeNull();
     expect(capture!.request.method).toBe("POST");
-    expect(capture!.request.url).toBe("https://api.alexandria.so/v1/chat/completions");
+    expect(capture!.request.url).toBe("https://ambientserver-staging.up.railway.app/v1/chat/completions");
     expect(capture!.request.body.base64).toBe(Buffer.from([1, 2, 3, 4]).toString("base64"));
     expect(capture!.response?.status).toBe(200);
     expect(capture!.response?.body.base64).toBe(Buffer.from([9, 8, 7, 6]).toString("base64"));
@@ -68,7 +68,7 @@ describe("WireTap", () => {
     const tap = new WireTap();
     tap.install(h);
 
-    await h.fetch(new Request("https://api.alexandria.so/healthz", {
+    await h.fetch(new Request("https://ambientserver-staging.up.railway.app/healthz", {
       headers: { "x-ambient-request-id": "req_health" },
     }));
     await flush();
@@ -83,7 +83,7 @@ describe("WireTap", () => {
     const tap = new WireTap();
     tap.install(h);
 
-    const req = new Request("https://api.alexandria.so/v1/responses", {
+    const req = new Request("https://ambientserver-staging.up.railway.app/v1/responses", {
       body: new Uint8Array([1]),
       headers: { "ehbp-encapsulated-key": "key" },
       method: "POST",
@@ -106,6 +106,118 @@ describe("WireTap", () => {
     const body = tap.get("req_big")!.request.body;
     expect(body.capturedBytes).toBe(16);
     expect(body.truncated).toBe(true);
+  });
+
+  it("retains complete production-sized request ciphertext within the 8 MiB bound", async () => {
+    const fetchImpl = vi.fn(async () => new Response("ok"));
+    const h = host(fetchImpl);
+    const tap = new WireTap();
+    tap.install(h);
+    const payload = new Uint8Array(6 * 1024 * 1024).fill(7);
+
+    await h.fetch(sealedRequest("req_complete", payload));
+    await flush();
+
+    const body = tap.get("req_complete")!.request.body;
+    expect(body.capturedBytes).toBe(payload.byteLength);
+    expect(body.byteLength).toBe(payload.byteLength);
+    expect(body.truncated).toBe(false);
+  });
+
+  it("keeps encrypted response previews bounded at 16 KiB", async () => {
+    const fetchImpl = vi.fn(async () => new Response(new Uint8Array(20 * 1024).fill(9)));
+    const h = host(fetchImpl);
+    const tap = new WireTap();
+    tap.install(h);
+
+    await h.fetch(sealedRequest("req_response_preview", new Uint8Array([1])));
+    await flush();
+
+    expect(tap.get("req_response_preview")!.response?.body).toMatchObject({
+      capturedBytes: 16 * 1024,
+      truncated: true,
+    });
+  });
+
+  it("retains a fast encrypted response when request capture storage finishes later", async () => {
+    let releaseRequestBody!: () => void;
+    const requestBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        releaseRequestBody = () => {
+          controller.enqueue(new Uint8Array([1, 2, 3]));
+          controller.close();
+        };
+      },
+    });
+    const request = new Request("https://ambientserver-staging.up.railway.app/v1/responses", {
+      body: requestBody,
+      duplex: "half",
+      headers: {
+        "ehbp-encapsulated-key": "key",
+        "x-ambient-request-id": "req_response_race",
+      },
+      method: "POST",
+    } as RequestInit & { duplex: "half" });
+    const h = host(vi.fn(async () => new Response(new Uint8Array([9, 8, 7]))));
+    const tap = new WireTap();
+    tap.install(h);
+
+    await h.fetch(request);
+    expect(tap.get("req_response_race")).toBeNull();
+    releaseRequestBody();
+    await flush();
+
+    expect(tap.get("req_response_race")?.response?.body.base64).toBe(
+      Buffer.from([9, 8, 7]).toString("base64"),
+    );
+  });
+
+  it("does not mark an exact-cap body truncated after observing EOF", async () => {
+    const fetchImpl = vi.fn(async () => new Response("ok"));
+    const h = host(fetchImpl);
+    const tap = new WireTap({ maxBytes: 16 });
+    tap.install(h);
+
+    await h.fetch(sealedRequest("req_exact", new Uint8Array(16).fill(4)));
+    await flush();
+
+    expect(tap.get("req_exact")!.request.body).toMatchObject({
+      byteLength: 16,
+      capturedBytes: 16,
+      truncated: false,
+    });
+  });
+
+  it("evicts oldest captures when the aggregate byte budget is reached", async () => {
+    const fetchImpl = vi.fn(async () => new Response(null));
+    const h = host(fetchImpl);
+    const onEvict = vi.fn();
+    const tap = new WireTap({ maxBytes: 16, maxTotalBytes: 5, onEvict });
+    tap.install(h);
+
+    await h.fetch(sealedRequest("req_budget_a", new Uint8Array([1, 2, 3])));
+    await h.fetch(sealedRequest("req_budget_b", new Uint8Array([4, 5, 6])));
+    await flush();
+
+    expect(tap.get("req_budget_a")).toBeNull();
+    expect(tap.get("req_budget_b")).not.toBeNull();
+    expect(onEvict).toHaveBeenCalledWith("req_budget_a");
+  });
+
+  it("clears retained ciphertext and rejects late capture work across account boundaries", async () => {
+    let resolveResponse!: (response: Response) => void;
+    const response = new Promise<Response>((resolve) => { resolveResponse = resolve; });
+    const h = host(vi.fn(() => response));
+    const tap = new WireTap();
+    tap.install(h);
+
+    const pending = h.fetch(sealedRequest("req_old_account", new Uint8Array([1, 2, 3])));
+    tap.clear();
+    resolveResponse(new Response(new Uint8Array([4, 5, 6])));
+    await pending;
+    await flush();
+
+    expect(tap.get("req_old_account")).toBeNull();
   });
 
   it("evicts old captures beyond the retention limit", async () => {

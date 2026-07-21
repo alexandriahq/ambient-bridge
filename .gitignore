@@ -1,17 +1,17 @@
-# macOS Finder metadata
-.DS_Store
-._*
-.AppleDouble
-.LSOverride
-
-.env
-.env.*
-!.env.example
-
 node_modules/
 dist/
 dist-packaged/
-out/
-.svelte-kit/
-.vite/
+playwright-report/
+test-results/
+electron/generated/
+.DS_Store
 *.log
+
+# Local configuration and release credentials are never source artifacts.
+.env
+.env.*
+!.env.mock
+*.p8
+*.p12
+*.cer
+*.mobileprovision

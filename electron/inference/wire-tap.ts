@@ -7,8 +7,10 @@
  * exact HPKE-sealed request ciphertext and the encrypted response, then surface
  * them in the "Network Logs" view for transparency over confidential compute.
  *
- * This deliberately overrides the AGENTS.md §6 guidance ("Bridge never surfaces
- * encrypted bodies"): the captured bytes are ciphertext only (never plaintext),
+ * This is the bounded exception to the default logging guidance
+ * (docs/agents/observability.md, "never surface inference bodies") that
+ * docs/agents/security-model.md calls out for Bridge: the captured bytes are
+ * ciphertext only (never plaintext),
  * the session token is redacted from headers, captures are size-capped and held
  * in memory only (never written to the audit log or disk), and they are served
  * to the local renderer on demand rather than streamed through status polling.
@@ -53,29 +55,46 @@ export type FetchHost = { fetch: FetchLike };
 export type WireTapOptions = {
   /** Max distinct request captures retained (ring buffer). */
   limit?: number;
-  /** Max bytes captured per body. */
+  /** Legacy override that applies the same cap to request and response bodies. */
   maxBytes?: number;
+  /** Max bytes captured from a sealed request body. */
+  maxRequestBytes?: number;
+  /** Max bytes captured from an encrypted response body. */
+  maxResponseBytes?: number;
+  /** Max raw ciphertext bytes retained across all captures. */
+  maxTotalBytes?: number;
   /** Notified (with the request id) whenever a capture is created or updated. */
   onUpdate?: (requestId: string) => void;
+  /** Notified when a retained capture is removed by a count or byte bound. */
+  onEvict?: (requestId: string) => void;
 };
 
 const REQUEST_ID_HEADER = "x-ambient-request-id";
 const ENCAPSULATED_KEY_HEADER = "ehbp-encapsulated-key";
 const REDACTED_HEADER_PATTERN = /^(authorization|cookie|set-cookie|x-ambient-session-token)$/i;
 const DEFAULT_LIMIT = 50;
-const DEFAULT_MAX_BYTES = 16 * 1024;
+const DEFAULT_MAX_REQUEST_BYTES = 8 * 1024 * 1024;
+const DEFAULT_MAX_RESPONSE_BYTES = 16 * 1024;
+const DEFAULT_MAX_TOTAL_BYTES = 32 * 1024 * 1024;
 
 export class WireTap {
   private readonly captures = new Map<string, WireCapture>();
   private readonly order: string[] = [];
   private readonly limit: number;
-  private readonly maxBytes: number;
+  private readonly maxRequestBytes: number;
+  private readonly maxResponseBytes: number;
+  private readonly maxTotalBytes: number;
+  private readonly onEvict?: (requestId: string) => void;
   private readonly onUpdate?: (requestId: string) => void;
   private installed = false;
+  private generation = 0;
 
   constructor(options: WireTapOptions = {}) {
     this.limit = options.limit ?? DEFAULT_LIMIT;
-    this.maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
+    this.maxRequestBytes = options.maxRequestBytes ?? options.maxBytes ?? DEFAULT_MAX_REQUEST_BYTES;
+    this.maxResponseBytes = options.maxResponseBytes ?? options.maxBytes ?? DEFAULT_MAX_RESPONSE_BYTES;
+    this.maxTotalBytes = options.maxTotalBytes ?? DEFAULT_MAX_TOTAL_BYTES;
+    this.onEvict = options.onEvict;
     this.onUpdate = options.onUpdate;
   }
 
@@ -94,6 +113,12 @@ export class WireTap {
     return structuredClone(capture);
   }
 
+  clear(): void {
+    this.generation += 1;
+    this.captures.clear();
+    this.order.length = 0;
+  }
+
   private async intercept(
     originalFetch: FetchLike,
     input: RequestInfo | URL,
@@ -109,9 +134,11 @@ export class WireTap {
     // Read the sealed request bytes from a clone, in parallel with the real send.
     const requestClone = request.clone();
     const responsePromise = originalFetch(request);
+    const captureGeneration = this.generation;
 
-    void this.readBody(requestClone.body, contentLength(request.headers))
+    const requestStored = this.readBody(requestClone.body, contentLength(request.headers), this.maxRequestBytes)
       .then((body) => {
+        if (captureGeneration !== this.generation) return;
         this.store(requestId, {
           requestId,
           at: Date.now(),
@@ -124,16 +151,20 @@ export class WireTap {
           response: null,
         });
         this.onUpdate?.(requestId);
-      })
-      .catch(() => {});
+      });
+    void requestStored.catch(() => {});
 
     const response = await responsePromise;
 
     // Capture the encrypted response from a tee'd clone so the SDK still decrypts
     // the original untouched. Reading is capped and cancels early on large streams.
     const responseClone = response.clone();
-    void this.readBody(responseClone.body, contentLength(response.headers))
-      .then((body) => {
+    void Promise.all([
+      requestStored,
+      this.readBody(responseClone.body, contentLength(response.headers), this.maxResponseBytes),
+    ])
+      .then(([, body]) => {
+        if (captureGeneration !== this.generation) return;
         const existing = this.captures.get(requestId);
         if (!existing) return;
         existing.response = {
@@ -141,6 +172,7 @@ export class WireTap {
           headers: sanitizeHeaders(response.headers),
           body,
         };
+        this.prune();
         this.onUpdate?.(requestId);
       })
       .catch(() => {});
@@ -160,17 +192,38 @@ export class WireTap {
   private store(requestId: string, capture: WireCapture): void {
     if (!this.captures.has(requestId)) {
       this.order.push(requestId);
-      while (this.order.length > this.limit) {
-        const evicted = this.order.shift();
-        if (evicted !== undefined) this.captures.delete(evicted);
-      }
     }
     this.captures.set(requestId, capture);
+    this.prune();
+  }
+
+  private prune(): void {
+    while (this.order.length > this.limit || this.retainedBytes() > this.maxTotalBytes) {
+      if (!this.evictOldest()) break;
+    }
+  }
+
+  private evictOldest(): boolean {
+    const requestId = this.order.shift();
+    if (requestId === undefined) return false;
+    const deleted = this.captures.delete(requestId);
+    if (deleted) this.onEvict?.(requestId);
+    return true;
+  }
+
+  private retainedBytes(): number {
+    let total = 0;
+    for (const capture of this.captures.values()) {
+      total += capture.request.body.capturedBytes;
+      total += capture.response?.body.capturedBytes ?? 0;
+    }
+    return total;
   }
 
   private async readBody(
     stream: ReadableStream<Uint8Array> | null,
     declaredLength: number | null,
+    maxBytes: number,
   ): Promise<WireBody> {
     if (!stream) {
       return { base64: "", byteLength: declaredLength ?? 0, capturedBytes: 0, truncated: false };
@@ -180,11 +233,15 @@ export class WireTap {
     let captured = 0;
     let truncated = false;
     try {
-      while (captured < this.maxBytes) {
+      while (true) {
         const { done, value } = await reader.read();
         if (done) break;
         if (!value || value.byteLength === 0) continue;
-        const remaining = this.maxBytes - captured;
+        const remaining = maxBytes - captured;
+        if (remaining <= 0) {
+          truncated = true;
+          break;
+        }
         if (value.byteLength <= remaining) {
           chunks.push(value);
           captured += value.byteLength;
@@ -195,7 +252,6 @@ export class WireTap {
           break;
         }
       }
-      if (captured >= this.maxBytes) truncated = true;
     } finally {
       void reader.cancel().catch(() => {});
     }

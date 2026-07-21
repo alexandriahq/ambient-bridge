@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, rm } from "node:fs/promises";
+import { chmod, mkdir, rm } from "node:fs/promises";
 import { dirname } from "node:path";
 import { createServer, type Server, type Socket } from "node:net";
 import {
@@ -19,12 +19,15 @@ import { errorMessage } from "../error-message.js";
 export type IpcStream = AsyncIterable<JsonValue | undefined>;
 export type IpcHandlerResult = JsonValue | undefined | IpcStream;
 export type IpcHandlerContext = {
+  /** Verified owner for authenticated methods. */
+  credentialId?: string;
   readBinaryUpload: (options?: BinaryUploadReadOptions) => Promise<Buffer>;
   /** Resolves when the requesting socket closes; lets long-lived streams end. */
   socketClosed?: Promise<void>;
 };
 export type IpcMethodHandler = (frame: BridgeRequestFrame, context: IpcHandlerContext) => IpcHandlerResult | Promise<IpcHandlerResult>;
-export type IpcWritable = Pick<Socket, "write">;
+export type IpcWritable = Pick<Socket, "write">
+  & Partial<Pick<Socket, "destroyed" | "writableEnded" | "once" | "off">>;
 
 export type BinaryUploadReadOptions = {
   readonly expectedByteLength?: number;
@@ -49,9 +52,12 @@ export type BridgeIpcServerOptions = {
 
 export class BridgeIpcServer {
   private server?: Server;
+  private startPromise?: Promise<void>;
+  private stopPromise?: Promise<void>;
+  private readonly sockets = new Set<Socket>();
   private readonly replayCache = new ReplayCache();
   private readonly publicMethods: Set<string>;
-  private readonly binaryUploads = new Map<string, BinaryUploadState>();
+  private readonly binaryUploads = new Map<Socket, Map<string, BinaryUploadState>>();
 
   constructor(private readonly options: BridgeIpcServerOptions) {
     this.publicMethods = options.publicMethods ?? new Set(["bridge.health", "pair.start", "pair.complete"]);
@@ -62,35 +68,91 @@ export class BridgeIpcServer {
   }
 
   async start(): Promise<void> {
+    if (this.stopPromise) await this.stopPromise;
+    if (this.server?.listening) return;
+    if (this.startPromise) return this.startPromise;
+
+    const startPromise = this.startInternal();
+    this.startPromise = startPromise;
+    try {
+      await startPromise;
+    } finally {
+      if (this.startPromise === startPromise) this.startPromise = undefined;
+    }
+  }
+
+  private async startInternal(): Promise<void> {
     if (!isWindowsPipePath(this.options.socketPath)) {
       await mkdir(dirname(this.options.socketPath), { recursive: true });
       await rm(this.options.socketPath, { force: true });
     }
 
-    this.server = createServer((socket) => this.handleSocket(socket));
-    await new Promise<void>((resolve, reject) => {
-      this.server?.once("error", reject);
-      this.server?.listen(this.options.socketPath, () => {
-        this.server?.off("error", reject);
-        resolve();
+    const server = createServer((socket) => this.handleSocket(socket));
+    this.server = server;
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(this.options.socketPath, () => {
+          server.off("error", reject);
+          resolve();
+        });
       });
-    });
+    } catch (error) {
+      if (this.server === server) this.server = undefined;
+      throw error;
+    }
+    if (!isWindowsPipePath(this.options.socketPath)) {
+      try {
+        await chmod(this.options.socketPath, 0o600);
+      } catch (error) {
+        this.options.audit.record("ipc.socket_chmod_failed", { message: errorMessage(error) });
+      }
+    }
   }
 
   async stop(): Promise<void> {
-    await new Promise<void>((resolve, reject) => {
-      if (!this.server) {
-        resolve();
-        return;
-      }
-      this.server.close((error) => (error ? reject(error) : resolve()));
-    });
+    if (this.stopPromise) return this.stopPromise;
+
+    const stopPromise = this.stopInternal();
+    this.stopPromise = stopPromise;
+    try {
+      await stopPromise;
+    } finally {
+      if (this.stopPromise === stopPromise) this.stopPromise = undefined;
+    }
+  }
+
+  private async stopInternal(): Promise<void> {
+    if (this.startPromise) {
+      await this.startPromise.catch(() => undefined);
+    }
+
+    const server = this.server;
+    this.server = undefined;
+    const closePromise = server?.listening
+      ? new Promise<void>((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      })
+      : Promise.resolve();
+
+    // `net.Server.close()` waits for accepted connections. Bridge intentionally
+    // has long-lived status streams, so close them explicitly; their close event
+    // resolves `socketClosed` and releases handler/binary-upload state.
+    for (const socket of this.sockets) {
+      this.dropSocketUploads(socket, "server_stopped");
+      socket.destroy();
+    }
+
+    await closePromise;
     if (!isWindowsPipePath(this.options.socketPath)) {
       await rm(this.options.socketPath, { force: true });
     }
   }
 
   private handleSocket(socket: Socket): void {
+    this.sockets.add(socket);
+    const binaryUploads = new Map<string, BinaryUploadState>();
+    this.binaryUploads.set(socket, binaryUploads);
     const decoder = new FrameDecoder();
     // Without a listener, a peer disconnecting while we write (EPIPE,
     // write-after-destroy) raises an unhandled 'error' event and crashes the
@@ -102,18 +164,14 @@ export class BridgeIpcServer {
       socket.once("close", () => resolve());
     });
     socket.on("close", () => {
-      for (const [id, upload] of this.binaryUploads) {
-        if (upload.socket !== socket) continue;
-        this.failBinaryUpload(upload, new Error("Bridge IPC connection closed during binary upload."));
-        this.binaryUploads.delete(id);
-        this.options.audit.record("ipc.binary_upload_dropped", { id, reason: "connection_closed" });
-      }
+      this.sockets.delete(socket);
+      this.dropSocketUploads(socket, "connection_closed");
     });
     socket.on("data", (chunk) => {
       try {
         const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
         for (const frame of decoder.push(buffer)) {
-          void this.handleFrame(socket, frame, socketClosed);
+          void this.handleFrame(socket, binaryUploads, frame, socketClosed);
         }
       } catch (error) {
         this.options.audit.record("ipc.frame_error", { message: errorMessage(error) });
@@ -122,14 +180,19 @@ export class BridgeIpcServer {
     });
   }
 
-  private async handleFrame(socket: Socket, frame: BridgeFrame, socketClosed?: Promise<void>): Promise<void> {
+  private async handleFrame(
+    socket: Socket,
+    binaryUploads: Map<string, BinaryUploadState>,
+    frame: BridgeFrame,
+    socketClosed?: Promise<void>,
+  ): Promise<void> {
     if (frame.type === "cancel") {
       await this.handleCancelFrame(socket, frame);
       return;
     }
 
     if (frame.type === "binary") {
-      this.handleBinaryFrame(socket, frame);
+      this.handleBinaryFrame(binaryUploads, frame);
       return;
     }
 
@@ -146,6 +209,7 @@ export class BridgeIpcServer {
 
     this.options.audit.record("ipc.request", { method: frame.method });
 
+    let credentialId: string | undefined;
     if (!this.publicMethods.has(frame.method)) {
       const credential = frame.auth
         ? this.options.pairingStore.findCredential(frame.auth.credentialId)
@@ -163,15 +227,18 @@ export class BridgeIpcServer {
         socket.write(encodeFrame({ type: "error", id: frame.id, code: auth.reason, message: "Unauthorized" }));
         return;
       }
+      credentialId = auth.credentialId;
     }
 
-    if (frame.method === "inference.audioTranscriptions") {
-      this.openBinaryUpload(socket, frame.id);
-    }
-
+    let binaryUploadOpened = false;
     try {
+      if (frame.method === "inference.audioTranscriptions") {
+        this.openBinaryUpload(binaryUploads, frame.id);
+        binaryUploadOpened = true;
+      }
       const context: IpcHandlerContext = {
-        readBinaryUpload: (options) => this.readBinaryUpload(frame.id, options),
+        credentialId,
+        readBinaryUpload: (options) => this.readBinaryUpload(binaryUploads, frame.id, options),
         socketClosed,
       };
       const result = await handler(frame, context);
@@ -193,40 +260,34 @@ export class BridgeIpcServer {
         message: safeHandlerErrorMessage(error),
       }));
     } finally {
-      if (frame.method === "inference.audioTranscriptions") {
-        this.binaryUploads.delete(frame.id);
+      if (binaryUploadOpened) {
+        binaryUploads.delete(frame.id);
       }
     }
   }
 
-  private openBinaryUpload(socket: Socket, id: string): void {
-    let active = 0;
-    for (const upload of this.binaryUploads.values()) {
-      if (upload.socket === socket) active += 1;
+  private openBinaryUpload(binaryUploads: Map<string, BinaryUploadState>, id: string): void {
+    if (binaryUploads.has(id)) {
+      throw new Error("Binary upload request id is already active on this connection.");
     }
     const state: BinaryUploadState = {
       bytes: 0,
       chunks: [],
       ended: false,
       expectedSeq: 0,
-      socket,
       waiters: [],
     };
-    if (active >= MAX_BINARY_UPLOADS_PER_SOCKET) {
+    if (binaryUploads.size >= MAX_BINARY_UPLOADS_PER_SOCKET) {
       state.error = new Error(`Too many concurrent binary uploads (limit ${MAX_BINARY_UPLOADS_PER_SOCKET}).`);
       this.options.audit.record("ipc.binary_upload_rejected", { id, reason: "concurrency_limit" });
     }
-    this.binaryUploads.set(id, state);
+    binaryUploads.set(id, state);
   }
 
-  private handleBinaryFrame(socket: Socket, frame: BridgeBinaryFrame): void {
-    const upload = this.binaryUploads.get(frame.id);
+  private handleBinaryFrame(binaryUploads: Map<string, BinaryUploadState>, frame: BridgeBinaryFrame): void {
+    const upload = binaryUploads.get(frame.id);
     if (!upload) {
       this.options.audit.record("ipc.binary_orphan", { id: frame.id });
-      return;
-    }
-    if (upload.socket !== socket) {
-      this.options.audit.record("ipc.binary_orphan", { id: frame.id, reason: "wrong_connection" });
       return;
     }
     if (upload.error || upload.ended) return;
@@ -248,8 +309,12 @@ export class BridgeIpcServer {
     this.resolveBinaryWaiters(upload);
   }
 
-  private readBinaryUpload(id: string, options: BinaryUploadReadOptions = {}): Promise<Buffer> {
-    const upload = this.binaryUploads.get(id);
+  private readBinaryUpload(
+    binaryUploads: Map<string, BinaryUploadState>,
+    id: string,
+    options: BinaryUploadReadOptions = {},
+  ): Promise<Buffer> {
+    const upload = binaryUploads.get(id);
     if (!upload) return Promise.reject(new Error("Binary upload was not opened for this IPC request."));
     if (options.maxBytes !== undefined && upload.bytes > options.maxBytes) {
       this.failBinaryUpload(upload, new Error(`Binary upload exceeds ${options.maxBytes} bytes.`));
@@ -282,6 +347,17 @@ export class BridgeIpcServer {
     upload.chunks = [];
     upload.bytes = 0;
     this.resolveBinaryWaiters(upload);
+  }
+
+  private dropSocketUploads(socket: Socket, reason: "connection_closed" | "server_stopped"): void {
+    const uploads = this.binaryUploads.get(socket);
+    if (!uploads) return;
+    this.binaryUploads.delete(socket);
+    for (const [id, upload] of uploads) {
+      this.failBinaryUpload(upload, new Error("Bridge IPC connection closed during binary upload."));
+      this.options.audit.record("ipc.binary_upload_dropped", { id, reason });
+    }
+    uploads.clear();
   }
 
   private finishBinaryUpload(upload: BinaryUploadState, options: BinaryUploadReadOptions): Buffer {
@@ -335,6 +411,7 @@ export class BridgeIpcServer {
         payload,
         type: "request",
       }, {
+        credentialId: auth.credentialId,
         readBinaryUpload: () => Promise.reject(new Error("Binary uploads are not available for cancellation.")),
       });
       await writeIpcHandlerResult({
@@ -364,7 +441,6 @@ type BinaryUploadState = {
   ended: boolean;
   error?: Error;
   expectedSeq: number;
-  socket: Socket;
   waiters: Array<{
     options: BinaryUploadReadOptions;
     resolve: (value: Buffer) => void;
@@ -380,27 +456,109 @@ export async function writeIpcHandlerResult(input: {
 }): Promise<void> {
   if (!isAsyncIterable(input.result)) {
     input.audit.record("ipc.response", { method: input.frame.method });
-    input.socket.write(encodeFrame({ type: "response", id: input.frame.id, payload: input.result }));
+    try {
+      await writeIpcFrame(input.socket, { type: "response", id: input.frame.id, payload: input.result });
+    } catch (error) {
+      if (error instanceof IpcSocketClosedError) {
+        input.audit.record("ipc.response_cancelled", { method: input.frame.method, reason: "connection_closed" });
+        return;
+      }
+      throw error;
+    }
     return;
   }
 
   input.audit.record("ipc.stream_start", { method: input.frame.method });
-  input.socket.write(encodeFrame({ type: "stream", id: input.frame.id, event: "start" }));
   try {
+    await writeIpcFrame(input.socket, { type: "stream", id: input.frame.id, event: "start" });
     for await (const payload of input.result) {
-      input.socket.write(encodeFrame({ type: "stream", id: input.frame.id, event: "delta", payload }));
+      await writeIpcFrame(input.socket, { type: "stream", id: input.frame.id, event: "delta", payload });
     }
     input.audit.record("ipc.stream_end", { method: input.frame.method });
-    input.socket.write(encodeFrame({ type: "stream", id: input.frame.id, event: "end" }));
+    await writeIpcFrame(input.socket, { type: "stream", id: input.frame.id, event: "end" });
   } catch (error) {
+    if (error instanceof IpcSocketClosedError) {
+      input.audit.record("ipc.stream_cancelled", { method: input.frame.method, reason: "connection_closed" });
+      return;
+    }
     input.audit.record("ipc.stream_error", { method: input.frame.method, message: errorMessage(error) });
-    input.socket.write(encodeFrame({
-      type: "error",
-      id: input.frame.id,
-      code: "handler_error",
-      message: safeHandlerErrorMessage(error),
-    }));
+    try {
+      await writeIpcFrame(input.socket, {
+        type: "error",
+        id: input.frame.id,
+        code: "handler_error",
+        message: safeHandlerErrorMessage(error),
+      });
+    } catch (writeError) {
+      if (!(writeError instanceof IpcSocketClosedError)) throw writeError;
+    }
   }
+}
+
+class IpcSocketClosedError extends Error {
+  constructor() {
+    super("Bridge IPC connection closed while writing a response.");
+    this.name = "IpcSocketClosedError";
+  }
+}
+
+async function writeIpcFrame(
+  socket: IpcWritable,
+  frame: Exclude<BridgeFrame, BridgeBinaryFrame>,
+): Promise<void> {
+  if (socket.destroyed || socket.writableEnded) throw new IpcSocketClosedError();
+
+  let writable: boolean;
+  try {
+    writable = socket.write(encodeFrame(frame));
+  } catch (error) {
+    if (socket.destroyed || socket.writableEnded || isClosedSocketWriteError(error)) {
+      throw new IpcSocketClosedError();
+    }
+    throw error;
+  }
+  if (!writable) await waitForSocketDrain(socket);
+}
+
+function waitForSocketDrain(socket: IpcWritable): Promise<void> {
+  if (socket.destroyed || socket.writableEnded) return Promise.reject(new IpcSocketClosedError());
+  if (!socket.once || !socket.off) {
+    return Promise.reject(new Error("IPC writer returned backpressure without lifecycle event support."));
+  }
+
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const cleanup = (): void => {
+      socket.off?.("drain", onDrain);
+      socket.off?.("close", onClose);
+      socket.off?.("error", onError);
+    };
+    const settle = (action: () => void): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      action();
+    };
+    const onDrain = (): void => settle(resolve);
+    const onClose = (): void => settle(() => reject(new IpcSocketClosedError()));
+    const onError = (): void => settle(() => reject(new IpcSocketClosedError()));
+
+    socket.once?.("drain", onDrain);
+    socket.once?.("close", onClose);
+    socket.once?.("error", onError);
+    // Close can race the listener registration after `write()` returned false.
+    if (socket.destroyed || socket.writableEnded) onClose();
+  });
+}
+
+function isClosedSocketWriteError(error: unknown): boolean {
+  if (!error || typeof error !== "object" || !("code" in error)) return false;
+  return new Set([
+    "ECONNRESET",
+    "EPIPE",
+    "ERR_STREAM_DESTROYED",
+    "ERR_STREAM_WRITE_AFTER_END",
+  ]).has(String(error.code));
 }
 
 
