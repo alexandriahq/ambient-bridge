@@ -37,7 +37,7 @@ The default build talks to `https://api.alexandria.so`. To deliberately bake a d
 
 ## Release artifact verification
 
-Public workflows produce unsigned, inspectable build artifacts. Alexandria's production artifacts use separate managed signing and notarization infrastructure. Build local release artifacts and checksums with:
+The manually dispatched public workflow produces unsigned, inspectable build artifacts from the source-stamped snapshot version. Alexandria's production artifacts use separate managed signing and notarization infrastructure. Build local release artifacts and checksums with:
 
 ```sh
 CSC_IDENTITY_AUTO_DISCOVERY=false pnpm release:bundle:mac

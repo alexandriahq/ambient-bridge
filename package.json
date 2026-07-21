@@ -1,6 +1,6 @@
 {
   "name": "@ambient/bridge",
-  "version": "0.1.0-alpha",
+  "version": "0.1.0-alpha.source.3f797bb49e27",
   "description": "Standalone Ambient Bridge desktop app for WorkOS auth, local IPC pairing, and inference egress.",
   "author": "Ambient",
   "private": true,

@@ -92,6 +92,7 @@ while (queue.length > 0) {
 
 verifyPackagedServerOrigin();
 verifyPackagedBridgeUi();
+verifyPublicLicenseNotices();
 
 if (failures.length > 0) {
   console.error("[bridge:smoke] packaged app dependency verification failed:");
@@ -163,6 +164,14 @@ function verifyPackagedBridgeUi() {
   for (const channel of ["bridge:get-wire-capture", "bridge:copy-wire-payload"]) {
     if (!preloadSource.includes(channel)) {
       failures.push(`Bridge packaged preload is missing renderer IPC channel ${channel}.`);
+    }
+  }
+}
+
+function verifyPublicLicenseNotices() {
+  for (const noticePath of ["/LICENSE", "/THIRD_PARTY_NOTICES.md"]) {
+    if (!packageHasPath(noticePath)) {
+      failures.push(`Bridge public package is missing required notice: ${noticePath}`);
     }
   }
 }

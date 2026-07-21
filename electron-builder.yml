@@ -12,6 +12,8 @@ afterPack: ./scripts/afterpack-tahoe-icon.cjs
 files:
   - dist/**/*
   - package.json
+  - LICENSE
+  - THIRD_PARTY_NOTICES.md
   - node_modules/**/*
 extraResources:
   - from: resources/bridge-icon.ico
