@@ -70,6 +70,50 @@ export function compactAuthWindowTransitionProgress(progress) {
   return 1 - Math.pow(1 - clamped, 3);
 }
 
+export function leaveCompactAuthFullScreen(window, platform = "browser") {
+  if (!window.isFullScreen()) return Promise.resolve();
+  if (platform !== "darwin") {
+    window.setFullScreen(false);
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      window.off("leave-full-screen", finish);
+      window.off("closed", finish);
+      resolve();
+    };
+    window.once("leave-full-screen", finish);
+    window.once("closed", finish);
+    window.setFullScreen(false);
+  });
+}
+
+export function leaveCompactAuthMaximized(window, platform = "browser") {
+  if (!window.isMaximized()) return Promise.resolve();
+  if (platform !== "darwin") {
+    window.unmaximize();
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      window.off("unmaximize", finish);
+      window.off("closed", finish);
+      resolve();
+    };
+    window.once("unmaximize", finish);
+    window.once("closed", finish);
+    window.unmaximize();
+  });
+}
+
 export function compactAuthWindowHtml(input = {}) {
   const title = escapeHtml(input.title ?? DEFAULT_COMPACT_AUTH_TITLE);
   const detail = escapeHtml(input.detail ?? "");

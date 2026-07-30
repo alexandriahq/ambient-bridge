@@ -1,6 +1,6 @@
 <script lang="ts">
 	import type { HTMLButtonAttributes } from 'svelte/elements';
-	import Icon from '../Icon.svelte';
+	import Icon from '../icon.svelte';
 
 	type Variant = 'primary' | 'secondary' | 'ghost' | 'danger';
 	type Size = 'sm' | 'md' | 'lg' | 'icon';

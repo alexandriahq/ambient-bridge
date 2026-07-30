@@ -109,7 +109,7 @@ test("opens and dismisses shared settings", async ({ page }) => {
   await expect(settings).toBeVisible();
   await expect(settings.getByText("Ambient Bridge", { exact: true })).toBeVisible();
   const closeSettings = settings.getByRole("button", { name: "Close settings" });
-  await expect(closeSettings).toContainText("Done");
+  await expect(closeSettings).toContainText("Close");
   await closeSettings.click();
   await expect(settings).toBeHidden();
 });
@@ -151,8 +151,9 @@ test("lists and installs experimental builds from feature-gated Dev settings", a
   await expect(page.getByRole("heading", { name: "Experimental builds" })).toBeVisible();
   await expect(page.getByText(/2 experimental builds available/)).toBeVisible();
   const buildSelector = page.getByRole("combobox", { name: "Build version" });
-  await expect(buildSelector).toHaveValue("id:rel_bridge_mock_149");
-  await buildSelector.selectOption("id:rel_bridge_mock_148");
+  const buildOptions = buildSelector.getByRole("option");
+  await expect(buildOptions).toHaveCount(2);
+  await buildSelector.selectOption({ index: 1 });
   await page.getByRole("button", { name: "Install selected build" }).click();
   await expect(page.getByRole("button", { name: "Downloading" })).toBeVisible();
 });

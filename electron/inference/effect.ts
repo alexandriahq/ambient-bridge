@@ -4,6 +4,17 @@ import type { AuditSink } from "../diagnostics/audit.js";
 import type { JsonValue } from "../ipc-server/protocol.js";
 import type { SignedInWorkOsSession, WorkOsSession } from "../workos/session.js";
 import { errorMessage } from "../error-message.js";
+import {
+  BridgeInferenceServiceError,
+  BridgeInsufficientCreditError,
+  BridgeUsageRequestError,
+  inferenceDomainError,
+} from "./errors.js";
+import { sessionUsageOwnerKey, type InferenceAvailabilityCircuit } from "./availability.js";
+import {
+  BridgeUsageAccountingDisabledError,
+  type BridgeUsageService,
+} from "./usage-service.js";
 
 export type InferenceProxyPath = "/v1/chat/completions" | "/v1/responses" | "/v1/audio/transcriptions";
 
@@ -25,7 +36,12 @@ export class BridgeInferenceRequestError extends Data.TaggedError("BridgeInferen
   readonly cause?: unknown;
 }> {}
 
-export type BridgeInferenceError = BridgeSignedOutError | BridgeInferenceRequestError;
+export type BridgeInferenceError =
+  | BridgeSignedOutError
+  | BridgeInferenceRequestError
+  | BridgeInsufficientCreditError
+  | BridgeInferenceServiceError
+  | BridgeUsageRequestError;
 
 export interface BridgeSessionServiceShape {
   readonly read: () => Effect.Effect<WorkOsSession, BridgeInferenceRequestError>;
@@ -51,7 +67,7 @@ export interface BridgeSecureClientShape {
   readonly fetch: (
     path: InferenceProxyPath,
     init: RequestInit,
-  ) => Effect.Effect<Response, BridgeInferenceRequestError>;
+  ) => Effect.Effect<Response, BridgeInferenceRequestError | BridgeInsufficientCreditError | BridgeInferenceServiceError>;
 }
 
 export class BridgeSecureClient extends Context.Tag("bridge/BridgeSecureClient")<
@@ -121,13 +137,15 @@ export function createBridgeSecureClient(input: {
     fetch: (path, init) =>
       Effect.tryPromise({
         try: () => client.fetch(path, init),
-        catch: (cause) => new BridgeInferenceRequestError({
+        catch: (cause) => inferenceDomainError(cause) ?? new BridgeInferenceRequestError({
           message: `Secure request failed: ${errorMessage(cause)}`,
           cause,
         }),
       }).pipe(
         Effect.retry({
-          while: (error) => isTransientSecureFetchError(error) && init.signal?.aborted !== true,
+          while: (error) => isTransientSecureFetchError(error)
+            && !new Headers(init.headers).has("x-ambient-credit-reservation")
+            && init.signal?.aborted !== true,
           schedule: SECURE_FETCH_RETRY_SCHEDULE,
         }),
       ),
@@ -177,6 +195,8 @@ export function secureInferenceResponse(input: {
   readonly requestId: string;
   readonly signal: AbortSignal;
   readonly responseTimeoutMs?: number;
+  readonly usage?: BridgeUsageService;
+  readonly availability?: InferenceAvailabilityCircuit;
 }): Effect.Effect<
   Response,
   BridgeInferenceError,
@@ -197,13 +217,59 @@ export function secureInferenceResponse(input: {
     }
 
     const modelId = modelIdFromPayload(input.payload);
+    const ownerKey = sessionUsageOwnerKey(session);
+    if (input.availability) {
+      try {
+        input.availability.beforeRequest(ownerKey);
+      } catch (error) {
+        const domainError = inferenceDomainError(error);
+        if (domainError) return yield* Effect.fail(domainError);
+        throw error;
+      }
+    }
+
+    let reservationId: string | null = null;
+    if (input.usage) {
+      if (!modelId) {
+        input.availability?.serviceProbeFailed();
+        return yield* Effect.fail(new BridgeUsageRequestError("Inference model identity is required for usage accounting."));
+      }
+      const reserved = yield* input.usage.reserve({
+        session,
+        requestId: input.requestId,
+        route: input.path,
+        modelId,
+      }).pipe(
+        Effect.catchAll((error) => error instanceof BridgeUsageAccountingDisabledError
+          ? Effect.succeed(null)
+          : Effect.fail(error)),
+        Effect.tapError((error) => Effect.sync(() => {
+          if (error instanceof BridgeInsufficientCreditError) {
+            input.availability?.accountExhausted(ownerKey, error);
+            input.availability?.serviceProbeFailed();
+          } else if (error instanceof BridgeInferenceServiceError) {
+            input.availability?.serviceUnavailable(error);
+          } else {
+            input.availability?.serviceProbeFailed();
+          }
+        })),
+      );
+      reservationId = reserved?.reservationId ?? null;
+    }
 
     yield* audit.record("inference.secure_client_ready_start", {
       feature: input.feature,
       path: input.path,
       requestId: input.requestId,
     });
-    yield* secureClient.ready();
+    yield* secureClient.ready().pipe(
+      Effect.tapError(() => {
+        input.availability?.serviceProbeFailed();
+        return input.usage && reservationId
+          ? input.usage.release(session, reservationId).pipe(Effect.catchAll(() => Effect.void))
+          : Effect.void;
+      }),
+    );
 
     const headers = new Headers({
       Accept: input.accept ?? "text/event-stream",
@@ -213,6 +279,7 @@ export function secureInferenceResponse(input: {
       "X-Ambient-Request-Id": input.requestId,
     });
     if (modelId) headers.set("X-Ambient-Model-Id", modelId);
+    if (reservationId) headers.set("X-Ambient-Credit-Reservation", reservationId);
     if (input.contentType !== null) {
       headers.set("Content-Type", input.contentType ?? "application/json");
     }
@@ -233,7 +300,7 @@ export function secureInferenceResponse(input: {
     // Abort the fetch if the enclave never sends response headers within the budget.
     // The timer is cleared as soon as the response resolves, so it can never abort an
     // in-progress token stream; user cancellation still flows through `input.signal`.
-    const response = yield* Effect.acquireUseRelease(
+    const secureFetch = Effect.acquireUseRelease(
       Effect.sync(() => {
         const timeoutController = new AbortController();
         const timer = setTimeout(() => {
@@ -252,6 +319,23 @@ export function secureInferenceResponse(input: {
       }),
       ({ timer }) => Effect.sync(() => clearTimeout(timer)),
     );
+    const response = yield* secureFetch.pipe(
+      Effect.tapError((error) => Effect.gen(function* () {
+        const domainError = inferenceDomainError(error);
+        if (domainError instanceof BridgeInferenceServiceError) {
+          input.availability?.serviceUnavailable(domainError);
+        } else if (domainError instanceof BridgeInsufficientCreditError) {
+          input.availability?.accountExhausted(ownerKey, domainError);
+          input.availability?.serviceProbeFailed();
+        } else {
+          input.availability?.serviceProbeFailed();
+        }
+        if (input.usage && reservationId) {
+          yield* input.usage.release(session, reservationId).pipe(Effect.catchAll(() => Effect.void));
+        }
+      })),
+    );
+    input.availability?.serviceRecovered();
 
     yield* audit.record("inference.secure_fetch_response", {
       feature: input.feature,

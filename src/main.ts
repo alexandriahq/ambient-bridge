@@ -1,5 +1,5 @@
 import { mount } from "svelte";
-import App from "./routes/App.svelte";
+import App from "./routes/app.svelte";
 import { maybeInstallBridgeMock } from "./lib/mock/bridge-mock";
 import "./app.css";
 

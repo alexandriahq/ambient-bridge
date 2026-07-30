@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { EventEmitter } from "node:events";
+import { describe, expect, it, vi } from "vitest";
 import {
   COMPACT_AUTH_WINDOW_BLACKOUT_LEAD_MS,
   COMPACT_AUTH_WINDOW_TRANSITION_MS,
@@ -9,6 +10,8 @@ import {
   compactAuthWindowHtml,
   compactAuthWindowTransitionBounds,
   compactAuthWindowTransitionProgress,
+  leaveCompactAuthFullScreen,
+  leaveCompactAuthMaximized,
 } from "@ambient/shared/compact-auth-window";
 
 describe("compact auth window", () => {
@@ -97,4 +100,86 @@ describe("compact auth window", () => {
     expect(COMPACT_AUTH_WINDOW_TRANSITION_MS).toBeGreaterThanOrEqual(150);
     expect(COMPACT_AUTH_WINDOW_TRANSITION_MS).toBeLessThanOrEqual(300);
   });
+
+  it("waits for macOS to leave full screen before compact-window work continues", async () => {
+    const window = new FakeFullScreenWindow(true);
+    let settled = false;
+
+    const leaving = leaveCompactAuthFullScreen(window, "darwin").then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+
+    expect(window.setFullScreen).toHaveBeenCalledWith(false);
+    expect(settled).toBe(false);
+
+    window.emit("leave-full-screen");
+    await leaving;
+
+    expect(settled).toBe(true);
+    expect(window.listenerCount("leave-full-screen")).toBe(0);
+    expect(window.listenerCount("closed")).toBe(0);
+  });
+
+  it("leaves full screen synchronously on platforms without asynchronous transitions", async () => {
+    const window = new FakeFullScreenWindow(true);
+
+    await leaveCompactAuthFullScreen(window, "win32");
+
+    expect(window.setFullScreen).toHaveBeenCalledWith(false);
+    expect(window.listenerCount("leave-full-screen")).toBe(0);
+  });
+
+  it("waits for macOS to unmaximize before compact-window work continues", async () => {
+    const window = new FakeMaximizedWindow(true);
+    let settled = false;
+
+    const leaving = leaveCompactAuthMaximized(window, "darwin").then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+
+    expect(window.unmaximize).toHaveBeenCalledOnce();
+    expect(settled).toBe(false);
+
+    window.emit("unmaximize");
+    await leaving;
+
+    expect(settled).toBe(true);
+    expect(window.listenerCount("unmaximize")).toBe(0);
+    expect(window.listenerCount("closed")).toBe(0);
+  });
+
+  it("unmaximizes synchronously on platforms without asynchronous transitions", async () => {
+    const window = new FakeMaximizedWindow(true);
+
+    await leaveCompactAuthMaximized(window, "win32");
+
+    expect(window.unmaximize).toHaveBeenCalledOnce();
+    expect(window.listenerCount("unmaximize")).toBe(0);
+  });
 });
+
+class FakeFullScreenWindow extends EventEmitter {
+  readonly setFullScreen = vi.fn<(flag: boolean) => void>();
+
+  constructor(private readonly fullScreen: boolean) {
+    super();
+  }
+
+  isFullScreen(): boolean {
+    return this.fullScreen;
+  }
+}
+
+class FakeMaximizedWindow extends EventEmitter {
+  readonly unmaximize = vi.fn<() => void>();
+
+  constructor(private readonly maximized: boolean) {
+    super();
+  }
+
+  isMaximized(): boolean {
+    return this.maximized;
+  }
+}

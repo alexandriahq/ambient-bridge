@@ -92,6 +92,7 @@ import {
 } from "./update-feed.js";
 import {
   isHttpUrl,
+  localReleaseBuildsSnapshot,
   normalizeDownloadPercent,
   sanitizedUpdateDiagnostics,
 } from "@ambient/shared/update-core";
@@ -104,6 +105,14 @@ import {
 import { errorMessage } from "./error-message.js";
 import { createBridgeShutdownCoordinator } from "./shutdown-coordinator.js";
 import { inferenceRequestKey, InferenceRequestRegistry } from "./inference/request-registry.js";
+import {
+  InferenceAvailabilityCircuit,
+  sessionUsageOwnerKey,
+  type InferenceAvailabilitySnapshot,
+} from "./inference/availability.js";
+import { createBridgeUsageService } from "./inference/usage-service.js";
+import { BridgeUsageCache } from "./inference/usage-cache.js";
+import { BridgeInsufficientCreditError, inferenceDomainError } from "./inference/errors.js";
 import { registerBridgeWireCaptureIpc } from "./bridge-ui-ipc.js";
 import type { BridgeWireCaptureResult } from "./bridge-ui-contract.js";
 import {
@@ -115,13 +124,22 @@ import {
   type SessionRefreshSnapshot,
 } from "./session-refresh-coordinator.js";
 import {
+  BUILD_APP_ID,
+  BUILD_APP_NAME,
   BUILD_COMMIT_SHA,
   BUILD_RELEASE_CHANNEL,
 } from "./generated/build-config.js";
+import { resolveBridgeDesktopIdentity } from "./desktop-identity.js";
 
 const requireFromMain = createRequire(import.meta.url);
 const { autoUpdater } = requireFromMain("electron-updater") as typeof import("electron-updater");
-const APP_ID = "com.alexandria.ambient.bridge";
+const desktopIdentity = resolveBridgeDesktopIdentity({
+  buildAppId: BUILD_APP_ID,
+  buildAppName: BUILD_APP_NAME,
+  packaged: app.isPackaged,
+  packagedAppName: app.getName(),
+});
+const APP_ID = desktopIdentity.appId;
 const BRIDGE_UI_E2E_REQUEST_ID = "bridge-e2e-wire-capture";
 const BRIDGE_UI_E2E_REQUEST_BODY = "AQIDBAUGBwgJCgsMDQ4PEA==";
 
@@ -236,6 +254,7 @@ type BridgePairedClient = {
 
 type BridgeInferenceStatus = {
   activeRequests: number;
+  availability: InferenceAvailabilitySnapshot;
   attestation: "not_checked" | "verifying" | "verified" | "failed";
   attestationChecks: BridgeAttestationCheck[];
   attestationInProgress: boolean;
@@ -292,6 +311,7 @@ const ATTESTATION_HISTORY_LIMIT = 10;
 const SERVER_REACHABILITY_TTL_MS = 8_000;
 const SERVER_REACHABILITY_TIMEOUT_MS = 2_500;
 const IPC_SOCKET_HEALTH_INTERVAL_MS = 15_000;
+const USAGE_RECOVERY_INTERVAL_MS = 60_000;
 // Proactive session-refresh retry budget. A stale access token gets renewed on
 // launch (and when the server comes back online) before the first inference
 // request; a transient WorkOS/network failure at boot is retried with backoff
@@ -301,7 +321,7 @@ const SESSION_REFRESH_BASE_DELAY_MS = 2_000;
 const SESSION_REFRESH_MAX_DELAY_MS = 30_000;
 const AMBIENT_SESSION_TOKEN_HEADER = "x-ambient-session-token";
 const STALE_SESSION_MESSAGE = "Your Bridge sign-in expired. Sign in again to continue.";
-const APP_NAME = "Ambient Bridge";
+const APP_NAME = desktopIdentity.appName;
 const AMBIENT_FEATURE_FLAG_DEFINITIONS: readonly BridgeFeatureFlagDefinition[] = [
   {
     key: "integrations",
@@ -471,6 +491,13 @@ const bridgeAuditService = createBridgeAuditService(audit);
 const bridgeSecureClient = createBridgeSecureClient({ serverBaseUrl });
 let inferenceStatus: BridgeInferenceStatus = initialInferenceStatus();
 const authServer = new AuthServerClient({ baseUrl: serverBaseUrl });
+const bridgeUsageService = createBridgeUsageService(authServer);
+const bridgeUsageCache = new BridgeUsageCache();
+const inferenceAvailability = new InferenceAvailabilityCircuit();
+const usageRecoveryTimer = setInterval(() => {
+  void refreshExhaustedAccountCircuit();
+}, USAGE_RECOVERY_INTERVAL_MS);
+usageRecoveryTimer.unref?.();
 const sessionRefreshCoordinator = new SessionRefreshCoordinator<SignedInWorkOsSession>({
   errorMessage: (error) => safeStatusMessage(errorMessage(error)),
   onRetryExhausted: ({ attempt, delayMs, message, reason }) => {
@@ -881,6 +908,9 @@ async function startIpcServer(): Promise<BridgeIpcServer> {
         return switchOrganization(organizationId, { compactWindow: false });
       },
       "auth.organizations": async () => organizationsPayload(),
+      "usage.summary": async (frame) => (
+        await usageSnapshotPayload(payloadBoolean(frame.payload, "refresh"))
+      ) as unknown as JsonValue,
       "analytics.handoffFeedback": async (frame) => forwardHandoffFeedbackAnalytics(frame),
       "analytics.telemetryBatch": async (frame) => forwardTelemetryBatchAnalytics(frame),
       "inference.audioSpeech": async () => unsupportedInferenceMethod("inference.audioSpeech"),
@@ -980,6 +1010,9 @@ async function getStatus(options: {
     inference: {
       ...inferenceStatus,
       activeRequests: activeInferenceRequests.size,
+      availability: session.kind === "signed_in"
+        ? inferenceAvailability.snapshot(sessionUsageOwnerKey(session))
+        : inferenceAvailability.snapshot(),
       attestationChecks: inferenceStatus.attestationChecks.map((check) => ({ ...check })),
       attestationInProgress: activeAttestationChecks.size > 0,
       lastRequest: networkHistory.latest(),
@@ -1639,6 +1672,7 @@ function payloadBoolean(payload: JsonValue | undefined, key: string): boolean {
 function initialInferenceStatus(): BridgeInferenceStatus {
   return {
     activeRequests: 0,
+    availability: { state: "ready" },
     attestation: "not_checked",
     attestationChecks: [],
     attestationInProgress: false,
@@ -1874,12 +1908,14 @@ async function* inferenceResponseStream(
     const response = await Effect.runPromise(
       secureInferenceResponse({
         appVersion: app.getVersion(),
+        availability: inferenceAvailability,
         feature: frame.method,
         path,
         payload: frame.payload,
         ...preparedRequest,
         requestId: frame.id,
         signal: abortController.signal,
+        usage: bridgeUsageService,
       }).pipe(
         Effect.provideService(
           BridgeSessionService,
@@ -1939,6 +1975,7 @@ async function* inferenceResponseStream(
       requestId: frame.id,
     });
     completeInferenceStatus(statusKey, "completed", generation);
+    void refreshInferenceUsageCircuit();
   } catch (error) {
     if (abortController.signal.aborted) {
       audit.record("inference.forward_cancelled", {
@@ -1951,6 +1988,10 @@ async function* inferenceResponseStream(
     }
 
     const message = errorMessage(error);
+    const domainError = inferenceDomainError(error);
+    if (domainError instanceof BridgeInsufficientCreditError && domainError.summary) {
+      bridgeUsageCache.observe(domainError.summary);
+    }
     const safeMessage = safeStatusMessage(message);
     audit.record("inference.forward_failed", {
       message,
@@ -1970,6 +2011,30 @@ async function* inferenceResponseStream(
   } finally {
     activeInferenceRequests.release(credentialId, frame.id, abortController);
   }
+}
+
+async function refreshInferenceUsageCircuit(): Promise<void> {
+  const snapshot = await usageSnapshotPayload(true);
+  if (snapshot.state === "ready") notifyStatusChanged();
+}
+
+async function refreshExhaustedAccountCircuit(): Promise<void> {
+  const session = await sessionStore().read();
+  if (session.kind !== "signed_in") return;
+  if (inferenceAvailability.snapshot(sessionUsageOwnerKey(session)).state !== "account_exhausted") return;
+  await refreshInferenceUsageCircuit();
+}
+
+async function usageSnapshotPayload(force: boolean): Promise<import("@ambient/shared/usage").UsageSnapshot> {
+  const stored = await sessionStore().read();
+  const session = stored.kind === "signed_in" ? stored : null;
+  const snapshot = await bridgeUsageCache.read({
+    session,
+    force,
+    load: (activeSession) => bridgeUsageService.summary(activeSession),
+  });
+  if (snapshot.state === "ready") inferenceAvailability.observeSummary(snapshot.summary);
+  return snapshot;
 }
 
 async function forwardHandoffFeedbackAnalytics(frame: BridgeRequestFrame): Promise<JsonValue> {
@@ -2535,6 +2600,8 @@ function clearInferenceTransparency(): void {
   networkHistory.clear();
   wireTap.clear();
   inferenceStatus = initialInferenceStatus();
+  inferenceAvailability.clearAccount();
+  bridgeUsageCache.clear();
   notifyStatusChanged();
 }
 
@@ -2780,9 +2847,11 @@ function initialUpdateStatus(): BridgeUpdateStatus {
 function bridgeUpdateStatusForFeed(input: { readonly channel: string; readonly version?: string }): BridgeUpdateStatus {
   const reason = bridgeUpdaterUnavailableReason({
     arch: process.arch,
+    channel: input.channel,
     isPackaged: app.isPackaged,
     localQaBuild: isLocalQaBuild(),
     platform: process.platform,
+    version: input.version,
   });
   const baseUrl = bridgeUpdateBaseUrlFromEnv();
   const feedUrl = reason
@@ -2939,6 +3008,16 @@ async function checkForBridgeUpdatesFromFeed(input: {
 
 async function listExperimentalBridgeBuilds() {
   const channel = BRIDGE_RELEASE_EXPERIMENTAL_CHANNEL;
+  const localSnapshot = localReleaseBuildsSnapshot({
+    arch: process.arch,
+    channel,
+    currentVersion: app.getVersion(),
+    isPackaged: app.isPackaged,
+    localBuild: isLocalQaBuild(),
+    platform: process.platform,
+  });
+  if (localSnapshot) return localSnapshot;
+
   const releasesUrl = bridgeReleaseListUrl({
     arch: process.arch,
     baseUrl: bridgeUpdateBaseUrlFromEnv(),

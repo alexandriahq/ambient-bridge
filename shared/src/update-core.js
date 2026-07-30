@@ -37,6 +37,13 @@ export function updaterUnavailableReason(input) {
   if (input.localQaBuild === true) {
     return "Updates are disabled for local QA builds.";
   }
+  if (
+    input.platform === AMBIENT_WINDOWS_RELEASE_PLATFORM
+    && input.channel === AMBIENT_RELEASE_EXPERIMENTAL_CHANNEL
+    && !input.version
+  ) {
+    return "Automatic updates are disabled for unsigned experimental Windows builds.";
+  }
   if (isSupportedReleaseTarget(input.platform, input.arch)) return null;
   if (input.platform === AMBIENT_RELEASE_PLATFORM) return "Updates are only configured for macOS arm64 builds.";
   if (input.platform === AMBIENT_WINDOWS_RELEASE_PLATFORM) return "Updates are only configured for Windows x64 builds.";
@@ -110,6 +117,18 @@ export function parseReleaseListResponse(input) {
     currentVersion: input.currentVersion,
     releasesUrl: input.releasesUrl,
     builds: releases,
+  };
+}
+
+export function localReleaseBuildsSnapshot(input) {
+  if (input.isPackaged && input.localBuild !== true) return null;
+  return {
+    channel: input.channel,
+    platform: input.platform,
+    arch: input.arch,
+    currentVersion: input.currentVersion,
+    releasesUrl: null,
+    builds: [],
   };
 }
 

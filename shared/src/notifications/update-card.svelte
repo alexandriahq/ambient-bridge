@@ -1,5 +1,5 @@
 <script lang="ts">
-  import Button from "../design/ui/Button.svelte";
+  import Button from "../design/adapters/button.svelte";
   import type { AmbientActionToastInput } from "./index.js";
   import type { AmbientToastAction } from "./types.js";
 

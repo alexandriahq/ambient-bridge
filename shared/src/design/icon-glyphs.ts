@@ -1,7 +1,7 @@
 // Lucide-derived 24×24 glyph bodies — one stroke language across the whole app.
-// Kept as plain TS (not inside Icon.svelte) so non-Svelte consumers — e.g. the
+// Kept as plain TS (not inside icon.svelte) so non-Svelte consumers — e.g. the
 // Electron main process building the live-recording overlay payload — can import
-// the same glyph set. Icon.svelte re-exports this as `glyphs`.
+// the same glyph set. icon.svelte re-exports this as `glyphs`.
 export const glyphs = {
 	feed: '<path d="M4 6h16"/><path d="M4 12h16"/><path d="M4 18h10"/>',
 	layers:
@@ -73,6 +73,8 @@ export const glyphs = {
 	link: '<path d="M9 17H7a5 5 0 0 1 0-10h2"/><path d="M15 7h2a5 5 0 0 1 0 10h-2"/><path d="M8 12h8"/>',
 	trash:
 		'<path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M6 6l1 14h10l1-14"/>',
+	archive:
+		'<rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v12h14V8"/><path d="M10 12h4"/>',
 	eye: '<path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/>',
 	'eye-off':
 		'<path d="M10.7 5.1A9.9 9.9 0 0 1 12 5c6 0 10 7 10 7a17 17 0 0 1-2.2 2.9M6.6 6.6A17 17 0 0 0 2 12s4 7 10 7a9.7 9.7 0 0 0 5.4-1.6"/><path d="M3 3l18 18"/>',
@@ -85,6 +87,7 @@ export const glyphs = {
 	'thumbs-down':
 		'<path d="M17 14V2"/><path d="M9 22 12 15H4a2 2 0 0 1-2-2.3l1.3-8A2 2 0 0 1 5.3 3H16v11l-4 8a2 2 0 0 1-3-2Z"/>',
 	wand: '<path d="m15 4 5 5"/><path d="M3 21 17 7l-2-2L1 19l2 2Z" transform="translate(2 -1)"/><path d="M19 3v4M17 5h4M20 12v2M19 13h2"/>',
+	square: '<rect x="6" y="6" width="12" height="12" rx="1"/>',
 	graph:
 		'<circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="7" r="2.5"/><circle cx="17" cy="18" r="2.5"/><circle cx="7" cy="17" r="2.5"/><path d="m8 7 8 1M9 15l7 2M7 8v7M17 9v7"/>',
 	note: '<path d="M14 3v5h5"/><path d="M18 21H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8l6 6v10a2 2 0 0 1-2 2Z"/><path d="M8 13h6M8 17h4"/>',

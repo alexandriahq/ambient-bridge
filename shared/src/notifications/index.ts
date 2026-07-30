@@ -1,8 +1,8 @@
 import { toast, type ExternalToast } from "svelte-sonner";
-import ActionToast from "./ActionToast.svelte";
+import ActionToast from "./action-toast.svelte";
 import type { AmbientToastAction, AmbientToastVariant } from "./types.js";
-export { default as AmbientToaster } from "./AmbientToaster.svelte";
-export { default as AmbientUpdateCard } from "./UpdateCard.svelte";
+export { default as AmbientToaster } from "./ambient-toaster.svelte";
+export { default as AmbientUpdateCard } from "./update-card.svelte";
 export { toast as ambientToast } from "svelte-sonner";
 export type { AmbientToastAction, AmbientToastVariant } from "./types.js";
 export {

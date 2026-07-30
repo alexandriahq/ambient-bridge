@@ -9,6 +9,7 @@ import { MemoryAuditSink } from "../electron/diagnostics/audit.js";
 import { PairingStore } from "../electron/ipc-server/pairing.js";
 import { encodeBinaryFrame, encodeFrame, FrameDecoder } from "../electron/ipc-server/protocol.js";
 import { BridgeIpcServer, writeIpcHandlerResult } from "../electron/ipc-server/socket.js";
+import { BridgeInferenceServiceError } from "../electron/inference/errors.js";
 
 describe("Bridge IPC server socket lifecycle", () => {
   it.skipIf(process.platform === "win32")("rebinds the socket after the file is externally removed", async () => {
@@ -323,6 +324,31 @@ describe("Bridge IPC server result writer", () => {
         type: "error",
       },
     ]);
+  });
+
+  it("preserves a stable provider-service code across the typed IPC error frame", async () => {
+    const chunks: Buffer[] = [];
+    await writeIpcHandlerResult({
+      audit: new MemoryAuditSink(),
+      frame: { id: "req_provider_billing", method: "inference.responses" },
+      result: (async function* () {
+        throw new BridgeInferenceServiceError("UPSTREAM_BILLING_UNAVAILABLE", 503, 60);
+      })(),
+      socket: {
+        write: (chunk) => {
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+          return true;
+        },
+      },
+    });
+
+    const frames = chunks.flatMap((chunk) => new FrameDecoder().push(chunk));
+    expect(frames.at(-1)).toEqual({
+      code: "UPSTREAM_BILLING_UNAVAILABLE",
+      id: "req_provider_billing",
+      message: "Inference processing is temporarily unavailable. (UPSTREAM_BILLING_UNAVAILABLE)",
+      type: "error",
+    });
   });
 
   it("bounds returned stream failure messages", async () => {

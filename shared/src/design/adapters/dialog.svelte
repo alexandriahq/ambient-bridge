@@ -1,6 +1,6 @@
 <script lang="ts">
 	import type { Snippet } from 'svelte';
-	import Icon from '../Icon.svelte';
+	import Icon from '../icon.svelte';
 	import { cn } from '../cn';
 
 	type Props = {

@@ -60,6 +60,19 @@ describe("Bridge update feed", () => {
       .toBe("Updates are only configured for macOS arm64 builds.");
     expect(bridgeUpdaterUnavailableReason({ arch: "arm64", isPackaged: true, platform: "win32" }))
       .toBe("Updates are only configured for Windows x64 builds.");
+    expect(bridgeUpdaterUnavailableReason({
+      arch: "x64",
+      channel: "experimental",
+      isPackaged: true,
+      platform: "win32",
+    })).toBe("Automatic updates are disabled for unsigned experimental Windows builds.");
+    expect(bridgeUpdaterUnavailableReason({
+      arch: "x64",
+      channel: "experimental",
+      isPackaged: true,
+      platform: "win32",
+      version: "1.0.0-experimental.pr431.30379606652",
+    })).toBeNull();
     expect(bridgeUpdaterUnavailableReason({ arch: "arm64", isPackaged: true, platform: "darwin" })).toBeNull();
     expect(bridgeUpdaterUnavailableReason({ arch: "x64", isPackaged: true, platform: "win32" })).toBeNull();
   });

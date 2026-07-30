@@ -1,6 +1,6 @@
 <script lang="ts">
+	import { ArrowLeft, X } from '@lucide/svelte';
 	import { onDestroy, type Snippet } from 'svelte';
-	import Kbd from '../ui/Kbd.svelte';
 
 	const FOCUSABLE_SELECTOR = [
 		'a[href]',
@@ -20,7 +20,9 @@
 		open?: boolean;
 		sections?: readonly Section[];
 		section?: string;
+		onSectionChange?: (section: string) => void;
 		onClose?: (e?: Event) => void;
+		onBack?: (e?: Event) => void;
 		children?: Snippet<[string | undefined]>;
 	};
 
@@ -28,11 +30,17 @@
 		open = false,
 		sections = [],
 		section = $bindable(sections[0]?.id),
+		onSectionChange,
 		onClose = () => {},
+		onBack,
 		children
 	}: Props = $props();
 
-	const titleId = $props.id();
+	function selectSection(nextSection: string): void {
+		section = nextSection;
+		onSectionChange?.(nextSection);
+	}
+
 	let dialog = $state<HTMLDivElement>();
 	let wasOpen = false;
 	let opener: HTMLElement | null = null;
@@ -131,34 +139,44 @@
 {#if open}
 	<div
 		bind:this={dialog}
-		class="fixed inset-0 z-[80] flex flex-col text-ink"
+		class="fixed inset-0 z-[80] flex text-ink"
 		style="background: hsl(var(--bg)); animation: rise 0.28s var(--ease-out-quint) both"
 		role="dialog"
 		aria-modal="true"
-		aria-labelledby={titleId}
+		aria-label="Settings"
 		tabindex="-1"
 	>
-		<!-- Top bar -->
-		<header class="drag flex h-[46px] shrink-0 items-center gap-3 border-b border-line px-5 pl-[88px]">
-			<h1 id={titleId} class="text-sm font-medium text-ink">Settings</h1>
-			<div class="flex-1"></div>
+		<button
+			type="button"
+			onclick={onClose}
+			aria-label="Close settings"
+			class="no-drag absolute right-3 top-[7px] z-10 flex cursor-pointer items-center gap-1.5 rounded-[var(--radius-md)] px-2.5 py-1.5 text-sm font-medium text-ink-tertiary transition-colors hover:bg-ink/[0.05] hover:text-ink"
+		>
+			<X size={16} aria-hidden="true" />
+			Close
+		</button>
+
+		{#if onBack}
 			<button
 				type="button"
-				onclick={onClose}
-				aria-label="Close settings"
-				class="no-drag flex items-center gap-2 rounded-[var(--radius-md)] px-2.5 py-1.5 text-sm font-medium text-ink-tertiary transition-colors hover:bg-ink/[0.05] hover:text-ink cursor-pointer"
+				onclick={onBack}
+				aria-label="Back"
+				class="no-drag absolute left-[232px] top-[7px] z-10 flex cursor-pointer items-center gap-1.5 rounded-[var(--radius-md)] px-2.5 py-1.5 text-sm font-medium text-ink-tertiary transition-colors hover:bg-ink/[0.05] hover:text-ink"
 			>
-				Done <Kbd>ESC</Kbd>
+				<ArrowLeft size={16} aria-hidden="true" />
+				Back
 			</button>
-		</header>
+		{/if}
 
-		<div class="flex min-h-0 flex-1">
-			<!-- Section rail -->
-			<nav aria-label="Settings sections" class="w-[220px] shrink-0 space-y-0.5 border-r border-line p-3">
+		<!-- Section rail mirrors the app sidebar: navigation sits directly on
+		     the shell background while the content occupies an inset panel. -->
+		<aside class="flex w-[220px] shrink-0 flex-col">
+			<header class="drag h-[46px] shrink-0"></header>
+			<nav aria-label="Settings sections" class="min-h-0 flex-1 space-y-0.5 overflow-y-auto p-3">
 				{#each sections as s (s.id)}
 					<button
 						type="button"
-						onclick={() => (section = s.id)}
+						onclick={() => selectSection(s.id)}
 						aria-current={section === s.id ? 'page' : undefined}
 						class="flex h-9 w-full items-center rounded-[var(--radius-md)] px-3 text-base font-medium transition-colors cursor-pointer {section ===
 						s.id
@@ -169,13 +187,21 @@
 					</button>
 				{/each}
 			</nav>
+		</aside>
 
-			<!-- Content -->
+		<!-- Rounded content panel replaces the old horizontal and vertical
+		     section dividers with the same geometry as the main application. -->
+		<main class="inset-panel relative flex min-w-0 flex-1 flex-col overflow-hidden rounded-[14px] bg-surface">
+			<header class="flex h-[46px] shrink-0">
+				<div class="no-drag w-24 shrink-0" data-settings-back-hit-area></div>
+				<div class="drag min-w-4 flex-1"></div>
+				<div class="no-drag w-24 shrink-0" data-settings-close-hit-area></div>
+			</header>
 			<div class="scroll-area min-h-0 flex-1 overflow-y-auto [scrollbar-gutter:stable]">
-				<div class="mx-auto max-w-[640px] px-10 py-9">
+				<div class="mx-auto w-full max-w-[720px] px-8 py-9">
 					{@render children?.(section)}
 				</div>
 			</div>
-		</div>
+		</main>
 	</div>
 {/if}

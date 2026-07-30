@@ -1,6 +1,6 @@
 {
   "name": "@ambient/bridge",
-  "version": "0.1.0-alpha.source.3f797bb49e27",
+  "version": "1.0.0-local.source.5d4bd3b88660",
   "description": "Standalone Ambient Bridge desktop app for WorkOS auth, local IPC pairing, and inference egress.",
   "author": "Ambient",
   "private": true,
@@ -21,6 +21,7 @@
     "build:release:mac": "pnpm generate:build-config && vite build && tsc -p tsconfig.electron.json && electron-builder --mac dmg zip --arm64 --publish never",
     "build:release:win": "pnpm generate:build-config && vite build && tsc -p tsconfig.electron.json && electron-builder --win nsis --x64 --publish never",
     "build:release:win:local": "pnpm generate:build-config && vite build && tsc -p tsconfig.electron.json && electron-builder --config electron-builder.local.yml --win nsis --x64 --publish never",
+    "build:release:win:arm64:local": "cross-env AMBIENT_DESKTOP_VARIANT=local pnpm generate:build-config && vite build && tsc -p tsconfig.electron.json && pnpm posthog:sourcemaps && electron-builder --config electron-builder.local.yml --win nsis --arm64 --publish never",
     "build:electron": "pnpm generate:build-config && tsc -p tsconfig.electron.json",
     "release:publish": "node scripts/publish-release.mjs",
     "smoke:packaged": "node scripts/smoke-packaged-app.mjs",
@@ -58,6 +59,7 @@
     "@tailwindcss/vite": "^4.2.1",
     "@types/node": "^25.9.1",
     "@types/semver": "^7.7.1",
+    "cross-env": "7.0.3",
     "electron": "^42.3.3",
     "electron-builder": "^26.8.1",
     "rcedit": "5.0.2",

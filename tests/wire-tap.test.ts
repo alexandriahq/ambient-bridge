@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import { WireTap, type FetchHost } from "../electron/inference/wire-tap.js";
+import {
+  BridgeInferenceServiceError,
+  BridgeInsufficientCreditError,
+} from "../electron/inference/errors.js";
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 10));
 
@@ -44,6 +48,64 @@ describe("WireTap", () => {
     expect(capture!.request.body.base64).toBe(Buffer.from([1, 2, 3, 4]).toString("base64"));
     expect(capture!.response?.status).toBe(200);
     expect(capture!.response?.body.base64).toBe(Buffer.from([9, 8, 7, 6]).toString("base64"));
+  });
+
+  it("classifies a legacy plain provider 402 without retaining its unverified body", async () => {
+    const fetchImpl = vi.fn(async () => new Response("private provider billing detail", { status: 402 }));
+    const h = host(fetchImpl);
+    const tap = new WireTap();
+    tap.install(h);
+
+    await expect(h.fetch(sealedRequest("req_provider_402", new Uint8Array([1])))).rejects.toMatchObject({
+      code: "UPSTREAM_BILLING_UNAVAILABLE",
+      httpStatus: 402,
+    });
+    await expect(h.fetch(sealedRequest("req_provider_402_second", new Uint8Array([1]))))
+      .rejects.toBeInstanceOf(BridgeInferenceServiceError);
+    const capture = tap.get("req_provider_402");
+    expect(capture?.response).toMatchObject({
+      status: 402,
+      body: { base64: "", capturedBytes: 0 },
+    });
+    expect(JSON.stringify(capture)).not.toContain("private provider billing detail");
+  });
+
+  it("trusts account exhaustion only with the server-authenticated error source", async () => {
+    const fetchImpl = vi.fn(async () => new Response("account body", {
+      status: 402,
+      headers: {
+        "x-ambient-error-code": "INSUFFICIENT_CREDIT",
+        "x-ambient-error-source": "ambient_account",
+      },
+    }));
+    const h = host(fetchImpl);
+    const tap = new WireTap();
+    tap.install(h);
+
+    await expect(h.fetch(sealedRequest("req_account_402", new Uint8Array([1]))))
+      .rejects.toBeInstanceOf(BridgeInsufficientCreditError);
+    expect(JSON.stringify(tap.get("req_account_402"))).not.toContain("account body");
+  });
+
+  it("preserves sanitized upstream-envelope semantics instead of a missing-nonce error", async () => {
+    const fetchImpl = vi.fn(async () => new Response("private rate limit detail", {
+      status: 503,
+      headers: {
+        "retry-after": "120",
+        "x-ambient-error-code": "UPSTREAM_ENVELOPE_UNAVAILABLE",
+        "x-ambient-error-source": "tinfoil_provider",
+      },
+    }));
+    const h = host(fetchImpl);
+    const tap = new WireTap();
+    tap.install(h);
+
+    await expect(h.fetch(sealedRequest("req_provider_503", new Uint8Array([1])))).rejects.toMatchObject({
+      code: "UPSTREAM_ENVELOPE_UNAVAILABLE",
+      httpStatus: 503,
+      retryAfterSeconds: 120,
+    });
+    expect(JSON.stringify(tap.get("req_provider_503"))).not.toContain("private rate limit detail");
   });
 
   it("redacts the session token from captured headers", async () => {

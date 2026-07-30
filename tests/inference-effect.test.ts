@@ -12,6 +12,13 @@ import {
 } from "../electron/inference/effect.js";
 import { MemoryAuditSink } from "../electron/diagnostics/audit.js";
 import type { SignedInWorkOsSession } from "../electron/workos/session.js";
+import type { UsageSummary } from "@ambient/shared/usage";
+import { InferenceAvailabilityCircuit } from "../electron/inference/availability.js";
+import { BridgeInferenceServiceError, BridgeUsageRequestError } from "../electron/inference/errors.js";
+import {
+  BridgeUsageAccountingDisabledError,
+  type BridgeUsageService,
+} from "../electron/inference/usage-service.js";
 
 describe("Bridge secure inference Effect service", () => {
   it("fails signed-out requests before verifying the Tinfoil client", async () => {
@@ -104,6 +111,204 @@ describe("Bridge secure inference Effect service", () => {
     expect(headers.get("x-ambient-feature")).toBe("inference.chatCompletions");
     expect(headers.get("x-ambient-model-id")).toBe("model_test");
     expect(calls.init?.body).toBe(JSON.stringify({ messages: [], model: "model_test", stream: true }));
+  });
+
+  it("reserves credit before secure egress and sends the opaque reservation identity", async () => {
+    const calls: { init?: RequestInit } = {};
+    const secureClient = createBridgeSecureClient({
+      makeSecureClient: (() => ({
+        fetch: async (_input, init) => {
+          calls.init = init;
+          return new Response("ok");
+        },
+        ready: async () => {},
+      })) satisfies SecureClientFactory,
+      serverBaseUrl: "https://api.example.test",
+    });
+    const usage = usageService();
+    const availability = new InferenceAvailabilityCircuit();
+
+    const response = await Effect.runPromise(
+      secureInferenceResponse({
+        appVersion: "0.1.0",
+        availability,
+        feature: "inference.chatCompletions",
+        path: "/v1/chat/completions",
+        payload: { messages: [], model: "model_test" },
+        requestId: "req_credit",
+        signal: new AbortController().signal,
+        usage,
+      }).pipe(
+        Effect.provideService(BridgeSessionService, createBridgeSessionService({ read: async () => signedInSession() })),
+        Effect.provideService(BridgeSecureClient, secureClient),
+        Effect.provideService(BridgeAuditService, createBridgeAuditService(new MemoryAuditSink())),
+      ),
+    );
+
+    expect(await response.text()).toBe("ok");
+    expect(usage.reserve).toHaveBeenCalledWith(expect.objectContaining({
+      modelId: "model_test",
+      requestId: "req_credit",
+      route: "/v1/chat/completions",
+    }));
+    expect(new Headers(calls.init?.headers).get("x-ambient-credit-reservation")).toBe("crr_test_abcdefghijklmnop");
+    expect(usage.release).not.toHaveBeenCalled();
+  });
+
+  it("automatically recovers a half-open availability probe after a successful request", async () => {
+    const secureClient = createBridgeSecureClient({
+      makeSecureClient: (() => ({
+        fetch: async () => new Response("not used"),
+        ready: async () => {},
+      })) satisfies SecureClientFactory,
+      serverBaseUrl: "https://api.example.test",
+    });
+    const usage = usageService();
+    const availability = new InferenceAvailabilityCircuit();
+    availability.serviceUnavailable(
+      new BridgeInferenceServiceError("UPSTREAM_BILLING_UNAVAILABLE", 503, 60),
+      Date.now() - 60_000,
+    );
+
+    const response = await Effect.runPromise(
+      secureInferenceResponse({
+        appVersion: "0.1.0",
+        availability,
+        feature: "inference.chatCompletions",
+        path: "/v1/chat/completions",
+        payload: { messages: [], model: "model_test" },
+        requestId: "req_usage_recovery_probe",
+        signal: new AbortController().signal,
+        usage,
+      }).pipe(
+        Effect.provideService(BridgeSessionService, createBridgeSessionService({ read: async () => signedInSession() })),
+        Effect.provideService(BridgeSecureClient, secureClient),
+        Effect.provideService(BridgeAuditService, createBridgeAuditService(new MemoryAuditSink())),
+      ),
+    );
+
+    expect(await response.text()).toBe("not used");
+    expect(availability.snapshot("organization:org_test")).toEqual({ state: "ready" });
+  });
+
+  it("re-arms a half-open availability probe after a non-transient reservation failure", async () => {
+    const secureClient = createBridgeSecureClient({
+      makeSecureClient: (() => ({
+        fetch: async () => new Response("not used"),
+        ready: async () => {},
+      })) satisfies SecureClientFactory,
+      serverBaseUrl: "https://api.example.test",
+    });
+    const usage = usageService();
+    usage.reserve.mockImplementationOnce(() => Effect.fail(
+      new BridgeUsageRequestError("permanent reservation failure"),
+    ));
+    const availability = new InferenceAvailabilityCircuit();
+    const serviceError = new BridgeInferenceServiceError("UPSTREAM_BILLING_UNAVAILABLE", 503, 60);
+    availability.serviceUnavailable(serviceError, Date.now() - 60_000);
+
+    const result = await Effect.runPromise(Effect.either(
+      secureInferenceResponse({
+        appVersion: "0.1.0",
+        availability,
+        feature: "inference.chatCompletions",
+        path: "/v1/chat/completions",
+        payload: { messages: [], model: "model_test" },
+        requestId: "req_usage_failed_probe",
+        signal: new AbortController().signal,
+        usage,
+      }).pipe(
+        Effect.provideService(BridgeSessionService, createBridgeSessionService({ read: async () => signedInSession() })),
+        Effect.provideService(BridgeSecureClient, secureClient),
+        Effect.provideService(BridgeAuditService, createBridgeAuditService(new MemoryAuditSink())),
+      ),
+    ));
+
+    expect(result._tag).toBe("Left");
+    expect(availability.snapshot("organization:org_test")).toMatchObject({
+      state: "service_degraded",
+      code: "UPSTREAM_BILLING_UNAVAILABLE",
+    });
+    expect(() => availability.beforeRequest("organization:org_test")).toThrow(BridgeInferenceServiceError);
+    expect(() => availability.beforeRequest("organization:org_test", Date.now() + 60_000)).not.toThrow();
+  });
+
+  it("uses the server's compatible unmetered path only when accounting is explicitly disabled", async () => {
+    const calls: { init?: RequestInit } = {};
+    const secureClient = createBridgeSecureClient({
+      makeSecureClient: (() => ({
+        fetch: async (_input, init) => {
+          calls.init = init;
+          return new Response("ok");
+        },
+        ready: async () => {},
+      })) satisfies SecureClientFactory,
+      serverBaseUrl: "https://api.example.test",
+    });
+    const usage = usageService();
+    usage.reserve.mockImplementationOnce(() => Effect.fail(new BridgeUsageAccountingDisabledError()));
+
+    const response = await Effect.runPromise(
+      secureInferenceResponse({
+        appVersion: "0.1.0",
+        feature: "inference.chatCompletions",
+        path: "/v1/chat/completions",
+        payload: { messages: [], model: "model_test" },
+        requestId: "req_unmetered_compatibility",
+        signal: new AbortController().signal,
+        usage,
+      }).pipe(
+        Effect.provideService(BridgeSessionService, createBridgeSessionService({ read: async () => signedInSession() })),
+        Effect.provideService(BridgeSecureClient, secureClient),
+        Effect.provideService(BridgeAuditService, createBridgeAuditService(new MemoryAuditSink())),
+      ),
+    );
+
+    expect(await response.text()).toBe("ok");
+    expect(new Headers(calls.init?.headers).has("x-ambient-credit-reservation")).toBe(false);
+    expect(usage.release).not.toHaveBeenCalled();
+  });
+
+  it("does not retry a credited request during a provider outage and releases it without opening account exhaustion", async () => {
+    let attempts = 0;
+    const secureClient = createBridgeSecureClient({
+      makeSecureClient: (() => ({
+        fetch: async () => {
+          attempts += 1;
+          throw new BridgeInferenceServiceError("UPSTREAM_BILLING_UNAVAILABLE", 503, 60);
+        },
+        ready: async () => {},
+      })) satisfies SecureClientFactory,
+      serverBaseUrl: "https://api.example.test",
+    });
+    const usage = usageService();
+    const availability = new InferenceAvailabilityCircuit();
+
+    const result = await Effect.runPromise(Effect.either(
+      secureInferenceResponse({
+        appVersion: "0.1.0",
+        availability,
+        feature: "inference.chatCompletions",
+        path: "/v1/chat/completions",
+        payload: { messages: [], model: "model_test" },
+        requestId: "req_provider_outage",
+        signal: new AbortController().signal,
+        usage,
+      }).pipe(
+        Effect.provideService(BridgeSessionService, createBridgeSessionService({ read: async () => signedInSession() })),
+        Effect.provideService(BridgeSecureClient, secureClient),
+        Effect.provideService(BridgeAuditService, createBridgeAuditService(new MemoryAuditSink())),
+      ),
+    ));
+
+    expect(result._tag).toBe("Left");
+    if (result._tag === "Left") expect(result.left).toBeInstanceOf(BridgeInferenceServiceError);
+    expect(attempts).toBe(1);
+    expect(usage.release).toHaveBeenCalledWith(expect.anything(), "crr_test_abcdefghijklmnop");
+    expect(availability.snapshot("organization:org_test")).toMatchObject({
+      state: "service_degraded",
+      code: "UPSTREAM_BILLING_UNAVAILABLE",
+    });
   });
 
   it("validates and uses refreshed sessions before secure requests", async () => {
@@ -431,3 +636,40 @@ describe("Bridge secure inference Effect service", () => {
     expect(calls.init?.body).toBe(body);
   });
 });
+
+function signedInSession(): SignedInWorkOsSession {
+  return {
+    email: "user@example.test",
+    expiresAt: 1_800_000_000,
+    kind: "signed_in",
+    organizationId: "org_test",
+    sessionToken: "sealed_session_test",
+    user: { email: "user@example.test", id: "user_1", name: null },
+  };
+}
+
+function usageService(): BridgeUsageService & {
+  readonly reserve: ReturnType<typeof vi.fn<BridgeUsageService["reserve"]>>;
+  readonly release: ReturnType<typeof vi.fn<BridgeUsageService["release"]>>;
+} {
+  const summary: UsageSummary = {
+    schemaVersion: 1,
+    owner: { kind: "organization", id: "org_test" },
+    currency: "USD",
+    period: { kind: "lifetime" },
+    mode: "metered",
+    grantedMicros: "100",
+    usedMicros: "0",
+    reservedMicros: "60",
+    remainingMicros: "40",
+    updatedAt: "2026-07-20T12:00:00.000Z",
+  };
+  const reserve = vi.fn<BridgeUsageService["reserve"]>(() => Effect.succeed({
+    reservationId: "crr_test_abcdefghijklmnop",
+    reservedMicros: "60",
+    expiresAt: "2026-07-20T12:15:00.000Z",
+    summary,
+  }));
+  const release = vi.fn<BridgeUsageService["release"]>(() => Effect.void);
+  return { summary: async () => summary, reserve, release };
+}

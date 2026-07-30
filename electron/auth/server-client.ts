@@ -1,4 +1,14 @@
 import { BUILD_DEFAULT_SERVER_URL } from "../generated/build-config.js";
+import {
+  parseUsageApiError,
+  parseUsageReservationResponse,
+  parseUsageSummary,
+  type UsageApiErrorBody,
+  type UsageErrorCode,
+  type UsageReservationRequest,
+  type UsageReservationResponse,
+  type UsageSummary,
+} from "@ambient/shared/usage";
 
 export type AuthBrokerUser = {
   id: string;
@@ -72,6 +82,18 @@ export class AuthServerRequestError extends Error {
   ) {
     super(typeof serverMessage === "string" ? `Server request failed: ${serverMessage}` : `Server request failed: ${status}`);
     this.name = "AuthServerRequestError";
+  }
+}
+
+export class AuthServerUsageError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: UsageErrorCode,
+    readonly serverMessage: string,
+    readonly summary?: UsageSummary,
+  ) {
+    super(`Usage request failed: ${serverMessage}`);
+    this.name = "AuthServerUsageError";
   }
 }
 
@@ -157,6 +179,31 @@ export class AuthServerClient {
     return { ...delegated, serverBaseUrl: this.baseUrl };
   }
 
+  usageSummary(sessionToken: string): Promise<UsageSummary> {
+    return this.usageJson("/usage/summary", sessionToken, { method: "GET" }, parseUsageSummary);
+  }
+
+  reserveUsage(sessionToken: string, request: UsageReservationRequest): Promise<UsageReservationResponse> {
+    return this.usageJson(
+      "/usage/reservations",
+      sessionToken,
+      { method: "POST", body: JSON.stringify(request) },
+      parseUsageReservationResponse,
+    );
+  }
+
+  releaseUsage(sessionToken: string, reservationId: string): Promise<UsageSummary> {
+    if (!/^crr_[A-Za-z0-9_-]{8,160}$/.test(reservationId)) {
+      return Promise.reject(new Error("Inference reservation identity is invalid."));
+    }
+    return this.usageJson(
+      `/usage/reservations/${encodeURIComponent(reservationId)}`,
+      sessionToken,
+      { method: "DELETE" },
+      parseUsageSummary,
+    );
+  }
+
   async checkHealth(options: AuthServerHealthOptions = {}): Promise<boolean> {
     return (await this.checkHealthDetailed(options)).reachable;
   }
@@ -239,6 +286,53 @@ export class AuthServerClient {
 
     return parse(responseBody);
   }
+
+  private async usageJson<T>(
+    path: string,
+    sessionToken: string,
+    init: { readonly method: "GET" | "POST" | "DELETE"; readonly body?: string },
+    parse: (value: unknown) => T,
+  ): Promise<T> {
+    const timeoutSignal = AbortSignal.timeout(this.requestTimeoutMs);
+    let response: Response;
+    try {
+      response = await this.fetchImpl(new URL(path, this.baseUrl), {
+        ...(init.body === undefined ? {} : { body: init.body }),
+        headers: {
+          Accept: "application/json",
+          Authorization: `Bearer ${sessionToken}`,
+          ...(init.body === undefined ? {} : { "Content-Type": "application/json" }),
+        },
+        method: init.method,
+        signal: timeoutSignal,
+      });
+    } catch (error) {
+      if (timeoutSignal.aborted || isAbortError(error) || isTimeoutError(error)) {
+        throw new AuthServerTimeoutError(this.requestTimeoutMs);
+      }
+      throw error;
+    }
+
+    let responseBody: unknown;
+    try {
+      responseBody = await response.json();
+    } catch (error) {
+      if (timeoutSignal.aborted || isTimeoutError(error)) {
+        throw new AuthServerTimeoutError(this.requestTimeoutMs);
+      }
+      responseBody = {};
+    }
+    if (!response.ok) throw usageRequestError(response.status, responseBody);
+    return parse(responseBody);
+  }
+}
+
+function usageRequestError(status: number, value: unknown): Error {
+  const parsed: UsageApiErrorBody | null = parseUsageApiError(value);
+  if (parsed) {
+    return new AuthServerUsageError(status, parsed.error.code, parsed.error.message, parsed.summary);
+  }
+  return new AuthServerRequestError(status, "Usage response was unavailable.");
 }
 
 export function resolveServerBaseUrl(): string {

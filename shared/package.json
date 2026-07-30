@@ -34,6 +34,10 @@
       "types": "./src/compact-auth-window.d.ts",
       "default": "./src/compact-auth-window.js"
     },
+    "./usage": {
+      "types": "./src/usage.d.ts",
+      "default": "./src/usage.js"
+    },
     "./window-capture": {
       "types": "./src/window-capture.d.ts",
       "default": "./src/window-capture.js"
@@ -41,6 +45,7 @@
   },
   "dependencies": {
     "@fontsource-variable/inter": "^5.1.0",
+    "@fontsource/jetbrains-mono": "^5.2.8",
     "@fontsource/stix-two-text": "^5.2.8",
     "clsx": "^2.1.1",
     "svelte-sonner": "^1.1.1",

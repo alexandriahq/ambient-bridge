@@ -1,9 +1,10 @@
-import { readFile } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 const bridgeRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const sharedRoot = path.resolve(bridgeRoot, "shared");
 
 describe("Bridge packaged dependency policy", () => {
   it("classifies every declared package dependency", async () => {
@@ -25,5 +26,17 @@ describe("Bridge packaged dependency policy", () => {
       "@lucide/svelte",
       "svelte",
     ]));
+  });
+
+  it("publishes the shared usage contract as JavaScript for Electron main", async () => {
+    const packageJson = JSON.parse(await readFile(path.join(sharedRoot, "package.json"), "utf8"));
+    const usageExport = packageJson.exports?.["./usage"];
+
+    expect(usageExport).toEqual({
+      default: "./src/usage.js",
+      types: "./src/usage.d.ts",
+    });
+    await expect(access(path.join(sharedRoot, usageExport.default))).resolves.toBeUndefined();
+    await expect(access(path.join(sharedRoot, usageExport.types))).resolves.toBeUndefined();
   });
 });

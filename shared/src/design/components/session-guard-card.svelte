@@ -1,5 +1,5 @@
 <script lang="ts">
-  import Button from "../ui/Button.svelte";
+  import Button from "../adapters/button.svelte";
   import { cn } from "../cn";
   import type { SessionGuardCardModel, SessionGuardStatus } from "../../session-guard.js";
 

@@ -16,6 +16,12 @@
  * to the local renderer on demand rather than streamed through status polling.
  */
 
+import {
+  BridgeInferenceServiceError,
+  BridgeInsufficientCreditError,
+  boundedRetryAfterSeconds,
+} from "./errors.js";
+
 export type WireHeader = { name: string; value: string };
 
 export type WireBody = {
@@ -156,6 +162,31 @@ export class WireTap {
 
     const response = await responsePromise;
 
+    const plainError = plainInferenceError(response);
+    if (plainError) {
+      await requestStored.catch(() => {});
+      if (captureGeneration === this.generation) {
+        const existing = this.captures.get(requestId);
+        if (existing) {
+          existing.response = {
+            status: response.status,
+            headers: sanitizeHeaders(response.headers),
+            // A non-EHBP body is unverified provider/edge plaintext. Never retain
+            // it in the ciphertext inspector or let it be mislabeled as sealed.
+            body: { base64: "", byteLength: null, capturedBytes: 0, truncated: response.body !== null },
+          };
+          this.prune();
+          this.onUpdate?.(requestId);
+        }
+      }
+      try {
+        await response.body?.cancel();
+      } catch {
+        // The unverified body is deliberately discarded.
+      }
+      throw plainError;
+    }
+
     // Capture the encrypted response from a tee'd clone so the SDK still decrypts
     // the original untouched. Reading is capped and cancels early on large streams.
     const responseClone = response.clone();
@@ -263,6 +294,27 @@ export class WireTap {
       truncated,
     };
   }
+}
+
+function plainInferenceError(response: Response): BridgeInferenceServiceError | BridgeInsufficientCreditError | null {
+  if (response.ok || response.headers.has("ehbp-response-nonce")) return null;
+  const code = response.headers.get("x-ambient-error-code");
+  const source = response.headers.get("x-ambient-error-source");
+  if (code === "INSUFFICIENT_CREDIT" && source === "ambient_account") {
+    return new BridgeInsufficientCreditError(undefined, response.status);
+  }
+  if (code === "UPSTREAM_BILLING_UNAVAILABLE" || (response.status === 402 && code !== "INSUFFICIENT_CREDIT")) {
+    return new BridgeInferenceServiceError(
+      "UPSTREAM_BILLING_UNAVAILABLE",
+      response.status,
+      boundedRetryAfterSeconds(response.headers.get("retry-after"), 60),
+    );
+  }
+  return new BridgeInferenceServiceError(
+    "UPSTREAM_ENVELOPE_UNAVAILABLE",
+    response.status,
+    boundedRetryAfterSeconds(response.headers.get("retry-after"), 30),
+  );
 }
 
 function contentLength(headers: Headers): number | null {

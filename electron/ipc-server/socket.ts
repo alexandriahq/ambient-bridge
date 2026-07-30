@@ -256,7 +256,7 @@ export class BridgeIpcServer {
       socket.write(encodeFrame({
         type: "error",
         id: frame.id,
-        code: "handler_error",
+        code: safeHandlerErrorCode(error),
         message: safeHandlerErrorMessage(error),
       }));
     } finally {
@@ -428,7 +428,7 @@ export class BridgeIpcServer {
       socket.write(encodeFrame({
         type: "error",
         id: frame.id,
-        code: "handler_error",
+        code: safeHandlerErrorCode(error),
         message: safeHandlerErrorMessage(error),
       }));
     }
@@ -486,7 +486,7 @@ export async function writeIpcHandlerResult(input: {
       await writeIpcFrame(input.socket, {
         type: "error",
         id: input.frame.id,
-        code: "handler_error",
+        code: safeHandlerErrorCode(error),
         message: safeHandlerErrorMessage(error),
       });
     } catch (writeError) {
@@ -565,6 +565,19 @@ function isClosedSocketWriteError(error: unknown): boolean {
 function safeHandlerErrorMessage(error: unknown): string {
   const message = errorMessage(error).trim();
   return (message || "Bridge handler failed").slice(0, 500);
+}
+
+const PUBLIC_HANDLER_ERROR_CODES = new Set([
+  "INSUFFICIENT_CREDIT",
+  "UPSTREAM_BILLING_UNAVAILABLE",
+  "UPSTREAM_ENVELOPE_UNAVAILABLE",
+]);
+
+function safeHandlerErrorCode(error: unknown, depth = 0): string {
+  if (!error || typeof error !== "object" || depth > 6) return "handler_error";
+  const record = error as { readonly code?: unknown; readonly cause?: unknown };
+  if (typeof record.code === "string" && PUBLIC_HANDLER_ERROR_CODES.has(record.code)) return record.code;
+  return safeHandlerErrorCode(record.cause, depth + 1);
 }
 
 function isWindowsPipePath(socketPath: string): boolean {

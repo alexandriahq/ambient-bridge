@@ -93,6 +93,7 @@ while (queue.length > 0) {
 verifyPackagedServerOrigin();
 verifyPackagedBridgeUi();
 verifyPublicLicenseNotices();
+verifyPackagedSharedRuntimeExports();
 
 if (failures.length > 0) {
   console.error("[bridge:smoke] packaged app dependency verification failed:");
@@ -165,6 +166,23 @@ function verifyPackagedBridgeUi() {
     if (!preloadSource.includes(channel)) {
       failures.push(`Bridge packaged preload is missing renderer IPC channel ${channel}.`);
     }
+  }
+}
+
+function verifyPackagedSharedRuntimeExports() {
+  const sharedPackagePath = presentPackages.get("@ambient/shared");
+  if (!sharedPackagePath) return;
+
+  const sharedPackage = readPackageJson(sharedPackagePath);
+  const usageRuntime = sharedPackage.exports?.["./usage"]?.default;
+  if (typeof usageRuntime !== "string" || !usageRuntime.endsWith(".js")) {
+    failures.push("@ambient/shared/usage must resolve to packaged JavaScript at runtime.");
+    return;
+  }
+
+  const usageRuntimePath = path.posix.join(path.posix.dirname(sharedPackagePath), usageRuntime);
+  if (!packageHasPath(usageRuntimePath)) {
+    failures.push(`@ambient/shared/usage runtime is missing from app.asar: ${usageRuntimePath}`);
   }
 }
 

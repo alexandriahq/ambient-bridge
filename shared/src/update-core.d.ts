@@ -81,6 +81,8 @@ export declare function updaterUnavailableReason(input: {
   readonly platform: NodeJS.Platform;
   readonly arch: string;
   readonly localQaBuild?: boolean;
+  readonly channel?: string;
+  readonly version?: string;
 }): string | null;
 
 export declare function normalizeDownloadPercent(value: unknown): number | null;
@@ -102,3 +104,12 @@ export declare function parseReleaseListResponse(input: {
   readonly releasesUrl: string;
   readonly body: unknown;
 }): AmbientReleaseBuildsSnapshot;
+
+export declare function localReleaseBuildsSnapshot(input: {
+  readonly isPackaged: boolean;
+  readonly localBuild?: boolean;
+  readonly channel: string;
+  readonly platform: NodeJS.Platform;
+  readonly arch: string;
+  readonly currentVersion: string;
+}): AmbientReleaseBuildsSnapshot | null;

@@ -1,9 +1,16 @@
 extends: electron-builder.yml
-# dev.ps1 supplies the same version used for extraMetadata.version.
+appId: com.alexandria.ambient.bridge.local
+productName: Ambient Bridge Local
+extraMetadata:
+  name: ambient-bridge-local
+  main: dist/electron/main.js
+mac:
+  timestamp: none
+# package.json owns the fixed local version; release workflows stamp CI versions.
 win:
   # Avoid electron-builder's cross-platform winCodeSign archive in ordinary
   # Windows shells. The afterPack hook applies the icon and version resources
   # with the Windows-only rcedit package; release/CI builds keep the base path.
   signAndEditExecutable: false
 nsis:
-  artifactName: ${productName} Setup ${env.AMBIENT_LOCAL_INSTALLER_VERSION}.${ext}
+  artifactName: ${productName} Setup ${version}.${ext}

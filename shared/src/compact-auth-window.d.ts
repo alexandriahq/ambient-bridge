@@ -46,6 +46,20 @@ export type CompactAuthWindowHtmlInput = {
   readonly cancelUrl?: string;
 };
 
+export type CompactAuthFullScreenWindow = {
+  isFullScreen(): boolean;
+  setFullScreen(flag: boolean): void;
+  once(event: "leave-full-screen" | "closed", listener: () => void): unknown;
+  off(event: "leave-full-screen" | "closed", listener: () => void): unknown;
+};
+
+export type CompactAuthMaximizedWindow = {
+  isMaximized(): boolean;
+  unmaximize(): void;
+  once(event: "unmaximize" | "closed", listener: () => void): unknown;
+  off(event: "unmaximize" | "closed", listener: () => void): unknown;
+};
+
 export declare const COMPACT_AUTH_WINDOW_EVENT_SCHEME: "ambient-compact-auth:";
 export declare const DEFAULT_COMPACT_AUTH_TITLE: "Sign into your Ambient Account";
 export declare const DEFAULT_COMPACT_AUTH_WINDOW_WIDTH: 560;
@@ -58,4 +72,12 @@ export declare function compactAuthWindowBlackoutHtml(input?: CompactAuthWindowB
 export declare function compactAuthWindowBounds(input: CompactAuthWindowBoundsInput): CompactAuthRectangle;
 export declare function compactAuthWindowTransitionBounds(input: CompactAuthWindowTransitionBoundsInput): CompactAuthRectangle;
 export declare function compactAuthWindowTransitionProgress(progress: number): number;
+export declare function leaveCompactAuthFullScreen(
+  window: CompactAuthFullScreenWindow,
+  platform?: CompactAuthPlatform,
+): Promise<void>;
+export declare function leaveCompactAuthMaximized(
+  window: CompactAuthMaximizedWindow,
+  platform?: CompactAuthPlatform,
+): Promise<void>;
 export declare function compactAuthWindowHtml(input?: CompactAuthWindowHtmlInput): string;

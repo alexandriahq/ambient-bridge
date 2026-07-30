@@ -51,9 +51,9 @@ win:
 nsis:
   installerIcon: resources/bridge-icon.ico
   uninstallerIcon: resources/bridge-icon.ico
-  oneClick: false
+  include: resources/windows-installer.nsh
+  oneClick: true
   perMachine: false
-  allowToChangeInstallationDirectory: true
 publish:
   provider: generic
   url: https://api.alexandria.so/updates/apps/ambient-bridge/alpha/darwin/arm64/

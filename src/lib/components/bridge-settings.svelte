@@ -1,6 +1,7 @@
 <script lang="ts">
   import { Button, Icon, Pill, Select, SettingsShell, cn } from "@ambient/shared/design";
   import type { BridgeExperimentalBuildsSnapshot, BridgeUpdateStatus } from "../bridge-api";
+  import bridgeIcon from "../../../resources/bridge-icon-source.png";
 
   type ExperimentalBuild = BridgeExperimentalBuildsSnapshot["builds"][number];
 
@@ -215,18 +216,46 @@
   }
 </script>
 
-<SettingsShell {open} {sections} bind:section onClose={closeSettings}>
+<SettingsShell
+  {open}
+  {sections}
+  {section}
+  onSectionChange={(nextSection) => {
+    section = nextSection;
+  }}
+  onClose={closeSettings}
+>
   {#snippet children(activeSection)}
     {#if activeSection === "about"}
-      <div class="flex flex-col items-center py-12 text-center">
-        <div class="grid size-14 place-items-center rounded-[var(--radius-lg)] border border-line bg-primary text-lg font-bold text-on-primary">
-          A
+      <h2 class="text-xl font-semibold tracking-tight text-ink">About</h2>
+      <div class="mt-8 max-w-xl">
+        <div class="flex items-center gap-4">
+          <div class="grid size-16 shrink-0 place-items-center overflow-hidden rounded-[var(--radius-lg)] border border-line bg-white shadow-sm">
+            <img src={bridgeIcon} alt="" class="size-full object-cover" />
+          </div>
+          <div class="min-w-0">
+            <p class="text-lg font-semibold text-ink">Ambient Bridge</p>
+            <p class="mt-0.5 truncate text-sm text-ink-tertiary">Secure local inference gateway</p>
+          </div>
         </div>
-        <p class="mt-4 text-lg font-semibold text-ink">Ambient Bridge</p>
-        <p class="text-sm text-ink-tertiary">Version {updateStatus.currentVersion ?? appVersion} · {updateStatus.channel}</p>
-        <div class="mt-4"><Pill tone="outline">{updateLabel()}</Pill></div>
+
+        <dl class="card mt-6 overflow-hidden text-sm" aria-label="Bridge identity">
+          <div class="grid grid-cols-[5rem_minmax(0,1fr)] items-center gap-4 px-4 py-3">
+            <dt class="font-medium text-ink-tertiary">Version</dt>
+            <dd class="min-w-0 break-words text-ink-secondary">{updateStatus.currentVersion ?? appVersion}</dd>
+          </div>
+          <div class="grid grid-cols-[5rem_minmax(0,1fr)] items-center gap-4 px-4 py-3">
+            <dt class="font-medium text-ink-tertiary">Channel</dt>
+            <dd class="min-w-0 break-words text-ink-secondary">{updateStatus.channel}</dd>
+          </div>
+          <div class="grid grid-cols-[5rem_minmax(0,1fr)] items-center gap-4 px-4 py-3">
+            <dt class="font-medium text-ink-tertiary">Updates</dt>
+            <dd><Pill tone="outline">{updateLabel()}</Pill></dd>
+          </div>
+        </dl>
+
         {#if updateStatus.enabled}
-          <div class="mt-4 flex items-center gap-2">
+          <div class="mt-4 flex flex-wrap items-center gap-3">
             <Button
               variant="secondary"
               size="sm"
@@ -246,20 +275,20 @@
             {/if}
           </div>
         {:else}
-          <p class="mt-4 max-w-sm text-sm leading-6 text-ink-tertiary">{updateStatus.reason ?? "Automatic updates are unavailable in this Bridge build."}</p>
+          <p class="mt-4 text-sm leading-relaxed text-ink-tertiary">{updateStatus.reason ?? "Automatic updates are unavailable in this Bridge build."}</p>
         {/if}
         {#if updateStatus.updateError}
-          <p class="mt-4 max-w-sm text-sm leading-6 text-warning">{updateStatus.updateError}</p>
+          <p class="mt-4 text-sm leading-relaxed text-warning">{updateStatus.updateError}</p>
         {/if}
       </div>
     {:else if activeSection === "dev" && devtoolsEnabled}
-      <h2 class="text-xl font-semibold text-ink">Dev</h2>
-      <div class="mt-6 grid gap-8">
+      <h2 class="text-xl font-semibold tracking-tight text-ink">Dev</h2>
+      <div class="mt-8 grid gap-8">
         <section aria-labelledby="experimental-builds-title">
           <div class="flex items-start justify-between gap-4">
             <div class="min-w-0">
-              <h3 id="experimental-builds-title" class="text-base font-semibold text-ink">Experimental builds</h3>
-              <p class="mt-1 text-sm leading-6 text-ink-tertiary" aria-live="polite">{experimentalBuildsTitle()} · {experimentalBuildsDetail()}</p>
+              <h3 id="experimental-builds-title" class="text-lg font-semibold text-ink">Experimental builds</h3>
+              <p class="mt-1 text-sm leading-relaxed text-ink-tertiary" aria-live="polite">{experimentalBuildsTitle()} · {experimentalBuildsDetail()}</p>
             </div>
             <Button
               variant="secondary"
@@ -272,19 +301,20 @@
             />
           </div>
           <div class="mt-4 grid gap-3">
-            <label class="grid gap-1.5 text-sm font-medium text-ink">
+            <div class="grid max-w-lg gap-1.5 text-sm font-medium text-ink">
               <span>Build version</span>
               <Select
-                class="w-full"
-                value={selectedExperimentalBuildKey}
+                aria-label="Build version"
+                class="w-full min-w-0 truncate"
+                bind:value={selectedExperimentalBuildKey}
                 options={experimentalBuildSelectOptions()}
                 disabled={experimentalBuildOptions().length === 0 || experimentalBuildsLoading || experimentalInstallBusy}
-                onchange={(event: Event) => {
-                  selectedExperimentalBuildKey = (event.currentTarget as HTMLSelectElement).value;
+                onValueChange={(value) => {
+                  selectedExperimentalBuildKey = value;
                   experimentalBuildsError = null;
                 }}
               />
-            </label>
+            </div>
             <div class="flex flex-wrap items-center gap-2">
               <Button type="button" onclick={() => void installSelectedExperimentalBuild()} disabled={experimentalInstallDisabled()}>{experimentalInstallButtonLabel()}</Button>
               <Button variant="secondary" type="button" onclick={() => void checkForStableUpdates()} disabled={stableUpdateDisabled()}>{stableUpdateButtonLabel()}</Button>

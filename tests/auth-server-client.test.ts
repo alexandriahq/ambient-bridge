@@ -4,6 +4,7 @@ import {
   AuthServerClient,
   AuthServerTimeoutError,
   AuthServerRequestError,
+  AuthServerUsageError,
   createAuthLoginUrl,
   normalizeAuthServerBaseUrl,
   parseBridgeAuthCallback,
@@ -322,7 +323,93 @@ describe("server auth client", () => {
     await expect(client.validateSession("session-token")).rejects.toBeInstanceOf(AuthServerTimeoutError);
   });
 
+  it("reads exact authenticated usage summaries without putting the session in the body", async () => {
+    const fetchImpl = vi.fn(async () => Response.json(usageSummary("2500000"))) as unknown as typeof fetch;
+    const client = new AuthServerClient({ baseUrl: "http://localhost:3000", fetchImpl });
+
+    await expect(client.usageSummary("session_secret")).resolves.toMatchObject({
+      grantedMicros: "10000000",
+      remainingMicros: "2500000",
+      usedMicros: "7500000",
+    });
+    expect(fetchImpl).toHaveBeenCalledWith(new URL("/usage/summary", "http://localhost:3000"), {
+      headers: {
+        Accept: "application/json",
+        Authorization: "Bearer session_secret",
+      },
+      method: "GET",
+      signal: expect.any(AbortSignal),
+    });
+  });
+
+  it("reserves and releases inference credit through typed control-plane calls", async () => {
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(Response.json({
+        reservationId: "crr_abcdefghijklmnop",
+        reservedMicros: "500000",
+        expiresAt: "2026-07-20T12:15:00.000Z",
+        summary: usageSummary("2000000"),
+      }, { status: 201 }))
+      .mockResolvedValueOnce(Response.json(usageSummary("2500000")));
+    const client = new AuthServerClient({ baseUrl: "http://localhost:3000", fetchImpl });
+
+    await expect(client.reserveUsage("session_secret", {
+      requestId: "request_1",
+      route: "/v1/chat/completions",
+      modelId: "model_test",
+    })).resolves.toMatchObject({ reservationId: "crr_abcdefghijklmnop" });
+    await expect(client.releaseUsage("session_secret", "crr_abcdefghijklmnop"))
+      .resolves.toMatchObject({ remainingMicros: "2500000" });
+
+    expect(fetchImpl.mock.calls[0]?.[1]).toMatchObject({
+      body: JSON.stringify({ requestId: "request_1", route: "/v1/chat/completions", modelId: "model_test" }),
+      method: "POST",
+    });
+    expect(fetchImpl.mock.calls[1]?.[0]).toEqual(
+      new URL("/usage/reservations/crr_abcdefghijklmnop", "http://localhost:3000"),
+    );
+    expect(fetchImpl.mock.calls[1]?.[1]).toMatchObject({ method: "DELETE" });
+  });
+
+  it("keeps a server-authenticated account exhaustion error typed and distinct", async () => {
+    const fetchImpl = vi.fn(async () => Response.json({
+      error: { code: "INSUFFICIENT_CREDIT", message: "No usable inference credit remains." },
+      summary: usageSummary("0"),
+    }, { status: 402 })) as unknown as typeof fetch;
+    const client = new AuthServerClient({ baseUrl: "http://localhost:3000", fetchImpl });
+
+    await expect(client.reserveUsage("session_secret", {
+      requestId: "request_1",
+      route: "/v1/chat/completions",
+      modelId: "model_test",
+    })).rejects.toMatchObject({
+      code: "INSUFFICIENT_CREDIT",
+      status: 402,
+      summary: { remainingMicros: "0" },
+    });
+    await expect(client.reserveUsage("session_secret", {
+      requestId: "request_2",
+      route: "/v1/chat/completions",
+      modelId: "model_test",
+    })).rejects.toBeInstanceOf(AuthServerUsageError);
+  });
+
 });
+
+function usageSummary(remainingMicros: string) {
+  return {
+    schemaVersion: 1,
+    owner: { kind: "organization", id: "org_test" },
+    currency: "USD",
+    period: { kind: "lifetime" },
+    mode: "metered",
+    grantedMicros: "10000000",
+    usedMicros: remainingMicros === "0" ? "10000000" : "7500000",
+    reservedMicros: "0",
+    remainingMicros,
+    updatedAt: "2026-07-20T12:00:00.000Z",
+  };
+}
 
 function responseWithStalledBody(): typeof fetch {
   return vi.fn(async (_input: URL | RequestInfo, init?: RequestInit) => {

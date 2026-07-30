@@ -65,6 +65,8 @@ export function bridgeUpdaterUnavailableReason(input: {
   readonly platform: NodeJS.Platform;
   readonly arch: string;
   readonly localQaBuild?: boolean;
+  readonly channel?: string;
+  readonly version?: string;
 }): string | null {
   return updaterUnavailableReason(input);
 }

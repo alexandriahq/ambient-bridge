@@ -8,6 +8,8 @@ import {
   compactAuthWindowBounds,
   compactAuthWindowHtml,
   compactAuthWindowTransitionBounds,
+  leaveCompactAuthFullScreen,
+  leaveCompactAuthMaximized,
 } from "@ambient/shared/compact-auth-window";
 
 const CANCEL_URL = `${COMPACT_AUTH_WINDOW_EVENT_SCHEME}//auth/cancel`;
@@ -58,6 +60,7 @@ let compactAuthOnRestore: (() => void) | null = null;
 let compactAuthOnRestoreLoadFailed: ((window: BrowserWindow) => void) | null = null;
 let compactAuthLastHtml: string | null = null;
 let compactAuthRestoring = false;
+let compactAuthActivationId = 0;
 let compactAuthTransitionId = 0;
 let removeScreenListeners: (() => void) | null = null;
 
@@ -80,18 +83,9 @@ export function showCompactAuthWindow(options: CompactAuthWindowOptions): Browse
 
   if (!hadActiveSession) {
     compactAuthSession = beginCompactAuthSession(targetWindow);
-    ensureScreenListeners();
   }
 
-  applyCompactAuthWindowState(targetWindow, options);
-  targetWindow.showInactive();
-  targetWindow.moveTop();
-  if (shouldTransition) {
-    beginCompactAuthTransition(targetWindow, options);
-  } else {
-    loadCompactAuthWindow(targetWindow, options);
-    positionCompactAuthWindow(targetWindow);
-  }
+  beginCompactAuthActivation(targetWindow, options, shouldTransition);
   return targetWindow;
 }
 
@@ -109,6 +103,7 @@ export function closeCompactAuthWindow(): void {
   removeScreenListeners = null;
   if (!session || !window) return;
 
+  compactAuthActivationId += 1;
   compactAuthTransitionId += 1;
   compactAuthRestoring = true;
   try {
@@ -145,6 +140,7 @@ function beginCompactAuthSession(window: BrowserWindow): CompactAuthSession {
   };
   const closedListener = (): void => {
     if (compactAuthSession?.window === window) compactAuthSession = null;
+    compactAuthActivationId += 1;
     compactAuthAnchorWindow = null;
     compactAuthOnRestore = null;
     removeScreenListeners?.();
@@ -194,7 +190,6 @@ function tupleSize(size: readonly number[]): readonly [number, number] {
 }
 
 function applyCompactAuthWindowState(window: BrowserWindow, options: CompactAuthWindowOptions): void {
-  if (window.isFullScreen()) window.setFullScreen(false);
   if (window.isMaximized()) window.unmaximize();
   if (window.isMinimized()) window.restore();
 
@@ -212,6 +207,45 @@ function applyCompactAuthWindowState(window: BrowserWindow, options: CompactAuth
   if (process.platform === "darwin") {
     window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
     window.setWindowButtonVisibility(false);
+  }
+}
+
+function beginCompactAuthActivation(
+  window: BrowserWindow,
+  options: CompactAuthWindowOptions,
+  shouldTransition: boolean,
+): void {
+  const activationId = compactAuthActivationId + 1;
+  compactAuthActivationId = activationId;
+  void leaveCompactAuthFullScreen(window, process.platform)
+    .then(() => leaveCompactAuthMaximized(window, process.platform))
+    .then(() => {
+      finishCompactAuthActivation(window, options, shouldTransition, activationId);
+    });
+}
+
+function finishCompactAuthActivation(
+  window: BrowserWindow,
+  options: CompactAuthWindowOptions,
+  shouldTransition: boolean,
+  activationId: number,
+): void {
+  if (
+    activationId !== compactAuthActivationId
+    || window.isDestroyed()
+    || compactAuthSession?.window !== window
+  ) {
+    return;
+  }
+  ensureScreenListeners();
+  applyCompactAuthWindowState(window, options);
+  window.showInactive();
+  window.moveTop();
+  if (shouldTransition) {
+    beginCompactAuthTransition(window, options);
+  } else {
+    loadCompactAuthWindow(window, options);
+    positionCompactAuthWindow(window);
   }
 }
 
@@ -291,6 +325,12 @@ async function runCompactAuthTransition(
   options: CompactAuthWindowOptions,
   transitionId: number,
 ): Promise<void> {
+  // Clamp the reused application window to the compact geometry before
+  // replacing its renderer. Painting the blackout document at the old
+  // onboarding bounds exposes a nearly full-screen auth surface while the
+  // resize animation is waiting to begin.
+  const to = compactAuthBounds();
+  window.setBounds(to, false);
   window.setBackgroundColor("#000000");
   paintCurrentContentsBlack(window);
   compactAuthLastHtml = null;
@@ -301,7 +341,6 @@ async function runCompactAuthTransition(
   if (!compactAuthTransitionActive(window, transitionId)) return;
 
   const from = window.getBounds();
-  const to = compactAuthBounds();
   if (systemPreferences.getAnimationSettings().prefersReducedMotion) {
     window.setBounds(to, false);
   } else {

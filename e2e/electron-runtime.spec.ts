@@ -142,7 +142,7 @@ test("drives a real sealed capture through the built inspector, production prelo
   await page.getByRole("button", { name: "Dev", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Experimental builds" })).toBeVisible();
   await expect(page.getByText(/1 experimental build available/)).toBeVisible();
-  await expect(page.getByRole("combobox", { name: "Build version" })).toHaveValue("id:rel_bridge_e2e");
+  await expect(page.getByRole("button", { name: "Build version" })).toContainText("0.1.0-experimental.pr310.e2e");
   await page.getByRole("button", { name: "Install selected build" }).click();
   await expect.poll(async () => page.evaluate(async () => (await window.ambientBridge?.getUpdateStatus())?.channel))
     .toBe("experimental");

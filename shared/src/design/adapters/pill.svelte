@@ -1,7 +1,7 @@
 <script lang="ts">
 	import type { Snippet } from 'svelte';
 	import type { HTMLAttributes } from 'svelte/elements';
-	import Icon from '../Icon.svelte';
+	import Icon from '../icon.svelte';
 
 	type Tone = 'soft' | 'solid' | 'outline';
 	type Size = 'sm' | 'md';

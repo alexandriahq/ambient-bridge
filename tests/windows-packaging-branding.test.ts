@@ -19,7 +19,13 @@ describe("Windows package branding", () => {
     expect(base).toMatch(/installerIcon:\s*resources\/bridge-icon\.ico/);
     expect(base).toMatch(/uninstallerIcon:\s*resources\/bridge-icon\.ico/);
     expect(local).toMatch(/extends:\s*electron-builder\.yml/);
+    expect(local).toMatch(/appId:\s*com\.alexandria\.ambient\.bridge\.local/);
+    expect(local).toMatch(/productName:\s*Ambient Bridge Local/);
+    expect(local).toMatch(/extraMetadata:[\s\S]*?name:\s*ambient-bridge-local/);
     expect(local).toMatch(/win:[\s\S]*?signAndEditExecutable:\s*false/);
+    expect(local).toMatch(/artifactName:\s*\$\{productName\} Setup \$\{version\}\.\$\{ext\}/);
+    expect(local).not.toContain("AMBIENT_LOCAL_INSTALLER_VERSION");
+    expect(manifest.version).toMatch(/^1\.0\.0-local(?:\.source\.[0-9a-f]{12})?$/);
     expect(manifest.devDependencies.rcedit).toBe("5.0.2");
     expect(afterPack).toContain('electronPlatformName === "win32"');
     expect(afterPack).toContain('{ rcedit } = require("rcedit")');

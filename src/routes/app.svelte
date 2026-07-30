@@ -11,9 +11,9 @@
     BRIDGE_GUARD_ACTION_SIGN_IN,
     composeBridgeSessionGuard,
   } from "../lib/session-guard";
-  import BridgeSettings from "../lib/components/BridgeSettings.svelte";
-  import NetworkLogsView from "../lib/components/NetworkLogsView.svelte";
-  import TopBar from "../lib/components/TopBar.svelte";
+  import BridgeSettings from "../lib/components/bridge-settings.svelte";
+  import NetworkLogsView from "../lib/components/network-logs-view.svelte";
+  import TopBar from "../lib/components/top-bar.svelte";
   import { startBridgeUpdateNotifications } from "../lib/update-notifications";
 
   const fallbackStatus: BridgeStatus = {
