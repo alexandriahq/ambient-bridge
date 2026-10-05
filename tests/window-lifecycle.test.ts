@@ -4,13 +4,14 @@ import {
   BRIDGE_SHOW_LAUNCH_ARG,
   BridgeWindowLifecycleController,
   bridgeBackgroundLoginItemArgs,
-  bridgeLoginItemSettings,
   bridgeLoginItemSettingsOptions,
   isCloseWindowAccelerator,
+  isExplicitBackgroundLaunch,
   isQuitAccelerator,
   macBridgeActivationPolicy,
   resolveBridgeLaunchDecision,
-  shouldHideMacDock,
+  shouldDisableHardwareAcceleration,
+  shouldShowMacDock,
   shouldOpenMainWindowOnLaunch,
   windowsSkipTaskbarForWindowState,
   type BridgeKeyboardEvent,
@@ -30,6 +31,18 @@ describe("Bridge background launch policy", () => {
     expect(shouldOpenMainWindowOnLaunch(decision)).toBe(false);
   });
 
+  it("stays silent even when a show arg or show env is also present", () => {
+    const decision = resolveBridgeLaunchDecision({
+      argv: ["Ambient Bridge", BRIDGE_SHOW_LAUNCH_ARG],
+      env: { AMBIENT_SILENT: "1", AMBIENT_BRIDGE_SHOW: "1" },
+    });
+
+    expect(decision).toEqual({ mode: "background", reason: "silent" });
+    expect(shouldOpenMainWindowOnLaunch(decision)).toBe(false);
+    expect(isExplicitBackgroundLaunch(decision)).toBe(true);
+    expect(resolveBridgeLaunchDecision({ argv: ["Ambient Bridge", "--ambient-silent"] }).reason).toBe("silent");
+  });
+
   it("starts headless for explicit background flags", () => {
     const decision = resolveBridgeLaunchDecision({ argv: ["Ambient Bridge", BRIDGE_BACKGROUND_LAUNCH_ARG] });
 
@@ -37,22 +50,38 @@ describe("Bridge background launch policy", () => {
     expect(shouldOpenMainWindowOnLaunch(decision)).toBe(false);
   });
 
-  it("shows UI for explicit launches, including second-instance style argv", () => {
+  it("starts hidden by default; show only for explicit --show args", () => {
     const firstLaunch = resolveBridgeLaunchDecision({ argv: ["Ambient Bridge"] });
     const secondLaunch = resolveBridgeLaunchDecision({ argv: ["Ambient Bridge", "--launched-from-start-menu"] });
 
-    expect(firstLaunch).toEqual({ mode: "show", reason: "explicit_launch" });
-    expect(shouldOpenMainWindowOnLaunch(secondLaunch)).toBe(true);
+    expect(firstLaunch).toEqual({ mode: "background", reason: "default_hidden" });
+    expect(shouldOpenMainWindowOnLaunch(firstLaunch)).toBe(false);
+    expect(shouldDisableHardwareAcceleration()).toBe(true);
+    expect(shouldOpenMainWindowOnLaunch(secondLaunch)).toBe(false);
+    expect(isExplicitBackgroundLaunch(firstLaunch)).toBe(false);
+    expect(isExplicitBackgroundLaunch(resolveBridgeLaunchDecision({
+      argv: ["Ambient Bridge", BRIDGE_BACKGROUND_LAUNCH_ARG],
+    }))).toBe(true);
     expect(resolveBridgeLaunchDecision({
       argv: ["Ambient Bridge", BRIDGE_SHOW_LAUNCH_ARG, BRIDGE_BACKGROUND_LAUNCH_ARG],
       loginItemSettings: { wasOpenedAtLogin: true },
     })).toEqual({ mode: "show", reason: "explicit_arg" });
+    expect(shouldDisableHardwareAcceleration()).toBe(true);
   });
 
-  it("uses accessory/no-Dock presentation on macOS", () => {
-    expect(macBridgeActivationPolicy()).toBe("accessory");
-    expect(shouldHideMacDock("darwin")).toBe(true);
-    expect(shouldHideMacDock("win32")).toBe(false);
+  it("shows when AMBIENT_BRIDGE_SHOW is set", () => {
+    expect(resolveBridgeLaunchDecision({
+      argv: ["Ambient Bridge"],
+      env: { AMBIENT_BRIDGE_SHOW: "1" },
+    })).toEqual({ mode: "show", reason: "explicit_arg" });
+  });
+
+  it("uses regular macOS presentation only while the window is visible", () => {
+    expect(macBridgeActivationPolicy("background")).toBe("accessory");
+    expect(macBridgeActivationPolicy("visible")).toBe("regular");
+    expect(shouldShowMacDock("darwin", "background")).toBe(false);
+    expect(shouldShowMacDock("darwin", "visible")).toBe(true);
+    expect(shouldShowMacDock("win32", "visible")).toBe(false);
   });
 
   it("configures login items to relaunch Bridge in the background", () => {
@@ -60,16 +89,6 @@ describe("Bridge background launch policy", () => {
       "--foo",
       BRIDGE_BACKGROUND_LAUNCH_ARG,
     ]);
-    expect(bridgeLoginItemSettings({ openAtLogin: true, platform: "darwin" })).toEqual({
-      openAsHidden: true,
-      openAtLogin: true,
-    });
-    expect(bridgeLoginItemSettings({ execPath: "C:/Ambient Bridge.exe", openAtLogin: true, platform: "win32" }))
-      .toEqual({
-        args: [BRIDGE_BACKGROUND_LAUNCH_ARG],
-        openAtLogin: true,
-        path: "C:/Ambient Bridge.exe",
-      });
     expect(bridgeLoginItemSettingsOptions({ execPath: "C:/Ambient Bridge.exe", platform: "win32" }))
       .toEqual({ args: [BRIDGE_BACKGROUND_LAUNCH_ARG], path: "C:/Ambient Bridge.exe" });
     expect(bridgeLoginItemSettingsOptions({ platform: "darwin" })).toBeUndefined();
@@ -84,7 +103,7 @@ describe("Bridge background launch policy", () => {
 });
 
 describe("Bridge window lifecycle controller", () => {
-  it("creates the main window lazily and hides instead of quitting on close", async () => {
+  it("creates the main window lazily and destroys it instead of quitting on close", async () => {
     const window = new FakeWindow();
     const controller = new BridgeWindowLifecycleController({
       createWindow: vi.fn().mockResolvedValue(window),
@@ -100,40 +119,47 @@ describe("Bridge window lifecycle controller", () => {
     window.emitClose(event);
 
     expect(event.preventDefault).toHaveBeenCalledOnce();
-    expect(window.hideCalls).toBe(1);
-    expect(controller.state.mainWindow).toBe("hidden");
+    expect(window.destroyCalls).toBe(1);
+    expect(window.hideCalls).toBe(0);
+    expect(controller.state.mainWindow).toBe("not_created");
     expect(controller.isQuitting).toBe(false);
   });
 
-  it("routes Ctrl/Cmd+W to hide and Ctrl/Cmd+Q to explicit quit", async () => {
-    const window = new FakeWindow();
+  it("routes Ctrl/Cmd+W to destroy UI and Ctrl/Cmd+Q to explicit quit", async () => {
+    const first = new FakeWindow();
+    const second = new FakeWindow();
     const quitApp = vi.fn();
     const destroyTray = vi.fn();
     const controller = new BridgeWindowLifecycleController({
-      createWindow: vi.fn().mockResolvedValue(window),
+      createWindow: vi.fn()
+        .mockResolvedValueOnce(first)
+        .mockResolvedValueOnce(second),
       destroyTray,
       platform: "win32",
       quitApp,
     });
 
     await controller.showMainWindow();
-    expect(window.skipTaskbarValues).toEqual([true, false]);
+    expect(first.skipTaskbarValues).toEqual([true, false]);
 
     const closeEvent = preventableKeyboardEvent();
-    window.emitBeforeInput(closeEvent, { control: true, key: "w", type: "keyDown" });
+    first.emitBeforeInput(closeEvent, { control: true, key: "w", type: "keyDown" });
     expect(closeEvent.preventDefault).toHaveBeenCalledOnce();
-    expect(window.hideCalls).toBe(1);
-    expect(window.skipTaskbarValues).toEqual([true, false, true]);
+    expect(first.destroyCalls).toBe(1);
+    expect(first.hideCalls).toBe(0);
+    expect(controller.state.mainWindow).toBe("not_created");
 
     const quitEvent = preventableKeyboardEvent();
-    window.emitBeforeInput(quitEvent, { control: true, key: "q", type: "keyDown" });
+    // Window was destroyed; recreate to exercise quit while UI is attached.
+    await controller.showMainWindow();
+    second.emitBeforeInput(quitEvent, { control: true, key: "q", type: "keyDown" });
     expect(quitEvent.preventDefault).toHaveBeenCalledOnce();
     expect(controller.isQuitting).toBe(true);
     expect(destroyTray).toHaveBeenCalledOnce();
     expect(quitApp).toHaveBeenCalledOnce();
   });
 
-  it("resigns app activation when hiding so the menu bar returns to the previous app", async () => {
+  it("resigns app activation when detaching UI so the menu bar returns to the previous app", async () => {
     const window = new FakeWindow();
     const deactivateApp = vi.fn();
     const controller = new BridgeWindowLifecycleController({
@@ -146,8 +172,10 @@ describe("Bridge window lifecycle controller", () => {
     expect(deactivateApp).not.toHaveBeenCalled();
 
     controller.hideMainWindow();
-    expect(window.hideCalls).toBe(1);
+    expect(window.destroyCalls).toBe(1);
+    expect(window.hideCalls).toBe(0);
     expect(deactivateApp).toHaveBeenCalledOnce();
+    expect(controller.state.mainWindow).toBe("not_created");
   });
 
   it("allows close to proceed during explicit quit", async () => {
@@ -167,25 +195,6 @@ describe("Bridge window lifecycle controller", () => {
     expect(controller.state.quitting).toBe(true);
   });
 
-  it("tracks auth-window visibility separately from the main window", async () => {
-    const window = new FakeWindow();
-    const states: string[] = [];
-    const controller = new BridgeWindowLifecycleController({
-      createWindow: vi.fn().mockResolvedValue(window),
-      onStateChange: (state) => states.push(`${state.mainWindow}:${state.authWindow}:${state.quitting}`),
-      platform: "darwin",
-    });
-
-    await controller.showMainWindow();
-    controller.markAuthWindowVisible();
-    controller.hideMainWindow();
-    controller.markAuthWindowHidden();
-
-    expect(controller.state).toMatchObject({ authWindow: "hidden", mainWindow: "hidden", quitting: false });
-    expect(states).toContain("visible:visible:false");
-    expect(states.at(-1)).toBe("hidden:hidden:false");
-  });
-
   it("recreates the main window after it is destroyed", async () => {
     const first = new FakeWindow();
     const second = new FakeWindow();
@@ -200,6 +209,27 @@ describe("Bridge window lifecycle controller", () => {
 
     await expect(controller.showMainWindow()).resolves.toBe(second);
     expect(createWindow).toHaveBeenCalledTimes(2);
+    expect(controller.state.mainWindow).toBe("visible");
+  });
+
+  it("coalesces concurrent showMainWindow calls onto one createWindow", async () => {
+    let resolveCreate: ((window: FakeWindow) => void) | undefined;
+    const createWindow = vi.fn().mockImplementation(() => new Promise<FakeWindow>((resolve) => {
+      resolveCreate = resolve;
+    }));
+    const controller = new BridgeWindowLifecycleController({ createWindow, platform: "win32" });
+
+    const firstShow = controller.showMainWindow();
+    const secondShow = controller.showMainWindow();
+    expect(createWindow).toHaveBeenCalledTimes(1);
+
+    const window = new FakeWindow();
+    resolveCreate?.(window);
+
+    await expect(firstShow).resolves.toBe(window);
+    await expect(secondShow).resolves.toBe(window);
+    expect(createWindow).toHaveBeenCalledTimes(1);
+    expect(window.showCalls).toBe(2);
     expect(controller.state.mainWindow).toBe("visible");
   });
 
@@ -220,6 +250,7 @@ class FakeWindow implements BridgeWindowLike {
     },
   };
 
+  destroyCalls = 0;
   hideCalls = 0;
   showCalls = 0;
   private beforeInputListeners: Array<(event: BridgeKeyboardEvent, input: BridgeKeyboardInput) => void> = [];
@@ -230,6 +261,11 @@ class FakeWindow implements BridgeWindowLike {
   private visible = false;
 
   focus(): void {}
+
+  destroy(): void {
+    this.destroyCalls += 1;
+    this.emitClosed();
+  }
 
   hide(): void {
     this.hideCalls += 1;

@@ -1,4 +1,5 @@
-import { execFileSync, spawn } from "node:child_process";
+import { createDevProcessGroup, terminateDevProcess } from "./dev-processes.mjs";
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, unwatchFile, watchFile } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
@@ -20,8 +21,9 @@ const portConfig = resolveDevRendererPort({
   envName: "AMBIENT_BRIDGE_DEV_PORT",
 });
 const initialUrl = portConfig.url;
-const children = new Set();
-const packageManager = process.platform === "win32" ? (process.env.ComSpec ?? "cmd.exe") : "pnpm";
+// Source-backed Bridge runs must use the `.dev` AppUserModelID, never the
+// bare production identity shared with installed Ambient Bridge (#520).
+process.env.AMBIENT_DESKTOP_VARIANT = "dev";
 const devLock = acquireDevProductLock({
   lockName: "ambient-bridge",
   productName: "Ambient Bridge",
@@ -35,8 +37,7 @@ let shuttingDown = false;
 let rendererUrl = initialUrl;
 let rendererUrlResolved = portConfig.strict;
 let rendererOutputBuffer = "";
-let tscOutputBuffer = "";
-let tscRebuildPending = false;
+let mainRebuildPending = false;
 let resolveRendererUrl;
 const rendererUrlReady = portConfig.strict
   ? Promise.resolve(initialUrl)
@@ -44,17 +45,29 @@ const rendererUrlReady = portConfig.strict
     resolveRendererUrl = resolve;
   });
 
+const processes = createDevProcessGroup({
+  cwd: bridgeRoot,
+  env: process.env,
+  onFailure: (label, error) => {
+    console.error(`[${label}] failed to start: ${error.message}`);
+    shutdown(1);
+  },
+  onExit: (code, signal, exitEndsSession) => {
+    if (exitEndsSession || (!shuttingDown && code !== 0)) shutdown(code ?? (signal ? 1 : 0));
+  },
+});
+const start = processes.start;
+
 process.on("SIGINT", () => shutdown(0));
 process.on("SIGTERM", () => shutdown(0));
 process.on("exit", () => devLock.release());
 
 await assertDevRendererPortReady(portConfig, "Bridge renderer");
 
-// electron/generated/build-config.ts is gitignored and required for tsc; make
-// sure it exists before the watch build starts. There is no runtime server-URL
-// override, so dev uses the same production API default as packaged releases.
-// Set AMBIENT_BRIDGE_BUILD_SERVER_URL to deliberately bake a staging or local
-// target (the `stack` flow sets it to the local server).
+// electron/generated/build-config.ts is gitignored and imported by the Vite
+// main bundle. There is no runtime server-URL override. Dev bakes staging
+// unless AMBIENT_SERVER_TARGET or AMBIENT_BRIDGE_BUILD_SERVER_URL is set
+// (the `stack` flow sets the latter to the local server).
 refreshBuildConfig({ alwaysLog: true });
 watchFile(buildConfigGeneratorPath, { interval: 500 }, (current, previous) => {
   if (shuttingDown || current.mtimeMs === previous.mtimeMs) return;
@@ -72,16 +85,28 @@ const vite = start("vite", [
   readyPattern: /ready in|Local:\s+http:\/\/127\.0\.0\.1:/,
 });
 
-const tsc = start("tsc", [
+const main = start("main", [
   "exec",
-  "tsc",
-  "-p",
-  "tsconfig.electron.json",
+  "vite",
+  "build",
+  "--config",
+  "vite.main.config.ts",
   "--watch",
-  "--preserveWatchOutput",
 ], {
-  onOutput: inspectTscOutput,
-  readyPattern: /Found 0 errors|Watching for file changes/,
+  onOutput: inspectMainOutput,
+  // Do not treat Vite's initial "watching" banner as a completed build.
+  readyPattern: /built in/i,
+});
+
+const preload = start("preload", [
+  "exec",
+  "vite",
+  "build",
+  "--config",
+  "vite.preload.config.ts",
+  "--watch",
+], {
+  readyPattern: /built in/i,
 });
 
 void waitForDevReady().catch((error) => {
@@ -92,8 +117,9 @@ void waitForDevReady().catch((error) => {
 
 async function waitForDevReady() {
   const activeRendererUrl = await rendererUrlReady;
-  await Promise.all([vite.ready, tsc.ready]);
+  await Promise.all([vite.ready, main.ready, preload.ready]);
   await waitForFile("dist/electron/main.js");
+  await waitForFile("dist/electron/preload.cjs");
   await waitForHttp(activeRendererUrl);
   startElectron(activeRendererUrl);
 }
@@ -133,49 +159,6 @@ function startElectron(activeRendererUrl) {
   electronChild = launched.child;
 }
 
-function start(label, args, options = {}) {
-  const packageManagerArgs = process.platform === "win32"
-    ? ["/d", "/s", "/c", "pnpm", ...args]
-    : args;
-  const child = spawn(packageManager, packageManagerArgs, {
-    cwd: bridgeRoot,
-    env: options.env ?? process.env,
-    stdio: ["inherit", "pipe", "pipe"],
-  });
-  children.add(child);
-
-  let readyResolve;
-  const ready = new Promise((resolve) => {
-    readyResolve = resolve;
-  });
-  const markReady = once(() => readyResolve());
-
-  child.stdout.on("data", (data) => {
-    const text = data.toString();
-    prefix(label, text, false);
-    options.onOutput?.(text);
-    if (options.readyPattern?.test(text)) markReady();
-  });
-
-  child.stderr.on("data", (data) => {
-    const text = data.toString();
-    prefix(label, text, true);
-    options.onOutput?.(text);
-    if (options.readyPattern?.test(text)) markReady();
-  });
-
-  child.on("exit", (code, signal) => {
-    children.delete(child);
-    console.log(`[${label}] exited code=${code ?? "null"} signal=${signal ?? "null"}`);
-    const exitHandled = options.onExit?.(code, signal) === true;
-    if (!exitHandled && (options.exitEndsSession || (!shuttingDown && code !== 0))) {
-      shutdown(code ?? (signal ? 1 : 0));
-    }
-  });
-
-  return { child, ready };
-}
-
 function inspectRendererOutput(text) {
   if (rendererUrlResolved) return;
   rendererOutputBuffer = `${rendererOutputBuffer}${text}`.slice(-4_000);
@@ -189,24 +172,16 @@ function inspectRendererOutput(text) {
   resolveRendererUrl(rendererUrl);
 }
 
-function inspectTscOutput(text) {
-  tscOutputBuffer = `${tscOutputBuffer}${text}`;
-  const lines = tscOutputBuffer.split(/\r?\n/);
-  tscOutputBuffer = lines.pop() ?? "";
-
-  for (const line of lines) {
-    if (line.includes("File change detected")) {
-      tscRebuildPending = true;
-      continue;
+function inspectMainOutput(text) {
+  // Vite watch rebuilds print "built in …" after each successful emit. Restart
+  // Electron so preload/IPC/baked config changes are never left stale.
+  if (/built in/i.test(text)) {
+    if (!mainRebuildPending) {
+      mainRebuildPending = true;
+      return;
     }
-    if (tscRebuildPending && line.includes("Found 0 errors")) {
-      tscRebuildPending = false;
-      // A branch switch can change both Electron source and the script that
-      // generates the baked server target. Compile that generated update before
-      // replacing main so the restarted process cannot keep an old realm.
-      if (refreshBuildConfigAfterStartup()) continue;
-      scheduleElectronRestart();
-    }
+    if (refreshBuildConfigAfterStartup()) return;
+    scheduleElectronRestart();
   }
 }
 
@@ -245,24 +220,11 @@ function scheduleElectronRestart() {
     if (!electronChild || shuttingDown) return;
     console.log("[electron] main-process build changed; restarting Electron");
     restartAfterElectronExit = true;
-    if (!terminateChild(electronChild)) {
+    if (!terminateDevProcess(electronChild)) {
       restartAfterElectronExit = false;
       console.error("[electron] could not stop the stale main process after rebuild");
     }
   }, 150);
-}
-
-function terminateChild(child) {
-  if (process.platform !== "win32") return child.kill("SIGTERM");
-  if (!child.pid) return false;
-  try {
-    // The Windows launcher is cmd.exe -> pnpm -> Electron. Terminating only the
-    // wrapper orphans Electron and leaves the Bridge single-instance lock held.
-    execFileSync("taskkill", ["/pid", String(child.pid), "/t", "/f"], { stdio: "ignore" });
-    return true;
-  } catch {
-    return child.exitCode !== null || child.signalCode !== null;
-  }
 }
 
 async function waitForFile(path) {
@@ -286,31 +248,13 @@ async function waitForHttp(target) {
   throw new Error(`Timed out waiting for ${target}`);
 }
 
-function prefix(label, text, isError) {
-  const stream = isError ? process.stderr : process.stdout;
-  for (const line of text.split(/\r?\n/)) {
-    if (line) stream.write(`[${label}] ${line}\n`);
-  }
-}
-
-function once(fn) {
-  let called = false;
-  return () => {
-    if (called) return;
-    called = true;
-    fn();
-  };
-}
-
 function shutdown(code) {
   if (shuttingDown) return;
   shuttingDown = true;
   clearTimeout(electronRestartTimer);
   restartAfterElectronExit = false;
   unwatchFile(buildConfigGeneratorPath);
-  for (const child of children) {
-    terminateChild(child);
-  }
+  processes.stop();
   setTimeout(() => {
     devLock.release();
     process.exit(code);

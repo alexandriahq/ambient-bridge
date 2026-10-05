@@ -42,6 +42,12 @@ export class PairingStore {
   static fromSnapshot(snapshot: unknown): PairingStore {
     const store = new PairingStore();
     const body = snapshot && typeof snapshot === "object" ? snapshot as Record<string, unknown> : {};
+    const schemaVersion = body.schemaVersion;
+    if (typeof schemaVersion === "number" && Number.isInteger(schemaVersion) && schemaVersion > 1) {
+      throw new Error(
+        `Pairing snapshot schemaVersion ${schemaVersion} is newer than this Bridge (speaks 1).`,
+      );
+    }
     const requests = Array.isArray(body.requests) ? body.requests : [];
     const clients = Array.isArray(body.clients) ? body.clients : [];
 

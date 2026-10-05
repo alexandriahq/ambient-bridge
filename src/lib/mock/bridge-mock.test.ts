@@ -12,7 +12,8 @@ describe("bridge browser mock", () => {
     try {
       const mock = buildBridgeMock();
 
-      await expect(mock.getStatus()).resolves.toMatchObject({
+      const status = await mock.getStatus();
+      expect(status).toMatchObject({
         appVersion: "1.42.0-mock-win",
         pairedClientList: expect.arrayContaining([
           expect.objectContaining({
@@ -21,9 +22,13 @@ describe("bridge browser mock", () => {
           }),
         ]),
       });
-      await expect(mock.listExperimentalBuilds()).resolves.toMatchObject({
-        platform: "win32",
-        arch: "x64",
+      expect(status).not.toHaveProperty("activity");
+      expect(status.inference).not.toHaveProperty("requests");
+      await expect(mock.getRequestLog()).resolves.toMatchObject({
+        revision: 1,
+        requests: expect.arrayContaining([
+          expect.objectContaining({ requestId: "req-1" }),
+        ]),
       });
     } finally {
       Object.defineProperty(globalThis, "navigator", {

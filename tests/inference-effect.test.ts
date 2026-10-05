@@ -311,6 +311,51 @@ describe("Bridge secure inference Effect service", () => {
     });
   });
 
+  it("classifies returned plaintext billing failures before recovering the circuit", async () => {
+    let attempts = 0;
+    const secureClient = createBridgeSecureClient({
+      makeSecureClient: (() => ({
+        fetch: async () => {
+          attempts += 1;
+          return new Response("private billing details", { status: 503, headers: {
+            "x-ambient-error-code": "UPSTREAM_BILLING_UNAVAILABLE",
+            "x-ambient-error-source": "openrouter_provider", "retry-after": "60",
+          } });
+        },
+        ready: async () => {},
+      })) satisfies SecureClientFactory,
+      serverBaseUrl: "https://api.example.test",
+    });
+    const usage = usageService();
+    const availability = new InferenceAvailabilityCircuit();
+
+    const result = await Effect.runPromise(Effect.either(
+      secureInferenceResponse({
+        appVersion: "0.1.0",
+        availability,
+        feature: "inference.chatCompletions",
+        path: "/v1/chat/completions",
+        payload: { messages: [], model: "model_test" },
+        requestId: "req_provider_outage",
+        signal: new AbortController().signal,
+        usage,
+      }).pipe(
+        Effect.provideService(BridgeSessionService, createBridgeSessionService({ read: async () => signedInSession() })),
+        Effect.provideService(BridgeSecureClient, secureClient),
+        Effect.provideService(BridgeAuditService, createBridgeAuditService(new MemoryAuditSink())),
+      ),
+    ));
+
+    expect(result._tag).toBe("Left");
+    if (result._tag === "Left") expect(result.left).toBeInstanceOf(BridgeInferenceServiceError);
+    expect(attempts).toBe(1);
+    expect(usage.release).toHaveBeenCalledWith(expect.anything(), "crr_test_abcdefghijklmnop");
+    expect(availability.snapshot("organization:org_test")).toMatchObject({
+      state: "service_degraded",
+      code: "UPSTREAM_BILLING_UNAVAILABLE",
+    });
+  });
+
   it("validates and uses refreshed sessions before secure requests", async () => {
     const calls: { init?: RequestInit } = {};
     const events: string[] = [];
@@ -407,6 +452,67 @@ describe("Bridge secure inference Effect service", () => {
       expect(result.left.message).toBe("Could not validate Bridge WorkOS session: invalid session");
     }
     expect(ready).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { name: "daily report", path: "/v1/responses" as const, feature: "inference.dailyReport", stream: false, delay: 170_000, succeeds: true },
+    { name: "Responses with stream omitted", path: "/v1/responses" as const, feature: "inference.responses", delay: 170_000, succeeds: true },
+    { name: "stalled non-streaming Responses", path: "/v1/responses" as const, feature: "inference.responses", stream: false, delay: 181_000, succeeds: false },
+    { name: "streaming Responses", path: "/v1/responses" as const, feature: "inference.responses", stream: true, delay: 121_000, succeeds: false },
+    { name: "chat completions", path: "/v1/chat/completions" as const, feature: "inference.chatCompletions", stream: false, delay: 121_000, succeeds: false },
+    { name: "explicit timeout override", path: "/v1/responses" as const, feature: "inference.responses", stream: false, delay: 110_000, responseTimeoutMs: 100_000, succeeds: false },
+  ])("uses the correct delayed-header budget for $name", async (scenario) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      let started!: () => void;
+      const fetching = new Promise<void>((resolve) => { started = resolve; });
+      let fetchSignal: AbortSignal | undefined;
+      const secureClient = createBridgeSecureClient({
+        makeSecureClient: (() => ({
+          fetch: (_input, init) => new Promise<Response>((resolve, reject) => {
+            fetchSignal = init?.signal;
+            const timer = setTimeout(() => resolve(new Response("completed")), scenario.delay);
+            fetchSignal?.addEventListener("abort", () => {
+              clearTimeout(timer);
+              reject(fetchSignal?.reason);
+            }, { once: true });
+            started();
+          }),
+          ready: async () => {},
+        })) satisfies SecureClientFactory,
+        serverBaseUrl: "https://api.example.test",
+      });
+      const resultPromise = Effect.runPromise(Effect.either(secureInferenceResponse({
+        appVersion: "0.1.0",
+        feature: scenario.feature,
+        path: scenario.path,
+        payload: { input: "synthetic", ...(scenario.stream === undefined ? {} : { stream: scenario.stream }) },
+        requestId: "req_header_budget",
+        responseTimeoutMs: scenario.responseTimeoutMs,
+        signal: new AbortController().signal,
+      }).pipe(
+        Effect.provideService(BridgeSessionService, createBridgeSessionService({ read: async () => ({
+          email: "user@example.test", expiresAt: 1_700_000_000, kind: "signed_in",
+          sessionToken: "sealed_session_test", user: { email: "user@example.test", id: "user_1", name: null },
+        }) })),
+        Effect.provideService(BridgeSecureClient, secureClient),
+        Effect.provideService(BridgeAuditService, createBridgeAuditService(new MemoryAuditSink())),
+      )));
+      await fetching;
+      await vi.advanceTimersByTimeAsync(scenario.delay);
+      const result = await resultPromise;
+      expect(result._tag).toBe(scenario.succeeds ? "Right" : "Left");
+      if (result._tag === "Right") {
+        expect(await result.right.text()).toBe("completed");
+        await vi.advanceTimersByTimeAsync(180_000);
+        expect(fetchSignal?.aborted).toBe(false);
+      } else {
+        expect(result.left.message).toContain("timed out");
+        expect(fetchSignal?.aborted).toBe(true);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("aborts the fetch when the enclave never returns response headers in time", async () => {

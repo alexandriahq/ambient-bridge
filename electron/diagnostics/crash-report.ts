@@ -6,15 +6,15 @@ import {
   type CrashLogWindowSummary,
   type MarkerStore,
 } from "@ambient/shared/observability";
-import type { BridgeCrashOrigin } from "./crash-telemetry.js";
 
 // Bridge binding of the shared crash-report architecture: markers + 30s JSONL
 // windows under <userData>/crashes, written synchronously at crash time and
-// offered for submission (with consent) on the next launch — the same flow as
-// the Ambient app.
+// retained locally for diagnostics.
 
 const CRASH_MARKER_VERSION = 1 as const;
 const MAX_PENDING_CRASH_REPORTS = 20;
+
+export type BridgeCrashOrigin = "uncaughtException" | "unhandledRejection";
 
 export interface BridgeCrashReportMarker {
   readonly version: typeof CRASH_MARKER_VERSION;
@@ -41,9 +41,6 @@ export interface WriteBridgeCrashSnapshotInput {
 export interface BridgeCrashReportStore {
   /** Persist synchronously; safe inside an uncaughtException handler. */
   readonly writeSnapshotSync: (input: WriteBridgeCrashSnapshotInput) => BridgeCrashReportMarker | null;
-  /** Pending markers, newest first; prunes beyond the retention cap. */
-  readonly listPending: () => readonly BridgeCrashReportMarker[];
-  readonly delete: (id: string) => void;
 }
 
 export function createBridgeCrashReportStore(options: {
@@ -63,7 +60,7 @@ export function createBridgeCrashReportStore(options: {
   return {
     writeSnapshotSync: (input) => {
       const nowMs = input.nowMs ?? Date.now();
-      return store.write({
+      const marker = store.write({
         nowMs,
         window: () => options.window(nowMs),
         buildMarker: (base) => ({
@@ -76,8 +73,8 @@ export function createBridgeCrashReportStore(options: {
           context: {},
         }),
       });
+      if (marker) store.listPending();
+      return marker;
     },
-    listPending: () => store.listPending(),
-    delete: (id) => store.delete(id),
   };
 }

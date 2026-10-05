@@ -1,6 +1,7 @@
 import { appendFile, mkdir, rename, rm, stat } from "node:fs/promises";
 import { dirname } from "node:path";
-import type { CrashRing } from "@ambient/shared/observability";
+import { threadId } from "node:worker_threads";
+import type { CrashRing, StructuredLogLevel, StructuredLogRecord } from "@ambient/shared/observability";
 import {
   bridgeComponentForAuditEvent,
   bridgeServiceForComponent,
@@ -59,15 +60,11 @@ export class FileAuditSink implements AuditSink {
   ) {}
 
   record(name: string, fields: AuditEvent["fields"] = {}): void {
-    const event: AuditEvent = {
-      at: Date.now(),
-      fields: sanitizeFields(fields),
-      name,
-    };
+    const record = structuredAuditRecord(name, fields, Date.now());
     this.pending = this.pending
       .then(async () => {
         await mkdir(dirname(this.path), { recursive: true });
-        const line = `${JSON.stringify(event)}\n`;
+        const line = `${JSON.stringify(record)}\n`;
         await this.rotateIfNeeded(Buffer.byteLength(line, "utf8"));
         await appendFile(this.path, line, { mode: 0o600 });
       })
@@ -115,20 +112,14 @@ export class RingAuditSink implements AuditSink {
   record(name: string, fields: AuditEvent["fields"] = {}): void {
     try {
       const atMs = this.nowMs();
-      const sanitized = sanitizeFields(fields);
-      const level = sanitized.level === "error" ? "ERROR" : "INFO";
-      const component = bridgeComponentForAuditEvent(name);
-      const record = {
-        ts: new Date(atMs).toISOString(),
-        level,
-        service: bridgeServiceForComponent(component),
-        component,
-        pid: process.pid,
-        processType: "bridge-main",
-        message: name,
-        fields: sanitized,
-      };
-      this.ring.append({ atMs, level, component, message: name, line: `${JSON.stringify(record)}\n` });
+      const record = structuredAuditRecord(name, fields, atMs);
+      this.ring.append({
+        atMs,
+        level: record.level,
+        component: record.component,
+        message: record.message,
+        line: `${JSON.stringify(record)}\n`,
+      });
     } catch {
       // The crash window is strictly best-effort and must never disrupt auditing.
     }
@@ -167,4 +158,33 @@ export function sanitizeFields(fields: AuditEvent["fields"]): AuditEvent["fields
     }
   }
   return sanitized;
+}
+
+function structuredAuditRecord(
+  name: string,
+  fields: AuditEvent["fields"],
+  atMs: number,
+): StructuredLogRecord<AuditEvent["fields"]> {
+  const annotations = sanitizeFields(fields);
+  const component = bridgeComponentForAuditEvent(name);
+  return {
+    ts: new Date(atMs).toISOString(),
+    level: auditLevel(annotations.level),
+    service: bridgeServiceForComponent(component),
+    component,
+    pid: process.pid,
+    threadId,
+    processType: "bridge-main",
+    message: name,
+    annotations,
+  };
+}
+
+function auditLevel(value: unknown): StructuredLogLevel {
+  if (typeof value !== "string") return "INFO";
+  const normalized = value.toUpperCase();
+  return normalized === "DEBUG" || normalized === "INFO" || normalized === "WARN"
+    || normalized === "ERROR" || normalized === "FATAL"
+    ? normalized
+    : "INFO";
 }

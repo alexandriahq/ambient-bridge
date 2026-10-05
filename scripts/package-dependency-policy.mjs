@@ -1,66 +1,29 @@
 export const bridgePackagedDependencyPolicy = Object.freeze({
   // Electron main/preload runtime roots that must be present in app.asar.
-  // Transitive dependencies are traversed unless the package is listed in
-  // nonTraversedPackageRoots below.
+  // Pure workspace TypeScript (@ambient/shared) and bundleable JS (effect, zod)
+  // are compiled into dist/electron/main.js by Vite; only packages that stay
+  // external at bundle time belong here. Transitive dependencies are traversed
+  // unless the package is listed in nonTraversedPackageRoots below.
   runtimeDependencyRoots: Object.freeze([
-    "@ambient/shared",
-    "effect",
     "electron-updater",
     "tinfoil",
   ]),
 
-  // Renderer dependencies are bundled by Vite into bridge/dist. They are kept
-  // classified here so adding a new package dependency requires choosing a
-  // release boundary without forcing the asar smoke test to walk styling/UI peer
-  // dependency trees that are not loaded by Electron main.
-  rendererBundleRoots: Object.freeze([
+  // Electron-main source and renderer dependencies are compiled into dist by
+  // Vite. They belong in devDependencies so electron-builder does not copy
+  // their complete production graphs into app.asar a second time.
+  bundledDependencyRoots: Object.freeze([
+    "@alexandria/cloud-contract",
+    "@alexandria/inference-contract",
+    "@ambient/shared",
     "@lucide/svelte",
-    "bits-ui",
-    "clsx",
+    "effect",
     "mode-watcher",
     "svelte",
-    "svelte-sonner",
-    "tailwind-merge",
-    "tailwind-variants",
   ]),
 
-  // Dependencies used by release scripts, not by the packaged app runtime.
-  releaseToolingRoots: Object.freeze([
-    "semver",
-  ]),
-
-  // Declared dependencies that are intentionally not runtime roots today. Keep
-  // this list small; removing an entry after deleting/moving the dependency is
-  // preferred over expanding packaged runtime verification noise.
-  declaredOnlyRoots: Object.freeze([
-    "@workos-inc/node",
-    "openai",
-    "zod",
-  ]),
-
-  // @ambient/shared is imported at the compact-auth-window subpath in Electron
-  // main. That subpath has no package dependencies; traversing the workspace
-  // package root would incorrectly pull renderer/shared UI peers into the Bridge
-  // runtime dependency check.
-  nonTraversedPackageRoots: Object.freeze([
-    "@ambient/shared",
-  ]),
+  // This is deliberately generous relative to the current ~20 MiB archive. It
+  // catches a dependency-graph regression before a release returns to 200+ MiB.
+  maxAsarBytes: 64 * 1024 * 1024,
+  nonTraversedPackageRoots: Object.freeze([]),
 });
-
-export function classifyBridgePackageDependencies(dependencies) {
-  const declared = new Set(dependencies);
-  const classified = allClassifiedDependencyRoots();
-  return {
-    unclassified: [...declared].filter((dependency) => !classified.has(dependency)).sort(),
-    missingFromPackageJson: [...classified].filter((dependency) => !declared.has(dependency)).sort(),
-  };
-}
-
-export function allClassifiedDependencyRoots() {
-  return new Set([
-    ...bridgePackagedDependencyPolicy.runtimeDependencyRoots,
-    ...bridgePackagedDependencyPolicy.rendererBundleRoots,
-    ...bridgePackagedDependencyPolicy.releaseToolingRoots,
-    ...bridgePackagedDependencyPolicy.declaredOnlyRoots,
-  ]);
-}

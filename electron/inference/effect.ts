@@ -1,3 +1,6 @@
+import type { InferenceProxyPath } from "../bridge-ui-contract.js";
+export type { InferenceProxyPath } from "../bridge-ui-contract.js";
+
 import { Context, Data, Effect, Schedule } from "effect";
 import { SecureClient } from "tinfoil";
 import type { AuditSink } from "../diagnostics/audit.js";
@@ -7,16 +10,22 @@ import { errorMessage } from "../error-message.js";
 import {
   BridgeInferenceServiceError,
   BridgeInsufficientCreditError,
+  BridgeGloballyDisabledError,
   BridgeUsageRequestError,
   inferenceDomainError,
+  inferenceResponseDomainError,
 } from "./errors.js";
 import { sessionUsageOwnerKey, type InferenceAvailabilityCircuit } from "./availability.js";
 import {
   BridgeUsageAccountingDisabledError,
   type BridgeUsageService,
 } from "./usage-service.js";
-
-export type InferenceProxyPath = "/v1/chat/completions" | "/v1/responses" | "/v1/audio/transcriptions";
+import {
+  ALEXANDRIA_FEATURE_HEADER,
+  ALEXANDRIA_MODEL_HEADER,
+  ALEXANDRIA_MODE_HEADER,
+  ALEXANDRIA_REQUEST_ID_HEADER,
+} from "@alexandria/inference-contract";
 
 /**
  * Time budget for the *response* phase of a secure inference fetch — i.e. how long
@@ -26,6 +35,9 @@ export type InferenceProxyPath = "/v1/chat/completions" | "/v1/responses" | "/v1
  * server-side 429 rate limiting) hangs forever and the request stays "In Flight".
  */
 export const DEFAULT_INFERENCE_RESPONSE_TIMEOUT_MS = 120_000;
+// Non-streaming Responses now finalize their body and usage receipt before headers.
+// Allow Alexandria Node's default 170-second execution budget to finish first.
+export const NON_STREAMING_RESPONSES_TIMEOUT_MS = 180_000;
 
 export class BridgeSignedOutError extends Data.TaggedError("BridgeSignedOutError")<{
   readonly message: string;
@@ -41,6 +53,7 @@ export type BridgeInferenceError =
   | BridgeInferenceRequestError
   | BridgeInsufficientCreditError
   | BridgeInferenceServiceError
+  | BridgeGloballyDisabledError
   | BridgeUsageRequestError;
 
 export interface BridgeSessionServiceShape {
@@ -87,12 +100,34 @@ export type BridgeSecureClientOptions = {
 
 export type SecureClientFactory = (options: BridgeSecureClientOptions) => SecureClientLike;
 
+export function createCloudNodeSecureClient(input: {
+  readonly client: BridgeSecureClientShape;
+  readonly accessToken: string;
+  readonly mode: "confidential" | "plaintext";
+  readonly feature?: "bridge" | "daily_report";
+}): BridgeSecureClientShape {
+  return {
+    ready: input.client.ready,
+    fetch: (path, init) => {
+      const headers = new Headers(init.headers);
+      headers.set("Authorization", `Bearer ${input.accessToken}`);
+      headers.set(ALEXANDRIA_FEATURE_HEADER, input.feature ?? "bridge");
+      headers.set(ALEXANDRIA_MODE_HEADER, input.mode);
+      const requestId = headers.get("X-Ambient-Request-Id");
+      const model = headers.get("X-Ambient-Model-Id");
+      if (requestId) headers.set(ALEXANDRIA_REQUEST_ID_HEADER, requestId);
+      if (model) headers.set(ALEXANDRIA_MODEL_HEADER, model);
+      return input.client.fetch(path, { ...init, headers });
+    },
+  };
+}
+
 /**
- * Secure inference client. Always uses the fully attestation-verifying Tinfoil
- * `SecureClient`: every request seals its body to the attested enclave key, and the
- * ambient-server relays both the attestation bundle (from `attestationBundleURL`)
- * and the sealed request. There is no unattested path — a self-hosted enclave must
- * produce a real attestation the server passes through, so nothing changes here.
+ * Secure inference client. The default path uses the fully attestation-verifying
+ * Tinfoil `SecureClient`: every request seals its body to the attested enclave
+ * key, and the ambient-server relays both the attestation bundle (from
+ * `attestationBundleURL`) and the sealed request. A self-hosted enclave must
+ * produce a real attestation the server passes through.
  */
 // The Tinfoil SDK rejects responses that lack EHBP envelope headers. That
 // happens when an edge/proxy hop answers for the enclave (load-balancer 5xx,
@@ -152,6 +187,31 @@ export function createBridgeSecureClient(input: {
   };
 }
 
+/**
+ * Plaintext transport for a Cloud-assigned Node. Uses ordinary HTTPS without EHBP.
+ */
+export function createBridgePlaintextClient(input: {
+  readonly serverBaseUrl: string;
+  readonly fetchImpl?: typeof fetch;
+}): BridgeSecureClientShape {
+  const fetchImpl = input.fetchImpl ?? fetch;
+  const base = input.serverBaseUrl.replace(/\/+$/, "");
+  return {
+    ready: () => Effect.void,
+    fetch: (path, init) =>
+      Effect.tryPromise({
+        try: () => {
+          const headers = new Headers(init.headers);
+          return fetchImpl(`${base}${path}`, { ...init, headers });
+        },
+        catch: (cause) => inferenceDomainError(cause) ?? new BridgeInferenceRequestError({
+          message: `Node plaintext request failed: ${errorMessage(cause)}`,
+          cause,
+        }),
+      }),
+  };
+}
+
 export function createBridgeSessionService(input: {
   readonly read: () => Promise<WorkOsSession>;
   readonly validate?: (session: SignedInWorkOsSession) => Promise<WorkOsSession>;
@@ -195,6 +255,7 @@ export function secureInferenceResponse(input: {
   readonly requestId: string;
   readonly signal: AbortSignal;
   readonly responseTimeoutMs?: number;
+  readonly traceparent?: string;
   readonly usage?: BridgeUsageService;
   readonly availability?: InferenceAvailabilityCircuit;
 }): Effect.Effect<
@@ -278,6 +339,7 @@ export function secureInferenceResponse(input: {
       "X-Ambient-Feature": input.feature,
       "X-Ambient-Request-Id": input.requestId,
     });
+    if (input.traceparent) headers.set("traceparent", input.traceparent);
     if (modelId) headers.set("X-Ambient-Model-Id", modelId);
     if (reservationId) headers.set("X-Ambient-Credit-Reservation", reservationId);
     if (input.contentType !== null) {
@@ -293,9 +355,12 @@ export function secureInferenceResponse(input: {
       requestBytes: bodyInitSize(input.body),
     });
 
+    const nonStreamingResponses = input.path === "/v1/responses"
+      && input.payload !== null && typeof input.payload === "object"
+      && !Array.isArray(input.payload) && input.payload.stream !== true;
     const timeoutMs = input.responseTimeoutMs && input.responseTimeoutMs > 0
       ? input.responseTimeoutMs
-      : DEFAULT_INFERENCE_RESPONSE_TIMEOUT_MS;
+      : nonStreamingResponses ? NON_STREAMING_RESPONSES_TIMEOUT_MS : DEFAULT_INFERENCE_RESPONSE_TIMEOUT_MS;
 
     // Abort the fetch if the enclave never sends response headers within the budget.
     // The timer is cleared as soon as the response resolves, so it can never abort an
@@ -320,6 +385,13 @@ export function secureInferenceResponse(input: {
       ({ timer }) => Effect.sync(() => clearTimeout(timer)),
     );
     const response = yield* secureFetch.pipe(
+      Effect.flatMap((response) => {
+        const error = inferenceResponseDomainError(response);
+        if (!error) return Effect.succeed(response);
+        // Error bodies may contain provider details. Never parse or log them.
+        return Effect.promise(async () => { try { await response.body?.cancel(); } catch { /* best effort */ } })
+          .pipe(Effect.zipRight(Effect.fail(error)));
+      }),
       Effect.tapError((error) => Effect.gen(function* () {
         const domainError = inferenceDomainError(error);
         if (domainError instanceof BridgeInferenceServiceError) {
@@ -335,7 +407,8 @@ export function secureInferenceResponse(input: {
         }
       })),
     );
-    input.availability?.serviceRecovered();
+    if (response.ok) input.availability?.serviceRecovered();
+    else input.availability?.serviceProbeFailed();
 
     yield* audit.record("inference.secure_fetch_response", {
       feature: input.feature,

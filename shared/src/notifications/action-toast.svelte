@@ -1,6 +1,8 @@
 <script lang="ts">
-  import Button from "../design/adapters/button.svelte";
+  import { Button } from "@ambient/shared/ui/button";
+  import type { AmbientUpdateProgressView } from "./index.js";
   import type { AmbientToastAction, AmbientToastVariant } from "./types";
+  import AmbientUpdateProgress from "./update-progress.svelte";
 
   let {
     title,
@@ -8,6 +10,7 @@
     detail = null,
     variant = "info",
     actions = [],
+    progress = null,
     closeToast = () => {},
   }: {
     readonly title: string;
@@ -15,6 +18,7 @@
     readonly detail?: string | null;
     readonly variant?: AmbientToastVariant;
     readonly actions?: readonly AmbientToastAction[];
+    readonly progress?: AmbientUpdateProgressView | null;
     readonly closeToast?: () => void;
   } = $props();
 
@@ -52,18 +56,15 @@
     {#if detail}
       <p class="text-xs text-ink-secondary [overflow-wrap:anywhere]">{detail}</p>
     {/if}
+    {#if progress}
+      <AmbientUpdateProgress percent={progress.percent} label={progress.label} />
+    {/if}
   </div>
 
   {#if actions.length > 0}
     <div class="flex flex-wrap gap-2" aria-label="Notification actions">
       {#each actions as action (action.label)}
-        <Button
-          type="button"
-          size="sm"
-          variant={toneVariant[action.tone ?? "secondary"]}
-          disabled={busyAction !== null}
-          onclick={() => void runAction(action)}
-        >
+        <Button type="button" size="sm" variant={toneVariant[action.tone ?? "secondary"]} disabled={busyAction !== null} onclick={() => void runAction(action)} class="no-drag">
           {busyAction === action.label ? "Working…" : action.label}
         </Button>
       {/each}

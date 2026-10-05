@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, test, vi } from "vitest";
@@ -9,11 +9,94 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
   return {
     ...actual,
+    rm: vi.fn(actual.rm),
+    rename: vi.fn(actual.rename),
     writeFile: vi.fn(actual.writeFile),
   };
 });
 
 describe("EncryptedSessionStore", () => {
+  test.each(["write", "rename"])("a failed %s preserves the prior session on disk and in memory", async (failure) => {
+    const root = await mkdtemp(path.join(tmpdir(), "ambient-bridge-token-store-"));
+    const crypto: TokenCrypto = {
+      decryptString: value => value.toString("utf8"),
+      encryptString: value => Buffer.from(value, "utf8"),
+      isEncryptionAvailable: () => true,
+    };
+    const file = path.join(root, "session.enc");
+    const store = new EncryptedSessionStore(file, crypto);
+    const session: SignedInWorkOsSession = {
+      kind: "signed_in", email: "user@example.test", expiresAt: 1_800_000_000,
+      sessionToken: "previous-session", user: { id: "user_1", email: "user@example.test", name: "User" },
+    };
+    try {
+      await store.write(session);
+      const previousBytes = await readFile(file);
+      if (failure === "write") {
+        const actualFs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+        vi.mocked(writeFile).mockImplementationOnce(async (target) => {
+          await actualFs.writeFile(target, "partial replacement");
+          throw new Error("disk write failed");
+        });
+      } else {
+        vi.mocked(rename).mockRejectedValueOnce(new Error("replacement blocked"));
+      }
+      const replacement = { ...session, sessionToken: "new-session" };
+      await expect(store.write(replacement)).rejects.toThrow(failure === "write" ? "disk write failed" : "replacement blocked");
+      expect(await readFile(file)).toEqual(previousBytes);
+      expect(await store.read()).toEqual(session);
+      expect(await new EncryptedSessionStore(file, crypto).read()).toEqual(session);
+      expect(await readdir(root)).toEqual(["session.enc"]);
+      await store.write(replacement);
+      expect(await new EncryptedSessionStore(file, crypto).read()).toEqual(replacement);
+      expect(await readdir(root)).toEqual(["session.enc"]);
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
+  test("a cancelled login cannot restore credentials after logout, including a queued callback", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "ambient-bridge-token-store-"));
+    const crypto: TokenCrypto = {
+      decryptString: (value) => value.toString("utf8"),
+      encryptString: (value) => Buffer.from(value, "utf8"),
+      isEncryptionAvailable: () => true,
+    };
+    const file = path.join(root, "session.enc");
+    const store = new EncryptedSessionStore(file, crypto);
+    const session: SignedInWorkOsSession = {
+      kind: "signed_in", email: "user@example.test", expiresAt: 1_800_000_000,
+      sessionToken: "test-session", user: { id: "user_1", email: "user@example.test", name: "User" },
+    };
+    try {
+      await expect(store.writeIfOwned(session, () => true)).resolves.toBe(true);
+      vi.mocked(rm).mockRejectedValueOnce(new Error("file locked"));
+      await expect(store.clear()).rejects.toThrow("file locked");
+      await expect(store.read()).resolves.toEqual(session);
+      await expect(new EncryptedSessionStore(file, crypto).read()).resolves.toEqual(session);
+      let ownsDuringWrite = true;
+      const actualFs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+      vi.mocked(writeFile).mockImplementationOnce(async (...args) => {
+        await actualFs.writeFile(...args);
+        ownsDuringWrite = false;
+      });
+      await expect(store.writeIfOwned({ ...session, sessionToken: "replaced" }, () => ownsDuringWrite)).resolves.toBe(false);
+      await expect(store.read()).resolves.toEqual(session);
+      await expect(new EncryptedSessionStore(file, crypto).read()).resolves.toEqual(session);
+      let ownsLogin = true;
+      const clear = store.clear();
+      const callback = store.writeIfOwned(session, () => ownsLogin);
+      ownsLogin = false;
+      await clear;
+      await expect(callback).resolves.toBe(false);
+      await expect(store.writeIfOwned(session, () => false)).resolves.toBe(false);
+      await expect(store.read()).resolves.toEqual({ kind: "signed_out" });
+      await expect(new EncryptedSessionStore(file, crypto).read()).resolves.toEqual({ kind: "signed_out" });
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
   test("caches decrypted WorkOS sessions after the first read", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "ambient-bridge-token-store-"));
     let decryptCalls = 0;
@@ -28,7 +111,7 @@ describe("EncryptedSessionStore", () => {
     const store = new EncryptedSessionStore(path.join(root, "workos-session.enc"), crypto);
     const session: WorkOsSession = {
       email: "user@example.test",
-      expiresAt: 1_700_000_000_000,
+      expiresAt: 1_700_000_000,
       kind: "signed_in",
       sessionToken: "sealed_session_test",
       user: {

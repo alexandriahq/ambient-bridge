@@ -1,5 +1,13 @@
 <script lang="ts">
-  import { Button, Card, Dialog, Icon, Pill, cn } from "@ambient/shared/design";
+  import { modelDetailsVisible } from "@ambient/shared/feature-flags";
+	import CheckIcon from "@lucide/svelte/icons/check";
+	import ClipboardIcon from "@lucide/svelte/icons/clipboard";
+	import LockIcon from "@lucide/svelte/icons/lock";
+  import { Button } from "@ambient/shared/ui/button";
+  import { Card } from "@ambient/shared/ui/card";
+  import * as Dialog from "@ambient/shared/ui/dialog";
+  import { Badge } from "@ambient/shared/ui/badge";
+  import { cn } from "@ambient/shared/utils";
   import type {
     BridgeInferenceRequestStatus,
     BridgeStatus,
@@ -8,13 +16,24 @@
   import { formatBytes, formatDuration, formatRelative, routeLabel } from "../format";
   import { statusDotClass } from "../status-dot";
 
-  let { status, now }: { status: BridgeStatus; now: number } = $props();
+  let {
+    status,
+    requests,
+    now,
+  }: {
+    status: BridgeStatus;
+    requests: readonly BridgeInferenceRequestStatus[];
+    now: number;
+  } = $props();
+
+  const showModelDetails = $derived(modelDetailsVisible(status.account));
+  const visibleError = (error: string) => showModelDetails ? error : "The inference request failed. Retry or contact support.";
 
   let detailsOpen = $state(false);
   let selectedRequestId = $state<string | null>(null);
   let selectedRequestSnapshot = $state<BridgeInferenceRequestStatus | null>(null);
   const selectedRequestLive = $derived(
-    status.inference.requests.find((request) => request.requestId === selectedRequestId) ?? null,
+    requests.find((request) => request.requestId === selectedRequestId) ?? null,
   );
   const selectedRequest = $derived(
     selectedRequestLive ?? selectedRequestSnapshot,
@@ -58,6 +77,10 @@
     return (request.completedAt ?? now) - request.startedAt;
   }
 
+  function phaseDuration(timestamp: number | null, startedAt: number): string {
+    return timestamp === null ? "—" : formatDuration(timestamp - startedAt);
+  }
+
   function requestStatus(request: BridgeInferenceRequestStatus): string {
     if (request.status === "active") return "In flight";
     return request.statusCode ? `${request.status} · ${request.statusCode}` : request.status;
@@ -69,6 +92,19 @@
     return "text-ink-secondary";
   }
 
+  function attestationLabel(attestation: BridgeInferenceRequestStatus["attestation"]): string {
+    if (attestation === "verified") return "Attested";
+    if (attestation === "skipped") return "Not attested";
+    return attestation;
+  }
+
+  function attestationTone(attestation: BridgeInferenceRequestStatus["attestation"]): string {
+    if (attestation === "verified") return "text-success";
+    if (attestation === "failed") return "text-danger";
+    if (attestation === "skipped") return "text-ink-secondary";
+    return "text-warning";
+  }
+
   function formatTimestamp(value: number | null): string {
     if (value === null) return "—";
     return new Intl.DateTimeFormat(undefined, {
@@ -77,7 +113,7 @@
     }).format(value);
   }
 
-  function base64Bytes(value: string): Uint8Array {
+  function base64Bytes(value: string) {
     const binary = atob(value);
     return Uint8Array.from(binary, (character) => character.charCodeAt(0));
   }
@@ -225,29 +261,29 @@
   <header class="flex flex-none items-end justify-between gap-4">
     <div>
       <h1 class="text-2xl font-semibold tracking-tight text-ink">Requests</h1>
-      <p class="mt-1 text-sm text-ink-tertiary">Encrypted inference traffic through this Bridge.</p>
+      <p class="mt-1 text-sm text-ink-tertiary">Inference requests and transport status through this Bridge.</p>
     </div>
-    <Pill tone="soft" class="text-success"><Icon name="lock" size={12} /> EHBP / HPKE</Pill>
+    <Badge variant="secondary" class="text-success"><LockIcon size={12} /> EHBP / HPKE</Badge>
   </header>
 
   <section class="flex min-h-0 flex-1 flex-col gap-2" aria-labelledby="request-list-title">
     <div class="flex flex-none items-center justify-between px-1">
       <h2 id="request-list-title" class="text-sm font-semibold text-ink">All requests</h2>
-      <span class="tnum text-xs text-ink-faint">{status.inference.requests.length} total</span>
+      <span class="tnum text-xs text-ink-faint">{requests.length} total</span>
     </div>
 
     <Card class="min-h-0 flex-1 overflow-hidden p-0">
-      {#if status.inference.requests.length === 0}
+      {#if requests.length === 0}
         <div class="grid h-full place-items-center px-5 text-center">
           <div>
-            <Icon name="lock" size={20} class="mx-auto text-ink-faint" />
+            <LockIcon size={20} class="mx-auto text-ink-faint" />
             <p class="mt-2 text-sm font-medium text-ink">No inference traffic yet</p>
             <p class="mt-1 text-xs text-ink-tertiary">Requests will appear here as they pass through the Bridge.</p>
           </div>
         </div>
       {:else}
         <ol class="h-full overflow-y-auto overscroll-contain divide-y divide-line" data-testid="request-list">
-          {#each status.inference.requests as request (request.requestId)}
+          {#each requests as request (request.requestId)}
             <li>
               <button
                 type="button"
@@ -259,8 +295,11 @@
                 <div class="min-w-0">
                   <div class="flex min-w-0 items-baseline gap-2">
                     <strong class="flex-none text-sm font-medium text-ink">{routeLabel(request.path)}</strong>
-                    <span class="truncate font-mono text-xs text-ink-tertiary">{request.model ?? "—"}</span>
+                    {#if showModelDetails}<span class="truncate font-mono text-xs text-ink-tertiary">{request.model ?? "—"}</span>{/if}
                   </div>
+                  {#if request.error}
+                    <p class="mt-1 line-clamp-2 text-xs text-danger">{visibleError(request.error)}</p>
+                  {/if}
                   <div class="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-ink-faint">
                     <span class="font-mono">{request.requestId}</span>
                     <span class="tnum">{formatDuration(latency(request))}</span>
@@ -269,10 +308,13 @@
                   </div>
                 </div>
                 <div class="flex items-center gap-2">
-                  <Pill tone="soft" size="sm" class={request.attestation === "verified" ? "text-success" : request.attestation === "failed" ? "text-danger" : "text-warning"}>
-                    <Icon name="lock" size={11} /> {request.attestation === "verified" ? "Attested" : request.attestation}
-                  </Pill>
-                  <Pill tone="soft" size="sm" class={statusTone(request)} dot>{requestStatus(request)}</Pill>
+                  <Badge variant="secondary" size="sm" class={attestationTone(request.attestation)}>
+                    <LockIcon size={11} /> {attestationLabel(request.attestation)}
+                  </Badge>
+                  <Badge variant="secondary" size="sm" class={statusTone(request)}>
+                    <span class="size-1.5 rounded-full bg-current opacity-70" aria-hidden="true"></span>
+                    {requestStatus(request)}
+                  </Badge>
                   <span class="text-xs text-ink-faint transition-transform group-hover:translate-x-0.5" aria-hidden="true">›</span>
                 </div>
               </button>
@@ -284,14 +326,19 @@
   </section>
 </section>
 
-<Dialog
-  bind:open={detailsOpen}
-  title={selectedRequest ? `${routeLabel(selectedRequest.path)} request` : "Request details"}
-  class="flex h-[calc(100dvh-3rem)] max-w-[760px] flex-col"
-  bodyClass="min-h-0 flex-1 overflow-hidden p-0"
->
-  {#if selectedRequest}
-    <div class="relative h-full min-h-0">
+<Dialog.Root bind:open={detailsOpen}>
+  <Dialog.Content
+    class="card elevate-lg flex h-[calc(100dvh-3rem)] max-w-[760px] flex-col gap-0 overflow-hidden bg-surface p-0"
+    style="animation: floatIn 0.28s var(--ease-out-quint) both"
+  >
+    <Dialog.Header class="flex-row items-center gap-3 border-b border-line px-4 py-3 pr-12">
+      <Dialog.Title class="flex-1 text-md font-semibold text-ink">
+        {selectedRequest ? `${routeLabel(selectedRequest.path)} request` : "Request details"}
+      </Dialog.Title>
+    </Dialog.Header>
+    <div class="min-h-0 flex-1 overflow-hidden p-0">
+      {#if selectedRequest}
+        <div class="relative h-full min-h-0">
       <!-- svelte-ignore a11y_no_noninteractive_tabindex (The overflow region must be keyboard-scrollable.) -->
       <div
         class="request-detail-scroll h-full overflow-y-auto overscroll-contain"
@@ -302,13 +349,19 @@
         tabindex="0"
         onscroll={handleDetailsScroll}
       >
+      {#if selectedRequest.error}
+        <div class="border-b border-danger/30 bg-danger/[0.04] px-4 py-3 text-sm text-danger" role="alert" data-testid="request-error">
+          <p>{visibleError(selectedRequest.error)}</p>
+          <p class="mt-2 text-xs">Failed at {selectedRequest.completedAt === null ? "Unknown" : new Date(selectedRequest.completedAt).toISOString()} · Request {selectedRequest.requestId}</p>
+        </div>
+      {/if}
       <section class="sticky top-0 z-10 border-b border-line bg-surface px-4 py-3" aria-label="Ciphertext identity" data-testid="cipher-summary">
         {#if wireCaptureLoading}
           <div class="grid h-[220px] place-items-center rounded-[var(--radius-lg)] border border-line bg-surface-2/50 text-sm text-ink-secondary" role="status">Building ciphertext identity…</div>
         {:else if wireCaptureError}
           <div class="flex items-center justify-between gap-4 rounded-[var(--radius-md)] border border-danger/30 bg-danger/[0.04] px-4 py-3 text-sm text-danger" role="alert">
             <span>{wireCaptureError}</span>
-            <Button variant="ghost" size="sm" onclick={retryWireCapture}>Retry</Button>
+            <Button variant="ghost" size="sm" onclick={retryWireCapture} class="no-drag">Retry</Button>
           </div>
         {:else if wireCaptureState === "pending"}
           <div class="rounded-[var(--radius-md)] border border-line bg-surface-2/40 px-4 py-5 text-sm text-ink-secondary" role="status">The sealed request is still being captured. This inspector will refresh automatically.</div>
@@ -322,7 +375,7 @@
               <div class="pointer-events-none absolute -right-10 -top-10 size-32 rounded-full border border-on-primary/10"></div>
               <div class="relative flex items-center justify-between gap-3">
                 <span class="text-2xs font-semibold uppercase tracking-[0.18em] text-on-primary/60">{wireCapture.request.body.truncated ? "Prefix cipherprint" : "Cipherprint"}</span>
-                <Icon name="lock" size={14} class="text-on-primary/60" />
+                <LockIcon size={14} class="text-on-primary/60" />
               </div>
               <pre
                 class="relative m-0 justify-self-center font-mono text-2xs leading-[1.12] tracking-[0.12em] text-on-primary"
@@ -343,11 +396,12 @@
                   <span class="text-2xs font-semibold uppercase tracking-wider text-ink-faint">{wireCapture.request.body.truncated ? "Sealed request · captured prefix" : "Sealed request"}</span>
                   <div class="flex items-center gap-1.5">
                     {#if wireCapture.request.body.truncated}
-                      <Pill tone="soft" size="sm" class="text-warning">Truncated</Pill>
+                      <Badge variant="secondary" size="sm" class="text-warning">Truncated</Badge>
                     {/if}
-                    <Pill tone="soft" size="sm" class={selectedRequest.attestation === "verified" ? "text-success" : selectedRequest.attestation === "failed" ? "text-danger" : "text-warning"} dot>
-                      {selectedRequest.attestation === "verified" ? "Attested" : selectedRequest.attestation}
-                    </Pill>
+                    <Badge variant="secondary" size="sm" class={attestationTone(selectedRequest.attestation)}>
+                      <span class="size-1.5 rounded-full bg-current opacity-70" aria-hidden="true"></span>
+                      {attestationLabel(selectedRequest.attestation)}
+                    </Badge>
                   </div>
                 </div>
                 <p class="mt-2 truncate whitespace-nowrap font-mono text-2xs tracking-tight text-ink" title={cipherIdentity.fingerprint} data-testid="cipher-fingerprint">{cipherIdentity.fingerprint}</p>
@@ -374,7 +428,7 @@
                 </div>
                 <div>
                   <dt class="text-2xs text-ink-faint">Enclave request</dt>
-                  <dd class="mt-0.5 truncate font-mono text-sm font-semibold text-ink">{selectedRequest.tinfoilRequestId ?? "Pending"}</dd>
+                  <dd class={cn("mt-0.5 truncate text-sm font-semibold text-ink", selectedRequest.tinfoilRequestId && "font-mono")}>{selectedRequest.tinfoilRequestId ?? "Pending"}</dd>
                 </div>
               </dl>
 
@@ -395,10 +449,12 @@
             <dt class="text-ink-faint">Route</dt>
             <dd class="mt-1 truncate font-mono text-ink" title={selectedRequest.path}>{selectedRequest.path}</dd>
           </div>
+          {#if showModelDetails}
           <div class="min-w-0 border-b border-r border-line p-2">
             <dt class="text-ink-faint">Model</dt>
             <dd class="mt-1 truncate font-mono text-ink">{selectedRequest.model ?? "—"}</dd>
           </div>
+          {/if}
           <div class="min-w-0 border-b border-line p-2">
             <dt class="text-ink-faint">Feature</dt>
             <dd class="mt-1 truncate text-ink">{selectedRequest.feature}</dd>
@@ -421,6 +477,20 @@
               <dd class="tnum text-ink-secondary">{selectedRequest.usage.promptTokens} input · {selectedRequest.usage.completionTokens} output · {selectedRequest.usage.totalTokens} total</dd>
             </div>
           {/if}
+          <div class="col-span-3 grid grid-cols-3 border-t border-line text-2xs">
+            <div class="border-r border-line px-2 py-1.5">
+              <dt class="text-ink-faint">Headers</dt>
+              <dd class="tnum mt-0.5 text-ink-secondary">{phaseDuration(selectedRequest.responseHeadersAt, selectedRequest.startedAt)}</dd>
+            </div>
+            <div class="border-r border-line px-2 py-1.5">
+              <dt class="text-ink-faint">First chunk</dt>
+              <dd class="tnum mt-0.5 text-ink-secondary">{phaseDuration(selectedRequest.firstChunkAt, selectedRequest.startedAt)}</dd>
+            </div>
+            <div class="min-w-0 px-2 py-1.5">
+              <dt class="text-ink-faint">Trace</dt>
+              <dd class="mt-0.5 truncate font-mono text-ink-secondary" title={selectedRequest.traceId ?? ""}>{selectedRequest.traceId?.slice(0, 12) ?? "—"}</dd>
+            </div>
+          </div>
           </dl>
         </section>
 
@@ -437,13 +507,8 @@
                     : `${formatBytes(wireCapture.request.body.capturedBytes)} complete capture`}
                 </p>
               </div>
-              <Button
-                variant="ghost"
-                size="sm"
-                icon={rawCopyState === "copied" ? "check" : "clipboard"}
-                aria-label={wireCapture.request.body.truncated ? "Copy captured sealed payload prefix" : "Copy raw sealed payload"}
-                onclick={() => void copyRawPayload()}
-              >
+              <Button variant="ghost" size="sm" aria-label={wireCapture.request.body.truncated ? "Copy captured sealed payload prefix" : "Copy raw sealed payload"} onclick={() => void copyRawPayload()} class="no-drag">
+                {#if rawCopyState === "copied"}<CheckIcon size={16} strokeWidth={1.75} aria-hidden="true" />{:else}<ClipboardIcon size={16} strokeWidth={1.75} aria-hidden="true" />{/if}
                 {rawCopyState === "copied" ? "Copied" : rawCopyState === "failed" ? "Copy failed" : wireCapture.request.body.truncated ? "Copy prefix" : "Copy raw"}
               </Button>
             </div>
@@ -471,9 +536,11 @@
         data-testid="request-scroll-thumb"
         aria-hidden="true"
       ></div>
+        </div>
+      {/if}
     </div>
-  {/if}
-</Dialog>
+  </Dialog.Content>
+</Dialog.Root>
 
 <style>
   .request-detail-scroll {

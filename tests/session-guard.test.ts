@@ -7,6 +7,35 @@ import {
 } from "../src/lib/session-guard";
 
 describe("composeBridgeSessionGuard", () => {
+
+  it("preserves network labels, fallback copy, and custom-detail trimming", () => {
+    const cases = [
+      ["offline", "Offline", "Bridge could not find an internet route to the Ambient server."],
+      ["dns_failure", "DNS failed", "Bridge could not resolve the Ambient server hostname."],
+      ["server_error", "Server down", "The Ambient server health check did not return a healthy response."],
+      ["timeout", "Timed out", "The Ambient server health check took too long to respond."],
+      ["not_checked", "Not checked", "Bridge could not reach the Ambient server."],
+      ["network_error", "Unreachable", "Bridge could not reach the Ambient server."],
+      ["ok", "Unreachable", "Bridge could not reach the Ambient server."],
+    ] as const;
+    for (const [reason, label, fallback] of cases) {
+      for (const detail of ["", "  \t ", "  Custom network detail.  "]) {
+        const guard = composeBridgeSessionGuard({
+          status: bridgeStatus({
+            serverReachability: "unavailable",
+            serverReachabilityMessage: detail,
+            serverReachabilityReason: reason,
+          }),
+        });
+        expect(guard).toMatchObject({ blocking: true, reason: "network" });
+        expect(guard.model).toMatchObject({ message: detail?.trim() || fallback, statusLabel: label });
+        expect(guard.model?.rows).toContainEqual(expect.objectContaining({ id: "server", value: label }));
+        if (reason === "network_error") expect(guard.model?.title).toBe("Bridge cannot reach Ambient server");
+        if (reason === "dns_failure") expect(guard.model?.nextSteps?.[1]).toBe("Try again after the server hostname resolves.");
+      }
+    }
+  });
+
   it("blocks Bridge UI until the account is signed in", () => {
     const guard = composeBridgeSessionGuard({ status: bridgeStatus({ account: { kind: "signed_out" } }) });
 
@@ -66,6 +95,7 @@ function bridgeStatus(overrides: Partial<BridgeStatus> = {}): BridgeStatus {
           automations: false,
           automationToggleTrack: false,
           contextHandoff: false,
+          skills: false, reports: false,
           devtooling: false,
           integrations: false,
         },
@@ -77,7 +107,6 @@ function bridgeStatus(overrides: Partial<BridgeStatus> = {}): BridgeStatus {
       },
       kind: "signed_in",
     },
-    activity: [],
     appVersion: "0.1.0-test",
     connection: "ready",
     inference: {
@@ -88,12 +117,12 @@ function bridgeStatus(overrides: Partial<BridgeStatus> = {}): BridgeStatus {
       encryption: "ehbp",
       lastError: null,
       lastRequest: null,
-      requests: [],
       responsePrivacy: "decrypts_in_bridge",
       serverAuth: "workos_session",
       serverOrigin: "https://api.example.test",
       wireCaptureRevision: 0,
     },
+    plaintextInferenceWarningHidden: false,
     pairedClientList: [],
     pairedClients: 0,
     pairingRequests: [],

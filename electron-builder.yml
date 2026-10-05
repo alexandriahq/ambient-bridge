@@ -1,21 +1,38 @@
 appId: com.alexandria.ambient.bridge
 productName: Ambient Bridge
-electronVersion: 42.3.3
+electronVersion: 42.6.2
 extraMetadata:
   name: ambient-bridge
   main: dist/electron/main.js
 directories:
   output: dist-packaged
+# Bridge's UI is English-only. Keeping every Chromium locale adds roughly
+# 50 MiB to each installed copy without exposing any localized product UI.
+electronLanguages:
+  - en
+  - en-US
+  - en-GB
+  - en_GB
 # Injects the macOS 26/Tahoe Icon Composer icon (Assets.car + CFBundleIconName)
 # into the .app before signing. See scripts/afterpack-tahoe-icon.cjs.
 afterPack: ./scripts/afterpack-tahoe-icon.cjs
 files:
   - dist/**/*
+  # Source maps are uploaded before electron-builder runs; they are not runtime
+  # files and should never consume installed-app space.
+  - "!dist/**/*.map"
   - package.json
   - LICENSE
   - THIRD_PARTY_NOTICES.md
   - node_modules/**/*
 extraResources:
+  # CSS bundles contain font assets without their package license files.
+  - from: node_modules/@fontsource-variable/inter/LICENSE
+    to: licenses/inter.txt
+  - from: node_modules/@fontsource/stix-two-text/LICENSE
+    to: licenses/stix-two-text.txt
+  - from: node_modules/@fontsource/jetbrains-mono/LICENSE
+    to: licenses/jetbrains-mono.txt
   - from: resources/bridge-icon.ico
     to: bridge-icon.ico
   - from: resources/bridge-icon-source.png
@@ -29,7 +46,13 @@ mac:
   category: public.app-category.productivity
   gatekeeperAssess: false
   hardenedRuntime: true
+  entitlements: resources/entitlements.mac.plist
   icon: resources/bridge-icon.icns
+  # Agent-style launch identity: no Dock tile before Electron can apply the
+  # runtime accessory policy. Tray + Cmd+Q / tray Quit remain the quit paths.
+  extendInfo:
+    NSAppleEventsUsageDescription: This app uses Finder to move itself to Trash when you choose Uninstall.
+    LSUIElement: true
   target:
     - target: dmg
       arch:
@@ -48,6 +71,16 @@ win:
     - target: nsis
       arch:
         - x64
+linux:
+  category: Utility
+  # Sized set, not the 1024px source. Ubuntu hicolor does not index 1024x1024/apps.
+  icon: build/linux-icons
+  target:
+    - target: deb
+      arch:
+        - x64
+deb:
+  artifactName: ${productName}_${version}_amd64.${ext}
 nsis:
   installerIcon: resources/bridge-icon.ico
   uninstallerIcon: resources/bridge-icon.ico

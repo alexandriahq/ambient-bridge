@@ -1,5 +1,7 @@
 packages:
   - shared
+  - alexandria-cloud-contract
+  - alexandria-inference-contract
 onlyBuiltDependencies:
   - '@parcel/watcher'
   - electron

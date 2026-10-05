@@ -1,8 +1,9 @@
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { isLocalVaultPayload, LocalSecretVault } from "../electron/local-secret-vault.js";
+import { EncryptedSessionStore } from "../electron/workos/token-store.js";
 
 describe("LocalSecretVault", () => {
   let dir: string;
@@ -22,6 +23,30 @@ describe("LocalSecretVault", () => {
     const payload = vault.encryptString("hello secrets");
     expect(isLocalVaultPayload(payload)).toBe(true);
     expect(vault.decryptString(payload)).toBe("hello secrets");
+  });
+
+  it.skipIf(process.platform === "win32").each(["permissions", "symlink"])("preserves the existing Bridge key-file behavior for %s", (kind) => {
+    // Characterize the existing hardening gap during extraction; future hardening may change it.
+    mkdirSync(join(dir, "nested"));
+    const target = kind === "symlink" ? join(dir, "target.json") : keyFilePath;
+    writeFileSync(target, JSON.stringify({ version: 1, keyBase64: Buffer.alloc(32, 7).toString("base64") }), { mode: 0o600 });
+    if (kind === "symlink") symlinkSync(target, keyFilePath);
+    else chmodSync(keyFilePath, 0o644);
+    const vault = new LocalSecretVault(keyFilePath);
+    expect(vault.decryptString(vault.encryptString("existing session"))).toBe("existing session");
+  });
+
+  it("reopens a real sealed session and signs out when its ciphertext or key changes", async () => {
+    const sessionPath = join(dir, "workos-session.enc");
+    const store = (keyPath = keyFilePath) => new EncryptedSessionStore(sessionPath, new LocalSecretVault(keyPath));
+    const session = { kind: "signed_in" as const, email: "user@example.test", expiresAt: 1_700_000_000, sessionToken: "synthetic-session", user: { id: "test-user", email: "user@example.test", name: "Test" } };
+    await store().write(session);
+    expect(await store().read()).toEqual(session);
+    expect(await store(join(dir, "wrong-key.json")).read()).toEqual({ kind: "signed_out" });
+    const payload = readFileSync(sessionPath);
+    payload[payload.length - 1] ^= 1;
+    writeFileSync(sessionPath, payload);
+    expect(await store().read()).toEqual({ kind: "signed_out" });
   });
 
   it("creates the key file lazily with owner-only permissions", () => {

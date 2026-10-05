@@ -3,11 +3,11 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { createConnection, type Socket } from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryAuditSink } from "../electron/diagnostics/audit.js";
 import { PairingStore } from "../electron/ipc-server/pairing.js";
 import { encodeBinaryFrame, encodeFrame } from "../electron/ipc-server/protocol.js";
-import { BridgeIpcServer, type IpcHandlerContext } from "../electron/ipc-server/socket.js";
+import { BridgeIpcServer, type IpcHandlerContext, type BinaryUploadReadOptions } from "../electron/ipc-server/socket.js";
 
 const UPLOAD_METHOD = "inference.audioTranscriptions";
 
@@ -25,7 +25,7 @@ afterEach(async () => {
   while (cleanups.length > 0) await cleanups.pop()?.();
 });
 
-async function startHarness(): Promise<Harness> {
+async function startHarness(options: (id: string) => BinaryUploadReadOptions = () => ({})): Promise<Harness> {
   const dir = process.platform === "win32"
     ? null
     : await mkdtemp(path.join(os.tmpdir(), "ambient-bridge-binary-"));
@@ -35,7 +35,7 @@ async function startHarness(): Promise<Harness> {
     audit,
     handlers: {
       [UPLOAD_METHOD]: async (frame, context: IpcHandlerContext) => {
-        const read = context.readBinaryUpload();
+        const read = context.readBinaryUpload(options(frame.id));
         reads.set(frame.id, [...(reads.get(frame.id) ?? []), read]);
         // Swallow here; tests assert on the stored promise.
         await read.catch(() => undefined);
@@ -189,4 +189,41 @@ describe("Bridge IPC binary upload lifecycle", () => {
     await expect(firstRead).resolves.toEqual(Buffer.from("first"));
     await expect(secondRead).resolves.toEqual(Buffer.from("second"));
   });
+});
+
+it("cancellation settles incomplete upload readers and releases connection capacity", async () => {
+  const controllers = new Map(Array.from({ length: 4 }, (_, index) => [`cancel-${index}`, new AbortController()]));
+  const { client, reads } = await startHarness(id => ({ signal: controllers.get(id)?.signal }));
+  const outcomes: unknown[] = [];
+  for (const [id] of controllers) {
+    requestUpload(client, id);
+    client.write(encodeBinaryFrame({ type: "binary", id, event: "chunk", seq: 0, bytes: Buffer.from("partial") }));
+    const { read } = await readFor(reads, id);
+    void read.then(value => outcomes.push(value), error => outcomes.push(error));
+  }
+  const reason = new Error("client cancelled upload");
+  for (const controller of controllers.values()) controller.abort(reason);
+  await vi.waitFor(() => expect(outcomes).toEqual([reason, reason, reason, reason]), { timeout: 500 });
+  requestUpload(client, "next");
+  const { read } = await readFor(reads, "next");
+  client.write(encodeBinaryFrame({ type: "binary", id: "next", event: "chunk", seq: 0, bytes: Buffer.from("valid") }));
+  client.write(encodeBinaryFrame({ type: "binary", id: "next", event: "end", seq: 1, bytes: Buffer.alloc(0) }));
+  await expect(read).resolves.toEqual(Buffer.from("valid"));
+});
+
+it("completed uploads detach their abort listener and pre-cancelled reads reject immediately", async () => {
+  const active = new AbortController(), cancelled = new AbortController();
+  const reason = new Error("cancelled before upload read");
+  cancelled.abort(reason);
+  const removed = vi.spyOn(active.signal, "removeEventListener");
+  const { client, reads } = await startHarness(id => ({ signal: id === "complete" ? active.signal : cancelled.signal }));
+  requestUpload(client, "complete");
+  const { read: complete } = await readFor(reads, "complete");
+  client.write(encodeBinaryFrame({ type: "binary", id: "complete", event: "chunk", seq: 0, bytes: Buffer.from("done") }));
+  client.write(encodeBinaryFrame({ type: "binary", id: "complete", event: "end", seq: 1, bytes: Buffer.alloc(0) }));
+  await expect(complete).resolves.toEqual(Buffer.from("done"));
+  expect(removed).toHaveBeenCalledWith("abort", expect.any(Function));
+  requestUpload(client, "already-cancelled");
+  const { read: rejected } = await readFor(reads, "already-cancelled");
+  await expect(rejected).rejects.toBe(reason);
 });

@@ -45,4 +45,12 @@ describe("PairingStore", () => {
     expect(restored.listRequests()).toEqual(store.listRequests());
     expect(restored.listClients()).toEqual(store.listClients());
   });
+
+  it("refuses a future pairing snapshot so an old Bridge fails closed", () => {
+    expect(() => PairingStore.fromSnapshot({
+      schemaVersion: 2,
+      requests: [],
+      clients: [],
+    })).toThrow(/schemaVersion 2 is newer than this Bridge/);
+  });
 });

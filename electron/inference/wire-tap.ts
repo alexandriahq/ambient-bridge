@@ -94,6 +94,7 @@ export class WireTap {
   private readonly onUpdate?: (requestId: string) => void;
   private installed = false;
   private generation = 0;
+  private readers = new Set<ReadableStreamDefaultReader<Uint8Array>>();
 
   constructor(options: WireTapOptions = {}) {
     this.limit = options.limit ?? DEFAULT_LIMIT;
@@ -123,6 +124,11 @@ export class WireTap {
     this.generation += 1;
     this.captures.clear();
     this.order.length = 0;
+    const readers = this.readers;
+    this.readers = new Set();
+    // A tee cancellation may wait for the real request/response consumer.
+    // Retire only our branches, without blocking that consumer or clear().
+    for (const reader of readers) void reader.cancel().catch(() => {});
   }
 
   private async intercept(
@@ -138,11 +144,11 @@ export class WireTap {
     }
 
     // Read the sealed request bytes from a clone, in parallel with the real send.
+    const captureGeneration = this.generation;
     const requestClone = request.clone();
     const responsePromise = originalFetch(request);
-    const captureGeneration = this.generation;
 
-    const requestStored = this.readBody(requestClone.body, contentLength(request.headers), this.maxRequestBytes)
+    const requestStored = this.readBody(requestClone.body, contentLength(request.headers), this.maxRequestBytes, captureGeneration)
       .then((body) => {
         if (captureGeneration !== this.generation) return;
         this.store(requestId, {
@@ -187,12 +193,14 @@ export class WireTap {
       throw plainError;
     }
 
+    if (captureGeneration !== this.generation) return response;
+
     // Capture the encrypted response from a tee'd clone so the SDK still decrypts
     // the original untouched. Reading is capped and cancels early on large streams.
     const responseClone = response.clone();
     void Promise.all([
       requestStored,
-      this.readBody(responseClone.body, contentLength(response.headers), this.maxResponseBytes),
+      this.readBody(responseClone.body, contentLength(response.headers), this.maxResponseBytes, captureGeneration),
     ])
       .then(([, body]) => {
         if (captureGeneration !== this.generation) return;
@@ -255,18 +263,24 @@ export class WireTap {
     stream: ReadableStream<Uint8Array> | null,
     declaredLength: number | null,
     maxBytes: number,
+    captureGeneration: number,
   ): Promise<WireBody> {
+    if (captureGeneration !== this.generation) {
+      void stream?.cancel().catch(() => {});
+      return { base64: "", byteLength: null, capturedBytes: 0, truncated: true };
+    }
     if (!stream) {
       return { base64: "", byteLength: declaredLength ?? 0, capturedBytes: 0, truncated: false };
     }
     const reader = stream.getReader();
+    this.readers.add(reader);
     const chunks: Uint8Array[] = [];
     let captured = 0;
     let truncated = false;
     try {
       while (true) {
         const { done, value } = await reader.read();
-        if (done) break;
+        if (done || captureGeneration !== this.generation) break;
         if (!value || value.byteLength === 0) continue;
         const remaining = maxBytes - captured;
         if (remaining <= 0) {
@@ -284,11 +298,16 @@ export class WireTap {
         }
       }
     } finally {
+      this.readers.delete(reader);
       void reader.cancel().catch(() => {});
+      reader.releaseLock();
+    }
+    if (captureGeneration !== this.generation) {
+      return { base64: "", byteLength: null, capturedBytes: 0, truncated: true };
     }
     const merged = concat(chunks, captured);
     return {
-      base64: Buffer.from(merged).toString("base64"),
+      base64: Buffer.from(merged.buffer, merged.byteOffset, merged.byteLength).toString("base64"),
       capturedBytes: captured,
       byteLength: declaredLength ?? (truncated ? null : captured),
       truncated,
@@ -308,6 +327,14 @@ function plainInferenceError(response: Response): BridgeInferenceServiceError | 
       "UPSTREAM_BILLING_UNAVAILABLE",
       response.status,
       boundedRetryAfterSeconds(response.headers.get("retry-after"), 60),
+      source === "openrouter_provider" ? source : "tinfoil_provider",
+    );
+  }
+  if (code === "SERVER_BUSY" && source === "ambient_server") {
+    return new BridgeInferenceServiceError(
+      "UPSTREAM_ENVELOPE_UNAVAILABLE",
+      response.status,
+      boundedRetryAfterSeconds(response.headers.get("retry-after"), 2),
     );
   }
   return new BridgeInferenceServiceError(

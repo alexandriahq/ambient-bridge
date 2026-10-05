@@ -30,11 +30,6 @@ export function resolveBridgeMockPlatform(): BridgeMockPlatform {
   return "win32";
 }
 
-export function bridgeMockArch(platform: BridgeMockPlatform): string {
-  if (platform === "darwin") return "arm64";
-  return "x64";
-}
-
 export function bridgeMockClientLabel(platform: BridgeMockPlatform): string {
   if (platform === "win32") return "Ambient (this Windows PC)";
   if (platform === "linux") return "Ambient (this Linux desktop)";

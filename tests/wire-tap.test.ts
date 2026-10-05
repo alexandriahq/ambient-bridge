@@ -11,7 +11,7 @@ function host(fetchImpl: FetchHost["fetch"]): FetchHost {
   return { fetch: fetchImpl };
 }
 
-function sealedRequest(requestId: string, body: Uint8Array, extraHeaders: Record<string, string> = {}): Request {
+function sealedRequest(requestId: string, body: Uint8Array<ArrayBuffer>, extraHeaders: Record<string, string> = {}): Request {
   return new Request("https://ambientserver-staging.up.railway.app/v1/chat/completions", {
     body,
     headers: {
@@ -108,6 +108,31 @@ describe("WireTap", () => {
     expect(JSON.stringify(tap.get("req_provider_503"))).not.toContain("private rate limit detail");
   });
 
+  it("classifies server admission 503 as a service circuit, not account exhaustion", async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
+      error: { code: "SERVER_BUSY", message: "The inference gateway is at capacity. Retry shortly." },
+    }), {
+      status: 503,
+      headers: {
+        "retry-after": "2",
+        "x-ambient-error-code": "SERVER_BUSY",
+        "x-ambient-error-source": "ambient_server",
+      },
+    }));
+    const h = host(fetchImpl);
+    const tap = new WireTap();
+    tap.install(h);
+
+    await expect(h.fetch(sealedRequest("req_server_busy", new Uint8Array([1])))).rejects.toMatchObject({
+      code: "UPSTREAM_ENVELOPE_UNAVAILABLE",
+      httpStatus: 503,
+      retryAfterSeconds: 2,
+      source: "tinfoil_provider",
+    });
+    await expect(h.fetch(sealedRequest("req_server_busy_account", new Uint8Array([1]))))
+      .rejects.not.toBeInstanceOf(BridgeInsufficientCreditError);
+  });
+
   it("redacts the session token from captured headers", async () => {
     const fetchImpl = vi.fn(async () => new Response("ok"));
     const h = host(fetchImpl);
@@ -184,6 +209,31 @@ describe("WireTap", () => {
     expect(body.capturedBytes).toBe(payload.byteLength);
     expect(body.byteLength).toBe(payload.byteLength);
     expect(body.truncated).toBe(false);
+    expect(Buffer.from(body.base64, "base64").equals(Buffer.from(payload))).toBe(true);
+  });
+
+  it("encodes only the bytes of offset stream chunks across truncation boundaries", async () => {
+    const backing = Uint8Array.from({ length: 270 }, (_, index) => (index * 47) % 256);
+    const chunks = [backing.subarray(3, 91), backing.subarray(117, 202), backing.subarray(251, 270)];
+    const expected = Buffer.concat(chunks.map(chunk => Buffer.from(chunk)));
+    for (const maxBytes of [0, 1, 87, 88, 89, expected.length, expected.length + 1]) {
+      const stream = () => new ReadableStream<Uint8Array>({
+        start(controller) { chunks.forEach(chunk => controller.enqueue(chunk)); controller.close(); },
+      });
+      const request = sealedRequest(`req_offsets_${maxBytes}`, new Uint8Array([1]));
+      vi.spyOn(request, "clone").mockReturnValue({ body: stream() } as Request);
+      const h = host(vi.fn(async () => new Response(stream(), { headers: { "ehbp-response-nonce": "nonce" } })));
+      const tap = new WireTap({ maxRequestBytes: maxBytes, maxResponseBytes: maxBytes });
+      tap.install(h);
+      await h.fetch(request);
+      await vi.waitFor(() => expect(tap.get(`req_offsets_${maxBytes}`)?.response).toBeTruthy());
+      const capture = tap.get(`req_offsets_${maxBytes}`)!;
+      for (const body of [capture.request.body, capture.response!.body]) {
+        expect(body.base64).toBe(expected.subarray(0, maxBytes).toString("base64"));
+        expect(body.capturedBytes).toBe(Math.min(maxBytes, expected.length));
+        expect(body.truncated).toBe(maxBytes < expected.length);
+      }
+    }
   });
 
   it("keeps encrypted response previews bounded at 16 KiB", async () => {
@@ -280,6 +330,98 @@ describe("WireTap", () => {
     await flush();
 
     expect(tap.get("req_old_account")).toBeNull();
+  });
+
+  it.each(["request", "response"] as const)("releases a pending %s capture reader on clear without cancelling the original", async (side) => {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const stream = new ReadableStream<Uint8Array>({ start(value) { controller = value; } });
+    const request = side === "request"
+      ? new Request("https://example.invalid/inference", {
+        method: "POST", body: stream, duplex: "half",
+        headers: { "x-ambient-request-id": "pending", "ehbp-encapsulated-key": "sealed" },
+      } as RequestInit)
+      : sealedRequest("pending", new Uint8Array([8]));
+    const upstream = new Response(side === "response" ? stream : new Uint8Array([9]), {
+      headers: { "ehbp-response-nonce": "nonce" },
+    });
+    const captured = { body: null as ReadableStream<Uint8Array> | null };
+    if (side === "request") {
+      const clone = request.clone.bind(request);
+      vi.spyOn(request, "clone").mockImplementation(() => {
+        const value = clone(); captured.body = value.body; return value;
+      });
+    } else {
+      const clone = upstream.clone.bind(upstream);
+      vi.spyOn(upstream, "clone").mockImplementation(() => {
+        const value = clone(); captured.body = value.body; return value;
+      });
+    }
+    const h = host(async () => upstream);
+    const tap = new WireTap();
+    tap.install(h);
+    const response = await h.fetch(request);
+    controller.enqueue(new Uint8Array([1, 2]));
+    await flush();
+    let closed = false;
+    try {
+      expect(captured.body).not.toBeNull();
+      expect(captured.body!.locked).toBe(true);
+      tap.clear();
+      await vi.waitFor(() => expect(captured.body!.locked).toBe(false), { timeout: 250, interval: 5 });
+      controller.enqueue(new Uint8Array([3, 4]));
+      controller.close(); closed = true;
+      const original = side === "request" ? request : response;
+      expect([...new Uint8Array(await original.arrayBuffer())]).toEqual([1, 2, 3, 4]);
+      await flush();
+      expect(tap.get("pending")).toBeNull();
+    } finally {
+      if (!closed) controller.close();
+      if (!request.bodyUsed) await request.arrayBuffer();
+      if (!response.bodyUsed) await response.arrayBuffer();
+    }
+  });
+
+  it("does not clone late response bodies after clear and captures the next generation", async () => {
+    let resolve!: (response: Response) => void;
+    const late = new Promise<Response>(done => { resolve = done; });
+    const h = host(vi.fn().mockReturnValueOnce(late).mockImplementation(async () => new Response("new ciphertext")));
+    const tap = new WireTap(); tap.install(h);
+    const pending = h.fetch(sealedRequest("old", new Uint8Array([1])));
+    tap.clear();
+    const upstream = new Response("old ciphertext");
+    const clone = vi.spyOn(upstream, "clone");
+    resolve(upstream);
+    expect(await (await pending).text()).toBe("old ciphertext");
+    await flush();
+    expect(clone).not.toHaveBeenCalled();
+    expect(tap.get("old")).toBeNull();
+    await h.fetch(sealedRequest("new", new Uint8Array([2])));
+    await vi.waitFor(() => expect(tap.get("new")?.response).toBeTruthy());
+    expect(tap.get("new")?.request.body.base64).toBe("Ag==");
+  });
+
+  it("retains plaintext control-error rejection after clear", async () => {
+    let resolve!: (response: Response) => void;
+    const h = host(() => new Promise<Response>(done => { resolve = done; }));
+    const tap = new WireTap(); tap.install(h);
+    const pending = h.fetch(sealedRequest("late-error", new Uint8Array([1])));
+    const rejection = expect(pending).rejects.toBeInstanceOf(BridgeInsufficientCreditError);
+    tap.clear();
+    resolve(new Response("private upstream error", { status: 402, headers: {
+      "x-ambient-error-code": "INSUFFICIENT_CREDIT", "x-ambient-error-source": "ambient_account",
+    } }));
+    await rejection;
+    expect(tap.get("late-error")).toBeNull();
+  });
+
+  it("does not adopt old traffic when the fetch host clears synchronously", async () => {
+    const tap = new WireTap();
+    const h = host(async () => { tap.clear(); return new Response("ciphertext"); });
+    tap.install(h);
+    const response = await h.fetch(sealedRequest("reentrant", new Uint8Array([1])));
+    expect(await response.text()).toBe("ciphertext");
+    await flush();
+    expect(tap.get("reentrant")).toBeNull();
   });
 
   it("evicts old captures beyond the retention limit", async () => {

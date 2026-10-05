@@ -1,4 +1,10 @@
-import type { SessionGuardCardModel, SessionGuardRow, SessionGuardStatus } from "@ambient/shared";
+import {
+  networkMessage,
+  networkStatusLabel,
+  type SessionGuardCardModel,
+  type SessionGuardRow,
+  type SessionGuardStatus,
+} from "@ambient/shared";
 import type { BridgeServerReachabilityReason, BridgeStatus } from "./bridge-api";
 
 export const BRIDGE_GUARD_ACTION_CHECK_STATUS = "bridge.checkStatus";
@@ -173,10 +179,10 @@ function serverRow(status: BridgeStatus): SessionGuardRow {
 function ipcRow(status: BridgeStatus): SessionGuardRow {
   return {
     detail: status.socketReady
-      ? "Ambient can connect to Bridge over local OS IPC."
-      : "Bridge is creating the local socket Ambient uses.",
+      ? "Ambient is connected to Bridge."
+      : "Preparing the connection to Ambient.",
     id: "ipc",
-    label: "Local Bridge IPC",
+    label: "Connection to Ambient",
     status: status.socketReady ? "ready" : "checking",
     value: status.socketReady ? "Ready" : "Starting",
   };
@@ -188,25 +194,6 @@ function networkTitle(reason: BridgeServerReachabilityReason): string {
   if (reason === "server_error") return "Ambient server is unavailable";
   if (reason === "timeout") return "Server health check timed out";
   return "Bridge cannot reach Ambient server";
-}
-
-function networkStatusLabel(reason: BridgeServerReachabilityReason): string {
-  if (reason === "offline") return "Offline";
-  if (reason === "dns_failure") return "DNS failed";
-  if (reason === "server_error") return "Server down";
-  if (reason === "timeout") return "Timed out";
-  if (reason === "not_checked") return "Not checked";
-  return "Unreachable";
-}
-
-function networkMessage(status: BridgeStatus): string {
-  const detail = status.serverReachabilityMessage?.trim();
-  if (detail) return detail;
-  if (status.serverReachabilityReason === "offline") return "Bridge could not find an internet route to the Ambient server.";
-  if (status.serverReachabilityReason === "dns_failure") return "Bridge could not resolve the Ambient server hostname.";
-  if (status.serverReachabilityReason === "server_error") return "The Ambient server health check did not return a healthy response.";
-  if (status.serverReachabilityReason === "timeout") return "The Ambient server health check took too long to respond.";
-  return "Bridge could not reach the Ambient server.";
 }
 
 function networkNextSteps(reason: BridgeServerReachabilityReason): readonly string[] {

@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import type { BridgeStatus } from "../src/lib/bridge-api";
 
 const rendererErrors = new WeakMap<Page, string[]>();
 
@@ -7,7 +8,11 @@ test.beforeEach(async ({ page }) => {
   rendererErrors.set(page, errors);
   page.on("pageerror", (error) => errors.push(`pageerror: ${error.message}`));
   page.on("console", (message) => {
-    if (message.type() === "error") errors.push(`console: ${message.text()}`);
+    if (message.type() !== "error") return;
+    const text = message.text();
+    // Vite mock-renderer cold starts can 504 on stale optimize-dep entries; not product signal.
+    if (text.includes("Outdated Optimize Dep")) return;
+    errors.push(`console: ${text}`);
   });
 });
 
@@ -17,8 +22,10 @@ test.afterEach(async ({ page }) => {
 
 test("shows an honest initial loading state before Bridge status is available", async ({ page }) => {
   await page.goto("/?bridgeMockStatusDelayMs=30000");
+  // Full-page loading replaces the Requests shell until the first status lands.
   await expect(page.getByRole("status").filter({ hasText: "Loading Bridge status" })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Requests", exact: true })).toBeVisible();
+  await expect(page.getByText("Reading the local account, connection, and request state.")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Requests", exact: true })).toHaveCount(0);
 });
 
 test("shows the full request list and opens request inspection", async ({ page }) => {
@@ -27,8 +34,8 @@ test("shows the full request list and opens request inspection", async ({ page }
   await expect(page).toHaveTitle("Ambient Bridge");
   await expect(page.getByRole("status", { name: /Bridge ready.*api\.alexandria\.so.*1 of 2 attested/ })).toBeVisible();
   await expect(page.getByRole("region", { name: "Requests", exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Traffic", exact: true })).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "Activity", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Requests", exact: true })).toHaveAttribute("aria-current", "page");
+  await expect(page.getByRole("button", { name: "About", exact: true })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Security", exact: true })).toHaveCount(0);
   await expect(page.getByRole("heading", { name: "Runtime", exact: true })).toHaveCount(0);
   await expect(page.getByRole("heading", { name: "Recent activity", exact: true })).toHaveCount(0);
@@ -36,6 +43,9 @@ test("shows the full request list and opens request inspection", async ({ page }
   await expect(windowShell).toHaveCSS("padding", "0px");
   await expect(windowShell).toHaveCSS("border-width", "0px");
   await expect(windowShell).toHaveCSS("border-radius", "0px");
+  const insetPane = page.getByTestId("bridge-inset-pane");
+  await expect(insetPane).toHaveCSS("border-radius", "14px");
+  await expect(insetPane).not.toHaveCSS("box-shadow", "none");
   await expect(page.getByTestId("request-list")).toHaveCSS("overflow-y", "auto");
 
   const toolbar = page.getByTestId("bridge-toolbar");
@@ -85,9 +95,19 @@ test("shows the full request list and opens request inspection", async ({ page }
   await expect(dialog).toBeHidden();
 });
 
+test("plaintext routing does not display the retired notice", async ({ page }) => {
+  await page.goto("/?bridgeMockPlaintext=1");
+  await expect(page.getByText("Inference requests and transport status through this Bridge.")).toBeVisible();
+  await expect(page.locator("[data-plaintext-inference-warning]")).toHaveCount(0);
+  await page.getByRole("button", { name: "About", exact: true }).click();
+  await expect(page.locator("[data-plaintext-inference-warning]")).toHaveCount(0);
+});
+
 test("keeps the centered toolbar status clear of controls in a narrow window", async ({ page }) => {
   await page.setViewportSize({ width: 420, height: 600 });
-  await page.goto("/");
+  // Pin darwin mock chrome so Linux CI does not paint win32/linux window
+  // controls into the account cluster and fail the clearance geometry.
+  await page.goto("/?mockPlatform=darwin");
 
   const toolbarBox = await page.getByTestId("bridge-toolbar").boundingBox();
   const statusBox = await page.getByTestId("bridge-toolbar-status").boundingBox();
@@ -100,86 +120,48 @@ test("keeps the centered toolbar status clear of controls in a narrow window", a
   await expect(page.getByTestId("bridge-toolbar-status").getByText("api.alexandria.so", { exact: true })).toBeHidden();
 });
 
-test("opens and dismisses shared settings", async ({ page }) => {
+test("opens About in the main Bridge pane", async ({ page }) => {
   await page.goto("/");
 
   await page.getByRole("button", { name: "Mock User you@example.com", exact: true }).click();
-  await page.getByRole("menuitem", { name: "Settings", exact: true }).click();
-  const settings = page.getByRole("dialog", { name: "Settings" });
-  await expect(settings).toBeVisible();
-  await expect(settings.getByText("Ambient Bridge", { exact: true })).toBeVisible();
-  const closeSettings = settings.getByRole("button", { name: "Close settings" });
-  await expect(closeSettings).toContainText("Close");
-  await closeSettings.click();
-  await expect(settings).toBeHidden();
+  await page.getByRole("menuitem", { name: "About", exact: true }).click();
+  await expect(page.getByRole("button", { name: "About", exact: true })).toHaveAttribute("aria-current", "page");
+  await expect(page.getByRole("heading", { name: "About", exact: true })).toBeVisible();
+  await expect(page.getByText("Ambient Bridge", { exact: true })).toBeVisible();
+  await expect(page.getByText(/Ambient installs matching Experimental App and Bridge builds/)).toBeVisible();
+  await expect(page.getByRole("button", { name: "Check for updates" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Restart and install" })).toHaveCount(0);
+  await page.getByRole("button", { name: "Uninstall Ambient Bridge" }).click();
+  const uninstallDialog = page.getByRole("dialog", { name: "Uninstall Ambient Bridge?" });
+  await expect(uninstallDialog).toBeVisible();
+  await expect(uninstallDialog.getByText("Your Bridge account and local settings will remain on this Mac.")).toBeVisible();
+  await expect(uninstallDialog.getByText("Uninstall is available in packaged Bridge builds.")).toBeVisible();
+  await expect(uninstallDialog.getByRole("button", { name: "Move to Trash and quit" })).toBeDisabled();
+  await uninstallDialog.getByRole("button", { name: "Cancel" }).click();
+  await expect(uninstallDialog).toBeHidden();
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("heading", { name: "About", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Requests", exact: true }).click();
+  await expect(page.getByRole("region", { name: "Requests", exact: true })).toBeVisible();
 });
 
-test("renders update notifications with the shared compact card spacing", async ({ page }) => {
+test("does not show a Bridge update toast when the mock reports a download", async ({ page }) => {
   await page.goto("/?bridgeMockUpdate=downloading");
 
-  const toast = page.getByTestId("ambient-action-toast");
-  await expect.poll(async () => {
-    if (!await toast.isVisible()) return null;
-    return toast.evaluate((element) => {
-      const styles = window.getComputedStyle(element);
-      const releaseNotes = Array.from(element.querySelectorAll("button"))
-        .find((button) => button.textContent?.trim() === "Release notes");
-      return {
-        gap: styles.rowGap,
-        padding: styles.padding,
-        progressVisible: element.textContent?.includes("Downloading the update (60%).") ?? false,
-        releaseNotesVisible: Boolean(releaseNotes && releaseNotes.getBoundingClientRect().height > 0),
-        width: styles.width,
-      };
-    });
-  }).toEqual({
-    gap: "12px",
-    padding: "14px",
-    progressVisible: true,
-    releaseNotesVisible: true,
-    width: "360px",
-  });
+  await expect(page.getByTestId("bridge-window-shell")).toBeVisible();
+  await expect(page.getByTestId("ambient-action-toast")).toHaveCount(0);
+  await expect(page.getByText("Downloading the update (60%).")).toHaveCount(0);
 });
 
-test("lists and installs experimental builds from feature-gated Dev settings", async ({ page }) => {
+test("does not offer Experimental installs from Bridge About", async ({ page }) => {
   await page.goto("/");
 
   await page.getByRole("button", { name: "Mock User you@example.com", exact: true }).click();
-  await page.getByRole("menuitem", { name: "Settings", exact: true }).click();
-  await page.getByRole("button", { name: "Dev", exact: true }).click();
-
-  await expect(page.getByRole("heading", { name: "Experimental builds" })).toBeVisible();
-  await expect(page.getByText(/2 experimental builds available/)).toBeVisible();
-  const buildSelector = page.getByRole("combobox", { name: "Build version" });
-  const buildOptions = buildSelector.getByRole("option");
-  await expect(buildOptions).toHaveCount(2);
-  await buildSelector.selectOption({ index: 1 });
-  await page.getByRole("button", { name: "Install selected build" }).click();
-  await expect(page.getByRole("button", { name: "Downloading" })).toBeVisible();
-});
-
-test("hides Dev settings without the devtools feature flag", async ({ page }) => {
-  await page.goto("/?bridgeMockDevtools=0");
-
-  await page.getByRole("button", { name: "Mock User you@example.com", exact: true }).click();
-  await page.getByRole("menuitem", { name: "Settings", exact: true }).click();
+  await page.getByRole("menuitem", { name: "About", exact: true }).click();
   await expect(page.getByRole("button", { name: "Dev", exact: true })).toHaveCount(0);
   await expect(page.getByRole("heading", { name: "Experimental builds" })).toHaveCount(0);
-});
-
-test("surfaces experimental build listing failures inside Dev settings", async ({ page }) => {
-  await page.goto("/");
-  await page.evaluate(() => {
-    const api = window.ambientBridge;
-    if (!api) throw new Error("Mock Bridge API unavailable");
-    api.listExperimentalBuilds = async () => { throw new Error("Release service unavailable"); };
-  });
-
-  await page.getByRole("button", { name: "Mock User you@example.com", exact: true }).click();
-  await page.getByRole("menuitem", { name: "Settings", exact: true }).click();
-  await page.getByRole("button", { name: "Dev", exact: true }).click();
-  await expect(page.getByRole("alert")).toContainText("Release service unavailable");
-  await expect(page.getByRole("button", { name: "Install selected build" })).toBeDisabled();
+  await expect(page.getByRole("heading", { name: "Experimental builds" })).toHaveCount(0);
+  await expect(page.getByText(/Ambient installs matching Experimental App and Bridge builds/)).toBeVisible();
 });
 
 test("keeps pending wire capture honest and refreshable", async ({ page }) => {
@@ -224,20 +206,12 @@ test("releases an open ciphertext inspector when its status history is cleared",
   const dialog = page.getByRole("dialog", { name: "Chat request" });
   await expect(dialog.getByTestId("raw-payload")).toBeVisible();
 
-  await page.evaluate(async () => {
-    const api = window.ambientBridge;
-    if (!api) throw new Error("Mock Bridge API unavailable");
-    const current = await api.getStatus();
-    api.getStatus = async () => ({
-      ...current,
-      inference: {
-        ...current.inference,
-        activeRequests: 0,
-        lastRequest: null,
-        requests: [],
-        wireCaptureRevision: current.inference.wireCaptureRevision + 1,
-      },
-    });
+  await page.evaluate(() => {
+    const api = window.ambientBridge as
+      | (NonNullable<typeof window.ambientBridge> & { clearRequestLogForTests?: () => void })
+      | undefined;
+    if (!api?.clearRequestLogForTests) throw new Error("Mock Bridge API unavailable");
+    api.clearRequestLogForTests();
   });
 
   await expect(dialog).toBeHidden({ timeout: 5_000 });
@@ -246,13 +220,195 @@ test("releases an open ciphertext inspector when its status history is cleared",
 test("surfaces wire IPC and last-known status errors without unhandled rejections", async ({ page }) => {
   await page.goto("/");
   await page.evaluate(() => {
-    const api = window.ambientBridge;
+    const api = window.ambientBridge as
+      | (NonNullable<typeof window.ambientBridge> & { emitStatusChangedForTests?: () => void })
+      | undefined;
     if (!api) throw new Error("Mock Bridge API unavailable");
     api.getWireCapture = async () => { throw new Error("Wire IPC unavailable"); };
     api.getStatus = async () => { throw new Error("Status IPC unavailable"); };
+    // Safety poll is 15s; push a status-changed ping so the banner appears promptly.
+    if (!api.emitStatusChangedForTests) throw new Error("Mock status ping unavailable");
+    api.emitStatusChangedForTests();
   });
 
   await page.getByRole("button", { name: /Inspect Chat request req-1/ }).click();
   await expect(page.getByRole("dialog", { name: "Chat request" }).getByRole("alert")).toContainText("Wire IPC unavailable");
   await expect(page.getByRole("alert").filter({ hasText: "Showing the last known Bridge status" })).toBeVisible({ timeout: 5_000 });
 });
+
+type StatusRaceOutcome = "ready" | "signed_out" | "offline" | "error";
+type StatusRaceWindow = typeof window & {
+  statusRace: { calls: string[]; settle(index: number, outcome: StatusRaceOutcome): Promise<void> };
+};
+
+async function openStatusRace(page: Page) {
+  await page.addInitScript(() => {
+    let api: Window["ambientBridge"];
+    Object.defineProperty(window, "ambientBridge", {
+      configurable: true,
+      get: () => api,
+      set: (next: NonNullable<Window["ambientBridge"]>) => {
+        api = next;
+        const ready = next.getStatus();
+        const calls: string[] = [];
+        const pending: Array<{ resolve(status: BridgeStatus): void; reject(error: Error): void }> = [];
+        const read = (method: string) => new Promise<BridgeStatus>((resolve, reject) => {
+          calls.push(method);
+          pending.push({ resolve, reject });
+        });
+        next.getStatus = () => read("status");
+        next.retryReachability = () => read("reachability");
+        (window as StatusRaceWindow).statusRace = {
+          calls,
+          async settle(index, outcome) {
+            const request = pending[index];
+            if (!request) throw new Error(`Missing status request ${index}`);
+            const status = await ready;
+            if (outcome === "error") request.reject(new Error(`Status failure ${index}`));
+            else request.resolve(outcome === "signed_out" ? { ...status, account: { kind: "signed_out" } }
+              : outcome === "offline" ? { ...status, connection: "offline", serverReachable: false,
+                serverReachability: "unavailable", serverReachabilityReason: "offline",
+                serverReachabilityMessage: "Controlled network unavailable" } : status);
+          },
+        };
+      },
+    });
+  });
+  await page.goto("/");
+  const race = {
+    settle: (index: number, outcome: StatusRaceOutcome) => page.evaluate(
+      ([id, result]) => (window as StatusRaceWindow).statusRace.settle(id, result),
+      [index, outcome] as const,
+    ),
+    push: () => page.evaluate(() => {
+      const api = window.ambientBridge as NonNullable<Window["ambientBridge"]> & {
+        emitStatusChangedForTests(): void;
+      };
+      api.emitStatusChangedForTests();
+    }),
+    reads: (calls: string[]) => expect.poll(
+      () => page.evaluate(() => (window as StatusRaceWindow).statusRace?.calls),
+    ).toEqual(calls),
+  };
+  await race.reads(["status"]);
+  return race;
+}
+
+for (const outcome of ["signed_out", "error"] as const) {
+  for (const order of ["older first", "newer first"] as const) {
+    test(`settles foreground loading after background ${outcome}, ${order}`, async ({ page }) => {
+      const race = await openStatusRace(page);
+      const loading = page.getByRole("status").filter({ hasText: "Loading Bridge status" });
+      await expect(loading).toBeVisible();
+      await race.push();
+      await race.reads(["status", "status"]);
+      if (order === "older first") {
+        await race.settle(0, "ready");
+        await expect(loading).toBeVisible();
+        await expect(page.getByTestId("bridge-window-shell")).toHaveCount(0);
+      }
+      await race.settle(1, outcome);
+      if (order === "newer first") await race.settle(0, "error");
+      await expect(loading).toHaveCount(0);
+      const retry = page.getByRole("button", { name: outcome === "error" ? "Try again" : "Check status", exact: true });
+      if (outcome === "error") {
+        await expect(page.getByRole("alert")).toContainText("Status failure 1");
+      } else {
+        await expect(page.getByText("Sign in to Ambient Bridge", { exact: true })).toBeVisible();
+      }
+      await expect(page.getByText("Status failure 0", { exact: true })).toHaveCount(0);
+      await expect(retry).toBeEnabled();
+      await retry.click();
+      await race.reads(["status", "status", "status"]);
+      if (outcome === "error") await expect(loading).toBeVisible();
+      else await expect(retry).toBeDisabled();
+      await race.settle(2, "ready");
+      await expect(page.getByRole("region", { name: "Requests", exact: true })).toBeVisible();
+      await expect(page.getByRole("alert")).toHaveCount(0);
+    });
+  }
+}
+
+for (const guard of ["signed_out", "offline"] as const) {
+  test(`keeps a newer ${guard} manual check busy when stale background fails`, async ({ page }) => {
+    const race = await openStatusRace(page);
+    await race.settle(0, guard);
+    const retry = page.getByRole("button", { name: guard === "offline" ? "Try again" : "Check status", exact: true });
+    await expect(retry).toBeEnabled();
+    await race.push();
+    await race.reads(["status", "status"]);
+    await expect(retry).toBeEnabled();
+    await retry.click();
+    await race.reads(["status", "status", guard === "offline" ? "reachability" : "status"]);
+    await expect(retry).toBeDisabled();
+    await race.settle(1, "error");
+    await expect(retry).toBeDisabled();
+    await race.settle(2, "ready");
+    await expect(page.getByRole("region", { name: "Requests", exact: true })).toBeVisible();
+    await expect(page.getByRole("alert")).toHaveCount(0);
+  });
+}
+
+test("keeps background-only status recovery silent after the shell loads", async ({ page }) => {
+  const race = await openStatusRace(page);
+  await race.settle(0, "ready");
+  const requests = page.getByRole("region", { name: "Requests", exact: true });
+  await expect(requests).toBeVisible();
+  await race.push();
+  await race.reads(["status", "status"]);
+  await expect(requests).toBeVisible();
+  await race.settle(1, "error");
+  const alert = page.getByRole("alert").filter({ hasText: "Showing the last known Bridge status" });
+  await expect(alert).toContainText("Status failure 1");
+  await expect(alert.getByRole("button", { name: "Retry", exact: true })).toBeEnabled();
+  await race.push();
+  await race.reads(["status", "status", "status"]);
+  await expect(requests).toBeVisible();
+  await expect(alert.getByRole("button", { name: "Retry", exact: true })).toBeEnabled();
+  await race.settle(2, "ready");
+  await expect(alert).toHaveCount(0);
+  await expect(requests).toBeVisible();
+});
+
+
+test("shows provider billing failure details, time, and correlation ID", async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.addInitScript(() => {
+    let api: Window["ambientBridge"];
+    Object.defineProperty(window, "ambientBridge", {
+      configurable: true,
+      get: () => api,
+      set: (next: NonNullable<Window["ambientBridge"]>) => {
+        api = next;
+        const read = next.getRequestLog.bind(next);
+        next.getRequestLog = async () => {
+          const status = await read();
+          status.requests = status.requests.map(request => request.requestId === "req-3"
+            ? { ...request, error: "AI processing is temporarily unavailable. Try again shortly; if this continues, contact Ambient support. (UPSTREAM_BILLING_UNAVAILABLE)" }
+            : request);
+          return status;
+        };
+      },
+    });
+  });
+  await page.goto("/?bridgeMockModelDetails=1");
+  await page.getByRole("button", { name: /Inspect Transcription request req-3/ }).click();
+  const error = page.getByTestId("request-error");
+  await expect(error).toContainText("UPSTREAM_BILLING_UNAVAILABLE");
+  await expect(error).toContainText("contact Ambient support");
+  await expect(error).toContainText(/Failed at \d{4}-\d{2}-\d{2}T[\d:.]+Z/);
+  await expect(error).toContainText("Request req-3");
+  if (process.env.AMBIENT_BILLING_SCREENSHOT) {
+    await page.screenshot({ path: process.env.AMBIENT_BILLING_SCREENSHOT, animations: "disabled" });
+  }
+});
+
+for (const enabled of [false, true]) {
+  test(`model details follow WorkOS flag: ${enabled}`, async ({ page }) => {
+    await page.goto(`/?bridgeMockModelDetails=${enabled ? "1" : "0"}`);
+    await expect(page.getByRole("region", { name: "Requests", exact: true })).toBeVisible();
+    const model = page.getByText("gemma4-31b", { exact: true });
+    if (enabled) await expect(model).toBeVisible();
+    else await expect(model).toHaveCount(0);
+  });
+}

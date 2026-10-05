@@ -1,7 +1,8 @@
 import type { AmbientUpdateToastActions, AmbientUpdateToastStatus } from "./index.js";
 
-// One update-notification lifecycle for both Ambient App and Ambient Bridge:
-// startup check, periodic re-check, status dedupe, and remind-later handling.
+// Update-notification lifecycle for Ambient App: startup check, periodic
+// re-check, status dedupe, and remind-later handling. Bridge stays stealth and
+// does not use this controller.
 // The toast layer and the product update API are injected so each renderer
 // stays a thin adapter and the behavior is testable without a DOM app shell.
 
@@ -13,6 +14,7 @@ export type AmbientUpdateControllerStatus = AmbientUpdateToastStatus & {
 export type AmbientUpdateControllerApi = {
   readonly getStatus: () => Promise<AmbientUpdateControllerStatus>;
   readonly check?: () => Promise<AmbientUpdateControllerStatus>;
+  readonly retry?: () => Promise<AmbientUpdateControllerStatus>;
   readonly install?: () => Promise<unknown>;
   readonly viewReleaseNotes?: () => Promise<unknown>;
   readonly onStatusChanged?: (
@@ -37,6 +39,8 @@ export type AmbientUpdateControllerConfig = {
   readonly stableLabelForChannel?: (channel: string) => string;
   /** Skip the startup/periodic check (e.g. while onboarding owns updates). */
   readonly shouldSkipCheck?: () => Promise<boolean>;
+  /** Disable renderer timers when Electron main owns background checks. */
+  readonly scheduleAutomaticChecks?: boolean;
   /** Forwarded on every status change (Bridge mirrors status into its UI). */
   readonly onStatus?: (status: AmbientUpdateControllerStatus) => void;
 };
@@ -84,14 +88,18 @@ export function createUpdateNotificationsController(input: {
 
   const unsubscribe = api.onStatusChanged?.(handleStatus) ?? (() => {});
   void api.getStatus().then(handleStatus).catch(() => undefined);
-  const startupCheck = window.setTimeout(() => {
-    void runCheck({ surfaceErrors: true });
-  }, STARTUP_CHECK_DELAY_MS);
+  const startupCheck = config.scheduleAutomaticChecks === false
+    ? null
+    : window.setTimeout(() => {
+        void runCheck({ surfaceErrors: true });
+      }, STARTUP_CHECK_DELAY_MS);
   // Long-running sessions still learn about new releases; failures here stay
   // quiet — the startup check already surfaces actionable errors.
-  const periodicCheck = window.setInterval(() => {
-    void runCheck({ surfaceErrors: false });
-  }, PERIODIC_CHECK_INTERVAL_MS);
+  const periodicCheck = config.scheduleAutomaticChecks === false
+    ? null
+    : window.setInterval(() => {
+        void runCheck({ surfaceErrors: false });
+      }, PERIODIC_CHECK_INTERVAL_MS);
 
   function renderUpdateToast(status: AmbientUpdateControllerStatus): void {
     if (!shouldShowUpdateToast(status) || reminderActive(status)) {
@@ -105,9 +113,9 @@ export function createUpdateNotificationsController(input: {
             await api.install?.();
           }
         : undefined,
-      retry: api.check
+      retry: (api.retry ?? api.check)
         ? async () => {
-            await api.check?.().then(handleStatus).catch(() => undefined);
+            await (api.retry ?? api.check)?.().then(handleStatus).catch(() => undefined);
           }
         : undefined,
       remindLater: () => {
@@ -146,15 +154,21 @@ export function createUpdateNotificationsController(input: {
 
   return () => {
     disposed = true;
-    window.clearTimeout(startupCheck);
-    window.clearInterval(periodicCheck);
+    if (startupCheck !== null) window.clearTimeout(startupCheck);
+    if (periodicCheck !== null) window.clearInterval(periodicCheck);
     unsubscribe();
   };
 }
 
 function shouldShowUpdateToast(status: AmbientUpdateControllerStatus): boolean {
   if (!status.enabled && !status.updateError) return false;
-  return Boolean(status.downloaded || status.updateAvailable || status.updateError);
+  return Boolean(
+    status.downloaded
+    || status.downloading
+    || status.installing
+    || status.updateAvailable
+    || status.updateError,
+  );
 }
 
 function updateToastSignature(status: AmbientUpdateControllerStatus): string {
@@ -163,10 +177,12 @@ function updateToastSignature(status: AmbientUpdateControllerStatus): string {
     : "";
   return [
     status.channel,
+    status.backgroundCheck === true,
     status.currentVersion,
     status.latestVersion ?? "",
     status.downloaded,
     status.downloading,
+    status.installing === true,
     status.updateAvailable,
     status.updateError ?? "",
     roundedPercent,

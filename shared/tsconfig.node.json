@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    "lib": ["ES2023"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "noEmit": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "target": "ES2023",
+    "types": ["node"]
+  },
+  "include": [
+    "src/feature-flags.ts",
+    "src/macos-trash.ts",
+    "src/update-core.ts",
+    "src/product-version.ts",
+    "src/server-targets.ts",
+    "src/usage.ts",
+    "src/local-secret-vault.ts",
+    "src/window-capture.ts",
+    "src/observability/crash-ring.ts",
+    "src/observability/crash-report-store.ts",
+    "src/observability/index.ts",
+    "src/harness/v2/**/*.ts"
+  ]
+}

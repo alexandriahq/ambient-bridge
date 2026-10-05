@@ -48,12 +48,38 @@ describe("ring audit sink", () => {
 
     const snapshot = ring.snapshot(2_500);
     expect(snapshot.text).toContain('"service":"bridge/electron-main"');
+    expect(snapshot.text).toContain('"annotations"');
+    expect(snapshot.text).not.toContain('"fields"');
     // Sensitive audit fields stay redacted inside the ring lines too.
     expect(snapshot.text).not.toContain("secret-token");
   });
 });
 
 describe("file audit sink rotation", () => {
+  it("writes the same complete structured schema as the Ambient app", async () => {
+    const auditPath = path.join(tempDir(), "bridge-audit.jsonl");
+    const sink = new FileAuditSink(auditPath);
+
+    sink.record("auth.login_failed", { level: "error", token: "secret-token" });
+    await sink.flush();
+
+    const record = JSON.parse(readFileSync(auditPath, "utf8"));
+    expect(record).toMatchObject({
+      level: "ERROR",
+      service: "bridge/electron-main",
+      component: "bridge-auth",
+      pid: process.pid,
+      processType: "bridge-main",
+      message: "auth.login_failed",
+      annotations: { level: "error", token: "[redacted]" },
+    });
+    expect(record.ts).toEqual(expect.any(String));
+    expect(record.threadId).toEqual(expect.any(Number));
+    expect(record).not.toHaveProperty("at");
+    expect(record).not.toHaveProperty("fields");
+    expect(record).not.toHaveProperty("name");
+  });
+
   it("rotates the audit log once it would exceed the size cap", async () => {
     const dir = tempDir();
     const auditPath = path.join(dir, "bridge-audit.jsonl");
@@ -70,7 +96,7 @@ describe("file audit sink rotation", () => {
 });
 
 describe("bridge crash report store", () => {
-  it("writes a marker + window snapshot and lists it pending, newest first", () => {
+  it("writes a marker and window snapshot for local diagnostics", () => {
     const ring = new CrashRing();
     ring.append({
       atMs: 900,
@@ -79,8 +105,9 @@ describe("bridge crash report store", () => {
       message: "inference.forward_failed",
       line: '{"message":"inference.forward_failed"}\n',
     });
+    const dir = path.join(tempDir(), "crashes");
     const store = createBridgeCrashReportStore({
-      dir: path.join(tempDir(), "crashes"),
+      dir,
       window: (nowMs) => ({ text: ring.snapshot(nowMs).text, summary: ring.summary(nowMs) }),
     });
 
@@ -98,11 +125,7 @@ describe("bridge crash report store", () => {
     expect(marker?.windowSummary.recordCount).toBe(1);
     expect(readFileSync(marker!.windowFile, "utf8")).toContain("inference.forward_failed");
 
-    const pending = store.listPending();
-    expect(pending).toHaveLength(1);
-    expect(pending[0].id).toBe(marker?.id);
-
-    store.delete(marker!.id);
-    expect(store.listPending()).toHaveLength(0);
+    const persisted = JSON.parse(readFileSync(path.join(dir, `${marker!.id}.crash.json`), "utf8"));
+    expect(persisted).toEqual(marker);
   });
 });

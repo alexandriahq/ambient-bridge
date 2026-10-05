@@ -1,13 +1,13 @@
 @import "tailwindcss";
-@import "tw-animate-css";
-@import "@ambient/shared/design/app.css";
-@source "../shared/src/design";
+@import "@ambient/shared/theme.css";
+@source "../shared/src/ui";
+@source "../shared/src/components";
 @source "../shared/src/notifications";
 
 /*
- * Bridge renderer — app-shell chrome only. The design language (colors, type,
- * radius, dark variant) is owned by @ambient/shared/design and imported above;
- * components read its semantic tokens.
+ * Bridge renderer — app-shell chrome only. The design language (Maia-standard
+ * tokens + Ambient palette, type, radius, dark variant) is owned by
+ * @ambient/shared/theme.css and imported above; components read its tokens.
  * Only genuinely-global window chrome that isn't expressible as component
  * utility classes lives here.
  */

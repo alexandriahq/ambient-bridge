@@ -1,3 +1,5 @@
+import { isAmbientSilentLaunch } from "@ambient/shared/silent-mode";
+
 export const BRIDGE_BACKGROUND_LAUNCH_ARG = "--ambient-bridge-background";
 export const BRIDGE_SHOW_LAUNCH_ARG = "--ambient-bridge-show";
 
@@ -24,10 +26,11 @@ type BridgeLoginItemSettings = {
 
 export type BridgeLaunchDecisionReason =
   | "background_arg"
+  | "default_hidden"
   | "env_background"
   | "explicit_arg"
-  | "explicit_launch"
-  | "login_item";
+  | "login_item"
+  | "silent";
 
 export type BridgeLaunchDecision = {
   readonly mode: "background" | "show";
@@ -35,10 +38,8 @@ export type BridgeLaunchDecision = {
 };
 
 export type BridgeLifecycleWindowState = "not_created" | "hidden" | "visible";
-export type BridgeLifecycleAuthWindowState = "hidden" | "visible";
 
 export type BridgeLifecycleState = {
-  readonly authWindow: BridgeLifecycleAuthWindowState;
   readonly mainWindow: BridgeLifecycleWindowState;
   readonly quitting: boolean;
   readonly services: "background_running";
@@ -63,6 +64,7 @@ export type BridgeKeyboardInput = {
 };
 
 export type BridgeWindowLike = {
+  destroy?(): void;
   focus(): void;
   hide(): void;
   isDestroyed(): boolean;
@@ -95,8 +97,20 @@ export function resolveBridgeLaunchDecision(input: {
   readonly env?: BridgeEnvironment;
   readonly loginItemSettings?: BridgeLoginItemSettings;
 }): BridgeLaunchDecision {
+  // Silent wins over every reveal request: managed deployments must never
+  // surface Bridge UI, even when a wrapper passes a show arg.
+  if (isAmbientSilentLaunch(input)) {
+    return { mode: "background", reason: "silent" };
+  }
+
   const args = normalizedArgs(input.argv);
   if (args.some((arg) => SHOW_LAUNCH_ARGS.has(arg))) {
+    return { mode: "show", reason: "explicit_arg" };
+  }
+
+  // Omarchy / Linux helpers use env to reveal without threading Electron argv
+  // through pnpm/dev wrappers.
+  if (isTruthy(input.env?.AMBIENT_BRIDGE_SHOW)) {
     return { mode: "show", reason: "explicit_arg" };
   }
 
@@ -112,11 +126,28 @@ export function resolveBridgeLaunchDecision(input: {
     return { mode: "background", reason: "login_item" };
   }
 
-  return { mode: "show", reason: "explicit_launch" };
+  // Cold start (Finder / Start menu / `pnpm ambient:dev:bridge`) stays in the tray /
+  // menu bar. Reveal via tray click, activate, or `--ambient-bridge-show`.
+  return { mode: "background", reason: "default_hidden" };
 }
 
 export function shouldOpenMainWindowOnLaunch(decision: BridgeLaunchDecision): boolean {
   return decision.mode === "show";
+}
+
+/** Bridge never uses Chromium GPU. Open uses software compositing. */
+export function shouldDisableHardwareAcceleration(): boolean {
+  return true;
+}
+
+/** True when a launch asked to stay headless (env/arg/login), not merely the default. */
+export function isExplicitBackgroundLaunch(decision: BridgeLaunchDecision): boolean {
+  return (
+    decision.reason === "background_arg"
+    || decision.reason === "env_background"
+    || decision.reason === "login_item"
+    || decision.reason === "silent"
+  );
 }
 
 export function bridgeBackgroundLoginItemArgs(existingArgs: readonly string[] = []): string[] {
@@ -125,29 +156,6 @@ export function bridgeBackgroundLoginItemArgs(existingArgs: readonly string[] = 
     return !BACKGROUND_LAUNCH_ARGS.has(normalized) && !SHOW_LAUNCH_ARGS.has(normalized);
   });
   return [...args, BRIDGE_BACKGROUND_LAUNCH_ARG];
-}
-
-export function bridgeLoginItemSettings(input: {
-  readonly execPath?: string;
-  readonly openAtLogin: boolean;
-  readonly platform: NodeJS.Platform;
-}): {
-  readonly args?: string[];
-  readonly openAsHidden?: boolean;
-  readonly openAtLogin: boolean;
-  readonly path?: string;
-} {
-  if (input.platform === "darwin") {
-    return { openAsHidden: true, openAtLogin: input.openAtLogin };
-  }
-  if (input.platform === "win32") {
-    return {
-      args: bridgeBackgroundLoginItemArgs(),
-      openAtLogin: input.openAtLogin,
-      ...(input.execPath ? { path: input.execPath } : {}),
-    };
-  }
-  return { openAtLogin: input.openAtLogin };
 }
 
 export function bridgeLoginItemSettingsOptions(input: {
@@ -161,12 +169,12 @@ export function bridgeLoginItemSettingsOptions(input: {
   };
 }
 
-export function macBridgeActivationPolicy(): "accessory" {
-  return "accessory";
+export function macBridgeActivationPolicy(state: "background" | "visible"): "accessory" | "regular" {
+  return state === "visible" ? "regular" : "accessory";
 }
 
-export function shouldHideMacDock(platform: NodeJS.Platform): boolean {
-  return platform === "darwin";
+export function shouldShowMacDock(platform: NodeJS.Platform, state: "background" | "visible"): boolean {
+  return platform === "darwin" && state === "visible";
 }
 
 export function windowsSkipTaskbarForWindowState(
@@ -190,9 +198,9 @@ export function isQuitAccelerator(input: BridgeKeyboardInput, platform: NodeJS.P
 }
 
 export class BridgeWindowLifecycleController {
-  private authWindowState: BridgeLifecycleAuthWindowState = "hidden";
   private mainWindow: BridgeWindowLike | undefined;
   private mainWindowState: BridgeLifecycleWindowState = "not_created";
+  private createWindowPromise: Promise<BridgeWindowLike> | undefined;
   private quitting = false;
 
   constructor(private readonly options: BridgeWindowLifecycleControllerOptions) {}
@@ -226,22 +234,18 @@ export class BridgeWindowLifecycleController {
       this.setMainWindowState("not_created");
       return;
     }
+    // Destroy the BrowserWindow so tray-only Bridge does not keep a warm
+    // Chromium renderer resident. showMainWindow() recreates it lazily.
     setWindowsTaskbarVisibility(this.options.platform, window, "hidden");
-    window.hide();
     this.options.deactivateApp?.();
+    if (typeof window.destroy === "function") {
+      window.destroy();
+      // `closed` clears the handle; keep state honest if destroy is sync.
+      if (this.liveWindow() === null) this.setMainWindowState("not_created");
+      return;
+    }
+    window.hide();
     this.setMainWindowState("hidden");
-  }
-
-  markAuthWindowVisible(): void {
-    if (this.authWindowState === "visible") return;
-    this.authWindowState = "visible";
-    this.emitStateChange();
-  }
-
-  markAuthWindowHidden(): void {
-    if (this.authWindowState === "hidden") return;
-    this.authWindowState = "hidden";
-    this.emitStateChange();
   }
 
   prepareForQuit(): void {
@@ -257,6 +261,20 @@ export class BridgeWindowLifecycleController {
   }
 
   private async ensureMainWindow(): Promise<BridgeWindowLike> {
+    const existing = this.liveWindow();
+    if (existing) return existing;
+    // createWindow awaits renderer loadURL in Electron; tray click + double-click,
+    // second-instance reveal, and auth completion can overlap that await in dev
+    // and otherwise spawn two main windows. Coalesce creators onto one promise.
+    if (!this.createWindowPromise) {
+      this.createWindowPromise = this.createMainWindow().finally(() => {
+        this.createWindowPromise = undefined;
+      });
+    }
+    return this.createWindowPromise;
+  }
+
+  private async createMainWindow(): Promise<BridgeWindowLike> {
     const existing = this.liveWindow();
     if (existing) return existing;
 
@@ -302,7 +320,6 @@ export class BridgeWindowLifecycleController {
 
   private snapshot(): BridgeLifecycleState {
     return {
-      authWindow: this.authWindowState,
       mainWindow: this.mainWindowState,
       quitting: this.quitting,
       services: "background_running",

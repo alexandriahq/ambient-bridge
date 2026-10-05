@@ -15,6 +15,8 @@ export type BridgeRequestFrame = {
   method: string;
   payload?: JsonValue;
   auth?: BridgeRequestAuth;
+  /** W3C trace context. Correlation only; never included in request signing. */
+  traceparent?: string;
 };
 
 export type BridgeResponseFrame = {
@@ -60,6 +62,7 @@ export type BridgeRequestAuth = {
 };
 
 const HEADER_BYTES = 4;
+const EMPTY_BUFFER = Buffer.alloc(0);
 const BINARY_FRAME_MAGIC = Buffer.from("AMBBIN1\n", "ascii");
 const BINARY_HEADER_BYTES = BINARY_FRAME_MAGIC.length + 4;
 const DEFAULT_MAX_FRAME_BYTES = 8 * 1024 * 1024;
@@ -81,19 +84,39 @@ export function encodeBinaryFrame(frame: BridgeBinaryFrame): Buffer {
   const bodyHeader = Buffer.allocUnsafe(BINARY_HEADER_BYTES);
   BINARY_FRAME_MAGIC.copy(bodyHeader, 0);
   bodyHeader.writeUInt32BE(binaryHeader.byteLength, BINARY_FRAME_MAGIC.length);
-  const body = Buffer.concat([bodyHeader, binaryHeader, frame.bytes]);
   const header = Buffer.allocUnsafe(HEADER_BYTES);
-  header.writeUInt32BE(body.length, 0);
-  return Buffer.concat([header, body]);
+  header.writeUInt32BE(bodyHeader.length + binaryHeader.length + frame.bytes.length, 0);
+  return Buffer.concat([header, bodyHeader, binaryHeader, frame.bytes]);
 }
 
 export class FrameDecoder {
-  private buffer = Buffer.alloc(0);
+  private buffer = EMPTY_BUFFER;
+  private storage = this.buffer;
+  private shared = false;
 
   constructor(private readonly maxFrameBytes = DEFAULT_MAX_FRAME_BYTES) {}
 
   push(chunk: Buffer): BridgeFrame[] {
-    this.buffer = Buffer.concat([this.buffer, chunk]);
+    const pendingLength = this.buffer.length;
+    const length = pendingLength + chunk.length;
+    // Grow geometrically: fragmented uploads should copy each byte a bounded
+    // number of times. Binary results own their backing buffer, so detach it
+    // before the next append can compact or overwrite retained frame bytes.
+    const consumedPrefix = this.buffer.byteOffset !== this.storage.byteOffset;
+    const releaseExcess = consumedPrefix && this.storage.length > length * 4;
+    if (this.shared || releaseExcess || this.storage.length < length) {
+      const capacity = this.shared || releaseExcess
+        ? length
+        : Math.max(length, this.storage.length * 2);
+      const storage = Buffer.allocUnsafe(capacity);
+      this.buffer.copy(storage);
+      this.storage = storage;
+    } else if (pendingLength > 0 && consumedPrefix) {
+      this.buffer.copy(this.storage);
+    }
+    chunk.copy(this.storage, pendingLength);
+    this.buffer = this.storage.length === length ? this.storage : this.storage.subarray(0, length);
+    this.shared = false;
     const frames: BridgeFrame[] = [];
 
     while (this.buffer.length >= HEADER_BYTES) {
@@ -109,9 +132,15 @@ export class FrameDecoder {
 
       const body = this.buffer.subarray(HEADER_BYTES, totalLength);
       this.buffer = this.buffer.subarray(totalLength);
-      frames.push(parseWireFrame(body));
+      const frame = parseWireFrame(body);
+      if (frame.type === "binary") this.shared = true;
+      frames.push(frame);
     }
 
+    if (this.buffer.length === 0) {
+      this.storage = this.buffer = EMPTY_BUFFER;
+      this.shared = false;
+    }
     return frames;
   }
 }
@@ -177,7 +206,8 @@ function isValidFrame(frame: BridgeFrame): frame is Exclude<BridgeFrame, BridgeB
         && typeof frame.method === "string"
         && frame.method.length > 0
         && optionalJsonValue(frame.payload)
-        && optionalAuth(frame.auth);
+        && optionalAuth(frame.auth)
+        && optionalTraceparent(frame.traceparent);
     case "response":
       return typeof frame.id === "string"
         && frame.id.length > 0
@@ -202,6 +232,14 @@ function isValidFrame(frame: BridgeFrame): frame is Exclude<BridgeFrame, BridgeB
     default:
       return false;
   }
+}
+
+function optionalTraceparent(value: string | undefined): boolean {
+  return value === undefined || (
+    /^00-[a-f0-9]{32}-[a-f0-9]{16}-(00|01)$/.test(value)
+    && !/^00-0{32}-/.test(value)
+    && !/-0{16}-(00|01)$/.test(value)
+  );
 }
 
 function optionalAuth(auth: BridgeRequestAuth | undefined): boolean {

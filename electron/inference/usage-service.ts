@@ -1,9 +1,11 @@
 import { Effect } from "effect";
 import type { UsageReservationResponse, UsageSummary } from "@ambient/shared/usage";
+import { GLOBALLY_DISABLED_PREFIX } from "@alexandria/cloud-contract";
 import { AuthServerClient, AuthServerUsageError } from "../auth/server-client.js";
 import type { SignedInWorkOsSession } from "../workos/session.js";
 import { errorMessage } from "../error-message.js";
 import {
+  BridgeGloballyDisabledError,
   BridgeInferenceServiceError,
   BridgeInsufficientCreditError,
   BridgeUsageRequestError,
@@ -20,6 +22,7 @@ export interface BridgeUsageService {
   }) => Effect.Effect<
     UsageReservationResponse,
     BridgeInferenceServiceError
+      | BridgeGloballyDisabledError
       | BridgeInsufficientCreditError
       | BridgeUsageAccountingDisabledError
       | BridgeUsageRequestError
@@ -29,6 +32,9 @@ export interface BridgeUsageService {
     reservationId: string,
   ) => Effect.Effect<void, BridgeUsageRequestError>;
 }
+
+/** Account-side refusals: the account cannot pay right now (ADR-0243). */
+const ACCOUNT_REFUSAL_CODES: ReadonlySet<string> = new Set(["INSUFFICIENT_CREDIT", "SPENDING_LIMIT_REACHED", "BILLING_PAST_DUE"]);
 
 export class BridgeUsageAccountingDisabledError extends Error {
   constructor() {
@@ -47,8 +53,11 @@ export function createBridgeUsageService(client: AuthServerClient): BridgeUsageS
         modelId: input.modelId,
       }),
       catch: (cause) => {
-        if (cause instanceof AuthServerUsageError && cause.code === "INSUFFICIENT_CREDIT") {
+        if (cause instanceof AuthServerUsageError && ACCOUNT_REFUSAL_CODES.has(cause.code)) {
           return new BridgeInsufficientCreditError(cause.summary, cause.status);
+        }
+        if (isGloballyDisabledUsageError(cause)) {
+          return new BridgeGloballyDisabledError(cause.serverMessage.slice(0, 400), cause.status);
         }
         if (cause instanceof AuthServerUsageError
           && cause.code === "USAGE_UNAVAILABLE"
@@ -58,17 +67,24 @@ export function createBridgeUsageService(client: AuthServerClient): BridgeUsageS
         if (cause instanceof AuthServerUsageError && cause.code === "USAGE_UNAVAILABLE" && cause.status >= 500) {
           return new BridgeInferenceServiceError("UPSTREAM_BILLING_UNAVAILABLE", cause.status, 60);
         }
-        return new BridgeUsageRequestError(`Inference credit reservation failed: ${safeUsageError(cause)}`, cause);
+        return new BridgeUsageRequestError(`Inference authorization failed: ${safeUsageError(cause)}`, cause);
       },
     }),
     release: (session, reservationId) => Effect.tryPromise({
       try: async () => { await client.releaseUsage(session.sessionToken, reservationId); },
       catch: (cause) => new BridgeUsageRequestError(
-        `Inference credit reservation release failed: ${safeUsageError(cause)}`,
+        `Inference authorization cleanup failed: ${safeUsageError(cause)}`,
         cause,
       ),
     }),
   };
+}
+
+/** Legacy `/usage/reservations` refusal of a globally disabled provider or model (ADR-0296). */
+export function isGloballyDisabledUsageError(error: unknown): error is AuthServerUsageError {
+  return error instanceof AuthServerUsageError
+    && error.code === "BILLING_FORBIDDEN"
+    && error.serverMessage.startsWith(GLOBALLY_DISABLED_PREFIX);
 }
 
 function safeUsageError(error: unknown): string {

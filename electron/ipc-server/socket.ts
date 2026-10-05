@@ -24,21 +24,24 @@ export type IpcHandlerContext = {
   readBinaryUpload: (options?: BinaryUploadReadOptions) => Promise<Buffer>;
   /** Resolves when the requesting socket closes; lets long-lived streams end. */
   socketClosed?: Promise<void>;
+  /** Validated W3C trace context propagated by the Ambient desktop client. */
+  traceparent?: string;
 };
 export type IpcMethodHandler = (frame: BridgeRequestFrame, context: IpcHandlerContext) => IpcHandlerResult | Promise<IpcHandlerResult>;
 export type IpcWritable = Pick<Socket, "write">
   & Partial<Pick<Socket, "destroyed" | "writableEnded" | "once" | "off">>;
 
 export type BinaryUploadReadOptions = {
+  readonly signal?: AbortSignal;
   readonly expectedByteLength?: number;
   readonly expectedSha256?: string;
   readonly maxBytes?: number;
 };
 
 // Binary uploads are buffered in memory until the owning handler reads them.
-// The only upload type today (audio transcription) is capped at 6 MiB by its
-// signed metadata; this server-level ceiling bounds buffering for any upload
-// before a handler enforces its own limit.
+// Audio transcription is capped at 6 MiB by its signed metadata and raw
+// capture segments at 16 MiB; this server-level ceiling bounds buffering for
+// any upload before a handler enforces its own limit.
 const MAX_BINARY_UPLOAD_BYTES = 16 * 1024 * 1024;
 const MAX_BINARY_UPLOADS_PER_SOCKET = 4;
 
@@ -207,7 +210,7 @@ export class BridgeIpcServer {
       return;
     }
 
-    this.options.audit.record("ipc.request", { method: frame.method });
+    const requestStartedAtMs = Date.now();
 
     let credentialId: string | undefined;
     if (!this.publicMethods.has(frame.method)) {
@@ -224,6 +227,14 @@ export class BridgeIpcServer {
 
       if (!auth.ok) {
         this.options.audit.record("ipc.unauthorized", { method: frame.method, reason: auth.reason });
+        this.options.audit.record("ipc.request_complete", {
+          method: frame.method,
+          traceId: traceIdFromTraceparent(frame.traceparent),
+          status: "unauthorized",
+          authMs: Math.max(0, Date.now() - requestStartedAtMs),
+          handlerAndWriteMs: 0,
+          durationMs: Math.max(0, Date.now() - requestStartedAtMs),
+        });
         socket.write(encodeFrame({ type: "error", id: frame.id, code: auth.reason, message: "Unauthorized" }));
         return;
       }
@@ -231,8 +242,9 @@ export class BridgeIpcServer {
     }
 
     let binaryUploadOpened = false;
+    let handlerStartedAtMs: number | null = null;
     try {
-      if (frame.method === "inference.audioTranscriptions") {
+      if (frame.method === "inference.audioTranscriptions" || frame.method === "multiplayer.rawCaptureUpload") {
         this.openBinaryUpload(binaryUploads, frame.id);
         binaryUploadOpened = true;
       }
@@ -240,18 +252,37 @@ export class BridgeIpcServer {
         credentialId,
         readBinaryUpload: (options) => this.readBinaryUpload(binaryUploads, frame.id, options),
         socketClosed,
+        traceparent: frame.traceparent,
       };
+      handlerStartedAtMs = Date.now();
       const result = await handler(frame, context);
-      await writeIpcHandlerResult({
+      const resultStatus = await writeIpcHandlerResult({
         audit: this.options.audit,
         frame,
         result,
         socket,
       });
+      this.options.audit.record("ipc.request_complete", {
+        method: frame.method,
+        traceId: traceIdFromTraceparent(frame.traceparent),
+        status: resultStatus,
+        authMs: Math.max(0, handlerStartedAtMs - requestStartedAtMs),
+        handlerAndWriteMs: Math.max(0, Date.now() - handlerStartedAtMs),
+        durationMs: Math.max(0, Date.now() - requestStartedAtMs),
+      });
     } catch (error) {
       this.options.audit.record("ipc.handler_error", {
         message: errorMessage(error),
         method: frame.method,
+        traceId: traceIdFromTraceparent(frame.traceparent),
+      });
+      this.options.audit.record("ipc.request_complete", {
+        method: frame.method,
+        traceId: traceIdFromTraceparent(frame.traceparent),
+        status: "failure",
+        authMs: Math.max(0, (handlerStartedAtMs ?? Date.now()) - requestStartedAtMs),
+        handlerAndWriteMs: handlerStartedAtMs === null ? 0 : Math.max(0, Date.now() - handlerStartedAtMs),
+        durationMs: Math.max(0, Date.now() - requestStartedAtMs),
       });
       socket.write(encodeFrame({
         type: "error",
@@ -316,13 +347,19 @@ export class BridgeIpcServer {
   ): Promise<Buffer> {
     const upload = binaryUploads.get(id);
     if (!upload) return Promise.reject(new Error("Binary upload was not opened for this IPC request."));
+    const onAbort = () => this.failBinaryUpload(upload, options.signal?.reason instanceof Error
+      ? options.signal.reason : new Error(String(options.signal?.reason ?? "Binary upload cancelled.")));
+    if (options.signal?.aborted) onAbort();
     if (options.maxBytes !== undefined && upload.bytes > options.maxBytes) {
       this.failBinaryUpload(upload, new Error(`Binary upload exceeds ${options.maxBytes} bytes.`));
     }
     if (upload.error) return Promise.reject(upload.error);
     if (upload.ended) return Promise.resolve(this.finishBinaryUpload(upload, options));
     return new Promise<Buffer>((resolve, reject) => {
-      upload.waiters.push({ options, reject, resolve });
+      upload.waiters.push({ options, reject, resolve,
+        dispose: () => options.signal?.removeEventListener("abort", onAbort),
+      });
+      options.signal?.addEventListener("abort", onAbort, { once: true });
     });
   }
 
@@ -330,6 +367,7 @@ export class BridgeIpcServer {
     if (!upload.ended && !upload.error) return;
     const waiters = upload.waiters.splice(0);
     for (const waiter of waiters) {
+      waiter.dispose();
       if (upload.error) {
         waiter.reject(upload.error);
       } else {
@@ -435,6 +473,10 @@ export class BridgeIpcServer {
   }
 }
 
+function traceIdFromTraceparent(value: string | undefined): string | null {
+  return value?.split("-")[1] ?? null;
+}
+
 type BinaryUploadState = {
   bytes: number;
   chunks: Buffer[];
@@ -443,6 +485,7 @@ type BinaryUploadState = {
   expectedSeq: number;
   waiters: Array<{
     options: BinaryUploadReadOptions;
+    dispose: () => void;
     resolve: (value: Buffer) => void;
     reject: (error: unknown) => void;
   }>;
@@ -453,33 +496,36 @@ export async function writeIpcHandlerResult(input: {
   readonly frame: Pick<BridgeRequestFrame, "id" | "method">;
   readonly result: IpcHandlerResult;
   readonly socket: IpcWritable;
-}): Promise<void> {
+}): Promise<"success" | "failure" | "cancelled"> {
   if (!isAsyncIterable(input.result)) {
-    input.audit.record("ipc.response", { method: input.frame.method });
     try {
       await writeIpcFrame(input.socket, { type: "response", id: input.frame.id, payload: input.result });
     } catch (error) {
       if (error instanceof IpcSocketClosedError) {
         input.audit.record("ipc.response_cancelled", { method: input.frame.method, reason: "connection_closed" });
-        return;
+        return "cancelled";
       }
       throw error;
     }
-    return;
+    return "success";
   }
 
-  input.audit.record("ipc.stream_start", { method: input.frame.method });
+  let iterator: AsyncIterator<JsonValue | undefined> | undefined;
+  let ended = false;
   try {
+    iterator = input.result[Symbol.asyncIterator]();
     await writeIpcFrame(input.socket, { type: "stream", id: input.frame.id, event: "start" });
-    for await (const payload of input.result) {
-      await writeIpcFrame(input.socket, { type: "stream", id: input.frame.id, event: "delta", payload });
+    while (true) {
+      const item = await iterator.next();
+      if (item.done) { ended = true; break; }
+      await writeIpcFrame(input.socket, { type: "stream", id: input.frame.id, event: "delta", payload: item.value });
     }
-    input.audit.record("ipc.stream_end", { method: input.frame.method });
     await writeIpcFrame(input.socket, { type: "stream", id: input.frame.id, event: "end" });
+    return "success";
   } catch (error) {
     if (error instanceof IpcSocketClosedError) {
       input.audit.record("ipc.stream_cancelled", { method: input.frame.method, reason: "connection_closed" });
-      return;
+      return "cancelled";
     }
     input.audit.record("ipc.stream_error", { method: input.frame.method, message: errorMessage(error) });
     try {
@@ -491,6 +537,13 @@ export async function writeIpcHandlerResult(input: {
       });
     } catch (writeError) {
       if (!(writeError instanceof IpcSocketClosedError)) throw writeError;
+    }
+    return "failure";
+  } finally {
+    // A failed stream-start write still owns the eagerly admitted iterator.
+    // Cleanup errors cannot replace a socket/handler failure already reported.
+    if (!ended) {
+      try { await iterator?.return?.(); } catch { /* Primary outcome wins. */ }
     }
   }
 }
@@ -571,6 +624,20 @@ const PUBLIC_HANDLER_ERROR_CODES = new Set([
   "INSUFFICIENT_CREDIT",
   "UPSTREAM_BILLING_UNAVAILABLE",
   "UPSTREAM_ENVELOPE_UNAVAILABLE",
+  "authentication_required",
+  "principal_forbidden",
+  "policy_denied",
+  "plaintext_not_enabled",
+  "assurance_unavailable",
+  "attestation_failed",
+  "key_expired",
+  "grant_expired",
+  "replay_detected",
+  "credit_exhausted",
+  "capacity_exhausted",
+  "provider_unavailable",
+  "deadline_exceeded",
+  "request_cancelled",
 ]);
 
 function safeHandlerErrorCode(error: unknown, depth = 0): string {

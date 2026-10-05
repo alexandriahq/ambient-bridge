@@ -1,0 +1,720 @@
+/*
+ * Consumed as source via @ambient/shared/theme.css. Each app owns
+ * `@import "tailwindcss"` (so Tailwind's content detection roots at the app);
+ * this file contributes the design tokens, base and component/utility layers,
+ * offline fonts, and the shared registry support import.
+ *
+ * Token contract = Maia / shadcn-svelte standard (full oklch colors on
+ * `--background` / `--foreground` / …, `--color-*` aliases via `var(--*)`),
+ * filled with Ambient’s Bauhaus / Codex palette, Inter + mark faces, and the
+ * Ambient semantic names (`--ink` / `--surface` / `--line` / …) used by App
+ * and Bridge call sites.
+ */
+@import '@fontsource-variable/inter';
+@import '@fontsource/jetbrains-mono/400.css';
+@import '@fontsource/jetbrains-mono/500.css';
+@import '@fontsource/jetbrains-mono/600.css';
+@import '@fontsource/stix-two-text/400.css';
+@import '@fontsource/stix-two-text/500.css';
+@import './registry.css';
+
+/*
+  ─────────────────────────────────────────────────────────────
+  Ambient design · Maia token standard
+  Frosted sidebar · rounded inset content · no status bar.
+  No primary hue. Dark is Codex grey, not black. The only colour
+  is the Ambient brand wash (Logseq teal / navy, orange marker dot),
+  and only inside the capture card.
+  ─────────────────────────────────────────────────────────────
+*/
+
+@theme {
+	/* Inter = UI copy, labels, shortcuts. JetBrains = machine tokens
+	   (IDs, paths, hosts, model slugs, payloads). Tailwind preflight maps
+	   code/kbd/samp/pre to --font-mono; product <kbd> is overridden to sans
+	   below because shortcuts are chrome, not data. Mark face is STIX. */
+	--font-sans:
+		'Inter Variable', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+	--font-mono:
+		'JetBrains Mono', ui-monospace, 'SF Mono', 'Menlo', 'Cascadia Code', monospace;
+	--font-serif: 'Georgia', 'Times New Roman', ui-serif, serif;
+	--font-mark: 'STIX Two Text', 'Georgia', 'Times New Roman', serif;
+
+	--text-2xs: 0.6875rem;
+	--text-2xs--line-height: 1rem;
+	--text-xs: 0.75rem;
+	--text-xs--line-height: 1.05rem;
+	--text-sm: 0.8125rem;
+	--text-sm--line-height: 1.25rem;
+	--text-base: 0.875rem;
+	--text-base--line-height: 1.4rem;
+	--text-md: 0.9375rem;
+	--text-md--line-height: 1.5rem;
+	--text-lg: 1.0625rem;
+	--text-lg--line-height: 1.55rem;
+	--text-xl: 1.375rem;
+	--text-xl--line-height: 1.75rem;
+	--text-2xl: 1.75rem;
+	--text-2xl--line-height: 2.05rem;
+	--text-3xl: 2.375rem;
+	--text-3xl--line-height: 2.55rem;
+
+	/* Ambient absolute radius scale (product). `--radius` below anchors Maia calcs. */
+	--radius-xs: 6px;
+	--radius-sm: 8px;
+	--radius-md: 10px;
+	--radius-lg: 14px;
+	--radius-xl: 18px;
+	--radius-2xl: 24px;
+	--radius-3xl: 30px;
+	--radius-4xl: 36px;
+
+	--ease-out-quint: cubic-bezier(0.22, 1, 0.36, 1);
+	--ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+/* `.theme-light` re-applies the light tokens inside a dark subtree (e.g. the
+   app preview shown on the always-dark onboarding). */
+:root,
+.theme-light {
+	/* Ambient semantics — full oklch (Maia standard), Bauhaus greys */
+	--bg: oklch(0.981 0 0);
+	--surface: oklch(1 0 0);
+	--surface-2: oklch(0.973 0 0);
+	--elevated: oklch(1 0 0);
+	--sidebar: oklch(0.981 0 0);
+
+	--ink: oklch(0.204 0 0);
+	--ink-secondary: oklch(0.474 0 0);
+	--ink-tertiary: oklch(0.615 0 0);
+	--ink-faint: oklch(0.716 0 0);
+
+	--line: oklch(0.927 0 0);
+	--line-strong: oklch(0.877 0 0);
+
+	--primary: oklch(0.204 0 0);
+	--on-primary: oklch(1 0 0);
+
+	--ring: oklch(0.418 0 0);
+	--scrim: oklch(0 0 0);
+	--success: oklch(0.636 0.136 157.8);
+	--warning: oklch(0.770 0.165 70.6);
+	--danger: oklch(0.579 0.214 27.2);
+	--info: oklch(0.600 0.180 254.6);
+
+	/* Maia / shadcn primitive names → Ambient values (full colors) */
+	--background: var(--bg);
+	--foreground: var(--ink);
+	--card: var(--surface);
+	--card-foreground: var(--ink);
+	--popover: var(--elevated);
+	--popover-foreground: var(--ink);
+	--primary-foreground: var(--on-primary);
+	--secondary: var(--surface-2);
+	--secondary-foreground: var(--ink);
+	--muted: var(--surface-2);
+	--muted-foreground: var(--ink-secondary);
+	--accent: var(--surface-2);
+	--accent-foreground: var(--ink);
+	--destructive: var(--danger);
+	--border: var(--line);
+	--input: var(--line);
+	--chart-1: var(--ink);
+	--chart-2: var(--ink-secondary);
+	--chart-3: var(--ink-tertiary);
+	--chart-4: var(--line-strong);
+	--chart-5: var(--line);
+	--sidebar-foreground: var(--ink);
+	--sidebar-primary: var(--primary);
+	--sidebar-primary-foreground: var(--on-primary);
+	--sidebar-accent: var(--surface-2);
+	--sidebar-accent-foreground: var(--ink);
+	--sidebar-border: var(--line);
+	--sidebar-ring: var(--ring);
+	--radius: 0.625rem;
+
+	color-scheme: light;
+}
+
+.dark {
+	/* Codex greys */
+	--bg: oklch(0.204 0 0);
+	--surface: oklch(0.232 0 0);
+	--surface-2: oklch(0.280 0 0);
+	--elevated: oklch(0.270 0 0);
+	--sidebar: oklch(0.204 0 0);
+
+	--ink: oklch(0.962 0 0);
+	--ink-secondary: oklch(0.708 0 0);
+	--ink-tertiary: oklch(0.572 0 0);
+	--ink-faint: oklch(0.474 0 0);
+
+	--line: oklch(0.301 0 0);
+	--line-strong: oklch(0.380 0 0);
+
+	--primary: oklch(0.985 0 0);
+	--on-primary: oklch(0.216 0 0);
+
+	--ring: oklch(0.845 0 0);
+	--scrim: oklch(0 0 0);
+	--success: oklch(0.758 0.141 159.7);
+	--warning: oklch(0.809 0.150 76.6);
+	--danger: oklch(0.644 0.174 23.3);
+	--info: oklch(0.707 0.150 254.6);
+
+	--background: var(--bg);
+	--foreground: var(--ink);
+	--card: var(--surface);
+	--card-foreground: var(--ink);
+	--popover: var(--elevated);
+	--popover-foreground: var(--ink);
+	--primary-foreground: var(--on-primary);
+	--secondary: var(--surface-2);
+	--secondary-foreground: var(--ink);
+	--muted: var(--surface-2);
+	--muted-foreground: var(--ink-secondary);
+	--accent: var(--surface-2);
+	--accent-foreground: var(--ink);
+	--destructive: var(--danger);
+	--border: var(--line);
+	--input: var(--line);
+	--chart-1: var(--ink);
+	--chart-2: var(--ink-secondary);
+	--chart-3: var(--ink-tertiary);
+	--chart-4: var(--line-strong);
+	--chart-5: var(--line);
+	--sidebar-foreground: var(--ink);
+	--sidebar-primary: var(--primary);
+	--sidebar-primary-foreground: var(--on-primary);
+	--sidebar-accent: var(--surface-2);
+	--sidebar-accent-foreground: var(--ink);
+	--sidebar-border: var(--line);
+	--sidebar-ring: var(--ring);
+
+	color-scheme: dark;
+}
+
+@theme inline {
+	/* Ambient semantic colors — full oklch via var() (Maia pattern) */
+	--color-bg: var(--bg);
+	--color-surface: var(--surface);
+	--color-surface-2: var(--surface-2);
+	--color-elevated: var(--elevated);
+	--color-sidebar: var(--sidebar);
+
+	--color-ink: var(--ink);
+	--color-ink-secondary: var(--ink-secondary);
+	--color-ink-tertiary: var(--ink-tertiary);
+	--color-ink-faint: var(--ink-faint);
+
+	--color-line: var(--line);
+	--color-line-strong: var(--line-strong);
+
+	--color-primary: var(--primary);
+	--color-on-primary: var(--on-primary);
+	--color-scrim: var(--scrim);
+	--color-success: var(--success);
+	--color-warning: var(--warning);
+	--color-danger: var(--danger);
+	--color-info: var(--info);
+
+	/* Maia / shadcn primitive color names */
+	--color-background: var(--background);
+	--color-foreground: var(--foreground);
+	--color-card: var(--card);
+	--color-card-foreground: var(--card-foreground);
+	--color-popover: var(--popover);
+	--color-popover-foreground: var(--popover-foreground);
+	--color-primary-foreground: var(--primary-foreground);
+	--color-secondary: var(--secondary);
+	--color-secondary-foreground: var(--secondary-foreground);
+	--color-muted: var(--muted);
+	--color-muted-foreground: var(--muted-foreground);
+	--color-accent: var(--accent);
+	--color-accent-foreground: var(--accent-foreground);
+	--color-destructive: var(--destructive);
+	--color-border: var(--border);
+	--color-input: var(--input);
+	--color-ring: var(--ring);
+	--color-chart-1: var(--chart-1);
+	--color-chart-2: var(--chart-2);
+	--color-chart-3: var(--chart-3);
+	--color-chart-4: var(--chart-4);
+	--color-chart-5: var(--chart-5);
+	--color-sidebar-foreground: var(--sidebar-foreground);
+	--color-sidebar-primary: var(--sidebar-primary);
+	--color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+	--color-sidebar-accent: var(--sidebar-accent);
+	--color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+	--color-sidebar-border: var(--sidebar-border);
+	--color-sidebar-ring: var(--sidebar-ring);
+}
+
+@layer base {
+	* {
+		border-color: var(--line);
+	}
+
+	html,
+	body {
+		height: 100%;
+	}
+
+	body {
+		background-color: var(--bg);
+		color: var(--ink);
+		font-family: var(--font-sans);
+		font-size: var(--text-base);
+		line-height: var(--text-base--line-height);
+		font-feature-settings: 'cv05', 'cv08', 'ss01', 'ss03';
+		-webkit-font-smoothing: antialiased;
+		text-rendering: optimizeLegibility;
+		letter-spacing: -0.006em;
+		overflow: hidden;
+	}
+
+	/* Shortcuts are UI chrome. Keep them on Inter even though preflight
+	   assigns kbd the mono stack. */
+	kbd {
+		font-family: var(--font-sans);
+	}
+
+	::selection {
+		background: color-mix(in oklch, var(--ink) 12%, transparent);
+	}
+
+	/* Design language: no focus outlines or focus rings anywhere. Keyboard focus
+	   reuses the hover treatment (the raised `pill-raised` surface) instead, so
+	   Tab moves the same highlight the pointer does. */
+	:focus,
+	:focus-visible {
+		outline: none !important;
+		--tw-ring-shadow: 0 0 #0000 !important;
+		--tw-ring-offset-shadow: 0 0 #0000 !important;
+	}
+
+	h1,
+	h2,
+	h3,
+	h4 {
+		letter-spacing: -0.022em;
+		font-weight: 600;
+	}
+
+	.tnum {
+		font-variant-numeric: tabular-nums;
+		font-feature-settings: 'tnum';
+	}
+
+	.scroll-area {
+		scrollbar-width: thin;
+		scrollbar-color: color-mix(in oklch, var(--ink-faint) 30%, transparent) transparent;
+	}
+	.scroll-area::-webkit-scrollbar {
+		width: 10px;
+		height: 10px;
+	}
+	.scroll-area::-webkit-scrollbar-thumb {
+		background: color-mix(in oklch, var(--ink-faint) 25%, transparent);
+		border-radius: 999px;
+		border: 3px solid transparent;
+		background-clip: content-box;
+	}
+	.scroll-area::-webkit-scrollbar-thumb:hover {
+		background: color-mix(in oklch, var(--ink-faint) 45%, transparent);
+		background-clip: content-box;
+	}
+}
+
+@layer components {
+	.card {
+		background: var(--surface);
+		border: 1px solid var(--line);
+		border-radius: var(--radius-xl);
+	}
+
+	/* Frosted sidebar material */
+	.frost {
+		background: color-mix(in oklch, var(--sidebar) 70%, transparent);
+		backdrop-filter: blur(30px) saturate(1.5);
+		-webkit-backdrop-filter: blur(30px) saturate(1.5);
+	}
+
+	.elevate-sm {
+		box-shadow:
+			0 1px 2px color-mix(in oklch, var(--scrim) 5%, transparent),
+			0 1px 1px color-mix(in oklch, var(--scrim) 4%, transparent);
+	}
+	.elevate-md {
+		box-shadow:
+			0 1px 2px color-mix(in oklch, var(--scrim) 5%, transparent),
+			0 10px 30px -12px color-mix(in oklch, var(--scrim) 12%, transparent);
+	}
+	.elevate-lg {
+		box-shadow:
+			0 1px 2px color-mix(in oklch, var(--scrim) 6%, transparent),
+			0 30px 70px -24px color-mix(in oklch, var(--scrim) 30%, transparent);
+	}
+	/* The floating inset panel */
+	.inset-panel {
+		box-shadow:
+			0 0 0 1px var(--line),
+			0 8px 24px -16px color-mix(in oklch, var(--scrim) 40%, transparent);
+	}
+
+	/* Desktop screen geometry. The scroll container always reserves its gutter,
+	   so moving between short and long routes cannot recenter the content. The
+	   standard rail is shared by Screen and the Feed's custom sticky shell. */
+	.screen-scroll-area {
+		container-type: inline-size;
+		scrollbar-gutter: stable;
+		min-width: 0;
+	}
+	.screen-content-frame {
+		box-sizing: border-box;
+		width: 100%;
+		min-width: 0;
+		padding-inline: clamp(1rem, 4cqi, 2rem);
+	}
+	.screen-standard-rail {
+		max-width: 820px;
+	}
+	.dark .inset-panel {
+		box-shadow:
+			0 0 0 1px hsl(0 0% 100% / 0.06),
+			0 12px 30px -18px hsl(0 0% 0% / 0.6);
+	}
+
+	/* Brand wash — the one splash of colour, kept to the capture card.
+	   Ambient palette only: Logseq teal #83C1C1, teal-mid #2C7D8F, navy #002934.
+	   No rainbow hues; orange is reserved for the heartbeat marker dot.
+	   Solid base, pale teal rather than white, so the pill never reads as a
+	   white card and never mixes with whatever is behind the window. */
+	.dia-wash {
+		background:
+			radial-gradient(120% 130% at 0% 0%, hsl(180 38% 62% / 0.72), transparent 60%),
+			radial-gradient(120% 130% at 100% 10%, hsl(191 55% 38% / 0.45), transparent 55%),
+			radial-gradient(130% 120% at 70% 130%, hsl(193 100% 12% / 0.3), transparent 55%),
+			color-mix(in oklch, var(--surface) 84%, hsl(186 35% 55%));
+	}
+	/* Heartbeat marker dot: Ambient orange #DC6A3C, marker dots only */
+	.capture-dot {
+		background: hsl(17 70% 55%);
+	}
+	.dia-inner-glow {
+		box-shadow:
+			inset 2px 2px 15px -2px hsl(180 33% 64% / 0.45),
+			inset -3px -3px 17px -3px hsl(191 53% 37% / 0.3);
+	}
+	.dark .dia-inner-glow {
+		box-shadow:
+			inset 2px 2px 17px -2px hsl(180 33% 64% / 0.4),
+			inset -3px -3px 19px -3px hsl(191 53% 45% / 0.36);
+	}
+
+	.dark .dia-wash {
+		background:
+			radial-gradient(120% 130% at 0% 0%, hsl(180 33% 55% / 0.38), transparent 60%),
+			radial-gradient(120% 130% at 100% 10%, hsl(191 53% 42% / 0.34), transparent 55%),
+			radial-gradient(130% 120% at 70% 130%, hsl(193 100% 12% / 0.55), transparent 55%),
+			var(--surface-2);
+	}
+
+	.grain::after {
+		content: '';
+		position: absolute;
+		inset: 0;
+		border-radius: inherit;
+		pointer-events: none;
+		opacity: 0.3;
+		mix-blend-mode: overlay;
+		background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.5'/%3E%3C/svg%3E");
+	}
+
+	/* Inline PII-redaction chips (Raw Data view). Redaction chips are monochrome:
+	   every category shares one neutral --redaction-accent that tints the text,
+	   fill and border, so the view reads calmly instead of a rainbow of category
+	   tones. The chip still carries a `data-tone` attribute (kept for the
+	   tooltip/label only) and shows the category label as its content — only the
+	   per-category color coding is dropped. Mirrors the three live-recording pill
+	   renderers: the HTML overlay (live-recording-overlay-html.ts), the macOS
+	   glass (RecordingsListView.swift) and the native Windows pill (main.cpp). */
+	.ambient-redaction-chip {
+		--redaction-accent: oklch(0.551 0.027 264.364);
+		color: var(--redaction-accent);
+		background-color: color-mix(in srgb, var(--redaction-accent) 14%, transparent);
+		border-color: color-mix(in srgb, var(--redaction-accent) 34%, transparent);
+	}
+}
+
+@layer utilities {
+	.drag {
+		-webkit-app-region: drag;
+	}
+	.no-drag {
+		-webkit-app-region: no-drag;
+	}
+	@keyframes breathe {
+		0%,
+		100% {
+			opacity: 1;
+			transform: scale(1);
+		}
+		50% {
+			opacity: 0.4;
+			transform: scale(0.7);
+		}
+	}
+	.animate-breathe {
+		animation: breathe 2.6s var(--ease-out-quint) infinite;
+	}
+	/* A slow lub-dub heartbeat: two quick beats, then a long rest */
+	@keyframes heartbeat {
+		0% {
+			transform: scale(1);
+		}
+		9% {
+			transform: scale(1.34);
+		}
+		18% {
+			transform: scale(1);
+		}
+		28% {
+			transform: scale(1.24);
+		}
+		40% {
+			transform: scale(1);
+		}
+		100% {
+			transform: scale(1);
+		}
+	}
+	.animate-heartbeat {
+		animation: heartbeat 1.9s ease-in-out infinite;
+		transform-origin: center;
+	}
+	@keyframes rise {
+		from {
+			opacity: 0;
+			transform: translateY(7px);
+		}
+		to {
+			opacity: 1;
+			transform: translateY(0);
+		}
+	}
+	.animate-rise {
+		animation: rise 0.5s var(--ease-out-quint) both;
+	}
+	@keyframes floatIn {
+		from {
+			opacity: 0;
+			transform: translateY(12px) scale(0.99);
+		}
+		to {
+			opacity: 1;
+			transform: translateY(0) scale(1);
+		}
+	}
+
+	/* Capture card: drifting brand-teal gradient on hover (no scale pulse). */
+	/* Capture card: part of the glass, not lifted off it — no outer shadow;
+	   a coloured inner glow plus an inset hairline give it its edge. */
+	/* Plus a faint glowing outline so it separates from any backdrop. */
+	.capture-card {
+		box-shadow:
+			0 0 0 1px hsl(184 45% 74% / 0.75),
+			0 0 8px 0 hsl(184 55% 66% / 0.35),
+			inset 0 0 0 1px hsl(191 40% 40% / 0.18),
+			inset 3px 3px 18px -2px hsl(180 40% 62% / 0.6),
+			inset -4px -4px 22px -3px hsl(191 55% 38% / 0.45);
+		transition: box-shadow 0.35s ease;
+	}
+	.dark .capture-card {
+		box-shadow:
+			0 0 0 1px hsl(184 40% 62% / 0.45),
+			0 0 8px 0 hsl(184 55% 55% / 0.3),
+			inset 0 0 0 1px hsl(180 40% 70% / 0.12),
+			inset 3px 3px 20px -2px hsl(180 35% 60% / 0.45),
+			inset -4px -4px 22px -3px hsl(191 55% 45% / 0.42);
+	}
+	.dia-drift {
+		background:
+			radial-gradient(42% 52% at 28% 30%, hsl(180 33% 64% / 0.9), transparent 62%),
+			radial-gradient(44% 54% at 74% 72%, hsl(191 53% 37% / 0.8), transparent 62%),
+			radial-gradient(48% 58% at 64% 26%, hsl(184 34% 56% / 0.6), transparent 62%),
+			radial-gradient(40% 50% at 20% 82%, hsl(193 100% 10% / 0.55), transparent 60%);
+		filter: blur(7px);
+		animation: diaDrift 4.5s ease-in-out infinite;
+	}
+	@keyframes diaDrift {
+		0% {
+			transform: translate3d(-14%, -9%, 0) rotate(0deg) scale(1.05);
+		}
+		50% {
+			transform: translate3d(14%, 10%, 0) rotate(10deg) scale(1.15);
+		}
+		100% {
+			transform: translate3d(-14%, -9%, 0) rotate(0deg) scale(1.05);
+		}
+	}
+
+	/* Handoff deck cycling: top card deals to the back, next rises to the front */
+	@keyframes dealBack {
+		0% {
+			transform: translateY(0) scale(1) rotate(0deg);
+			opacity: 1;
+		}
+		45% {
+			transform: translateY(17px) scale(0.95) rotate(-2.6deg);
+			opacity: 1;
+		}
+		100% {
+			transform: translateY(7px) scale(0.925) rotate(1.6deg);
+			opacity: 0;
+		}
+	}
+	.animate-deal-back {
+		animation: dealBack 0.36s var(--ease-out-quint) both;
+	}
+	/* Rises to the front with a small scale bump and a counter-rotation
+	   (opposite the outgoing card's tilt) that settles to flat. */
+	@keyframes comeFront {
+		0% {
+			transform: translateY(6px) scale(0.955) rotate(1.6deg);
+		}
+		55% {
+			transform: translateY(0) scale(1.014) rotate(-0.4deg);
+		}
+		100% {
+			transform: translateY(0) scale(1) rotate(0deg);
+		}
+	}
+	.animate-come-front {
+		/* !important so it wins over the .handoff-top:hover jiggle animation —
+		   the entrance must play regardless of where the cursor is. */
+		animation: comeFront 0.36s var(--ease-out-quint) both !important;
+	}
+
+	/* Handoff top card → a tiny, quick rotational nudge on hover */
+	.handoff-top {
+		transition: transform 0.2s var(--ease-out-quint), box-shadow 0.2s ease;
+	}
+	.handoff-top:hover {
+		transform: scale(1.006);
+		animation: jiggle 0.3s var(--ease-out-quint);
+	}
+	@keyframes jiggle {
+		0% {
+			transform: scale(1.006) rotate(0deg);
+		}
+		55% {
+			transform: scale(1.006) rotate(-0.3deg);
+		}
+		100% {
+			transform: scale(1.006) rotate(0deg);
+		}
+	}
+}
+
+/* ── Print / PDF export — prints the live page, 1:1 with screen ── */
+.print-cover {
+	display: none;
+}
+@page {
+	size: A4;
+	margin: 0;
+}
+@media print {
+	html,
+	body {
+		height: auto !important;
+		overflow: visible !important;
+		background: var(--bg);
+		-webkit-print-color-adjust: exact;
+		print-color-adjust: exact;
+	}
+	.scroll-area {
+		height: auto !important;
+		overflow: visible !important;
+	}
+	.no-print {
+		display: none !important;
+	}
+	/* cover — centred wordmark + caps subtitle, its own first page */
+	.print-cover {
+		display: flex !important;
+		flex-direction: column;
+		align-items: center;
+		justify-content: center;
+		min-height: 100vh;
+		text-align: center;
+		break-after: page;
+	}
+	/* the live UI has already settled its entrance animations; pin the
+	   resting state so nothing prints mid-transition or invisible */
+	*,
+	*::before,
+	*::after {
+		animation: none !important;
+		transition: none !important;
+	}
+	[class*='animate-'] {
+		opacity: 1 !important;
+	}
+	/* mix-blend noise renders wrong on paper; drop it, keep the gradient */
+	.grain::after {
+		display: none !important;
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	*,
+	*::before,
+	*::after {
+		animation-duration: 0.001ms !important;
+		animation-iteration-count: 1 !important;
+		transition-duration: 0.001ms !important;
+	}
+}
+
+/* Design language — selection states on the glass sidebar and in content.
+   - `pill-raised`: the one selected item on the translucent sidebar (current
+     page): solid surface, very light stroke, soft drop shadow.
+   - `surface-hover`: hover / keyboard focus on the glass sidebar — a secondary,
+     lighter wash so it never reads as selected.
+   - `surface-selected`: selected + hover rows on solid (white) surfaces such as
+     Settings navigation and content lists — a soft grey fill, no stroke. */
+@utility pill-raised {
+	background-color: var(--surface);
+	box-shadow:
+		0 0 0 1px color-mix(in oklch, var(--ink) 9%, transparent),
+		0 1px 2px color-mix(in oklch, var(--scrim) 6%, transparent),
+		0 3px 10px -4px color-mix(in oklch, var(--scrim) 14%, transparent);
+	:where(.dark) &:not(:where(.theme-light, .theme-light *)) {
+		background-color: color-mix(in oklch, white 10%, transparent);
+		box-shadow:
+			0 0 0 1px color-mix(in oklch, white 9%, transparent),
+			0 1px 3px color-mix(in oklch, black 35%, transparent);
+	}
+}
+@utility surface-hover {
+	background-color: color-mix(in oklch, var(--surface) 50%, transparent);
+	:where(.dark) &:not(:where(.theme-light, .theme-light *)) {
+		background-color: color-mix(in oklch, white 5%, transparent);
+	}
+}
+/* Hover on solid surfaces: a lighter step than `surface-selected`, so a hovered
+   row never reads as the selected one. */
+@utility surface-hover-soft {
+	background-color: color-mix(in oklch, var(--ink) 3%, transparent);
+	:where(.dark) &:not(:where(.theme-light, .theme-light *)) {
+		background-color: color-mix(in oklch, white 4%, transparent);
+	}
+}
+@utility surface-selected {
+	background-color: color-mix(in oklch, var(--ink) 6%, transparent);
+	:where(.dark) &:not(:where(.theme-light, .theme-light *)) {
+		background-color: color-mix(in oklch, white 8%, transparent);
+	}
+}

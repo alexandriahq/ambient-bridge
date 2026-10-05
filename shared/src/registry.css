@@ -1,0 +1,14 @@
+/*
+ * Theme-neutral support required by components installed through
+ * shared/components.json. Both shared themes import this file so registry
+ * additions work in every consumer without duplicating setup in each app.
+ */
+@import "tw-animate-css";
+@import "shadcn-svelte/tailwind.css";
+
+@custom-variant dark (&:is(.dark *):not(:is(.theme-light, .theme-light *)));
+/* Last input wins: while the keyboard is driving (html[data-input="keyboard"],
+   set by the app shell), pointer hover styles are suppressed so a list never
+   shows a hover highlight next to the keyboard selection. Moving the mouse
+   switches back. */
+@custom-variant hover (&:hover:not(:where(html[data-input="keyboard"] *)));

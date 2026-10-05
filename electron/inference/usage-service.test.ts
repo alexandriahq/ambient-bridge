@@ -3,7 +3,13 @@ import { describe, expect, test } from "vitest";
 import type { UsageReservationRequest } from "@ambient/shared/usage";
 import { AuthServerUsageError, type AuthServerClient } from "../auth/server-client.js";
 import type { SignedInWorkOsSession } from "../workos/session.js";
-import { BridgeInferenceServiceError, BridgeUsageRequestError } from "./errors.js";
+import {
+  BridgeGloballyDisabledError,
+  BridgeInferenceServiceError,
+  BridgeInsufficientCreditError,
+  BridgeUsageRequestError,
+  globallyDisabledRefusalText,
+} from "./errors.js";
 import {
   BridgeUsageAccountingDisabledError,
   createBridgeUsageService,
@@ -32,6 +38,49 @@ describe("Bridge usage service reservation failures", () => {
     if (result._tag === "Left") {
       expect(result.left).toBeInstanceOf(BridgeUsageAccountingDisabledError);
     }
+  });
+
+  test.each(["INSUFFICIENT_CREDIT", "SPENDING_LIMIT_REACHED", "BILLING_PAST_DUE"] as const)(
+    "treats %s as account exhaustion (ADR-0243)",
+    async (code) => {
+      const service = createBridgeUsageService({
+        reserveUsage: async () => { throw new AuthServerUsageError(402, code, "Refused"); },
+      } as unknown as AuthServerClient);
+      const result = await Effect.runPromise(Effect.either(service.reserve(reservationInput())));
+      expect(result._tag).toBe("Left");
+      if (result._tag === "Left") expect(result.left).toBeInstanceOf(BridgeInsufficientCreditError);
+    },
+  );
+
+  test("maps a globally disabled reservation refusal to policy_denied with the precise text (ADR-0296)", async () => {
+    const service = createBridgeUsageService({
+      reserveUsage: async () => {
+        throw new AuthServerUsageError(403, "BILLING_FORBIDDEN", "globally_disabled: Claude is temporarily unavailable.");
+      },
+    } as unknown as AuthServerClient);
+    const result = await Effect.runPromise(Effect.either(service.reserve(reservationInput())));
+    expect(result._tag).toBe("Left");
+    if (result._tag === "Left") {
+      expect(result.left).toBeInstanceOf(BridgeGloballyDisabledError);
+      expect(result.left).toMatchObject({ code: "policy_denied", message: "globally_disabled: Claude is temporarily unavailable." });
+      expect(globallyDisabledRefusalText(result.left)).toBe("Claude is temporarily unavailable.");
+    }
+  });
+
+  test("keeps other BILLING_FORBIDDEN refusals generic", async () => {
+    const service = createBridgeUsageService({
+      reserveUsage: async () => { throw new AuthServerUsageError(403, "BILLING_FORBIDDEN", "Forbidden"); },
+    } as unknown as AuthServerClient);
+    const result = await Effect.runPromise(Effect.either(service.reserve(reservationInput())));
+    expect(result._tag === "Left" && result.left).toBeInstanceOf(BridgeUsageRequestError);
+  });
+
+  test("reads a Node grant refusal by code and prefix only", () => {
+    expect(globallyDisabledRefusalText({ code: "policy_denied", message: "globally_disabled: The model x is temporarily unavailable." }))
+      .toBe("The model x is temporarily unavailable.");
+    expect(globallyDisabledRefusalText({ code: "policy_denied", message: "seat_limit_reached: full" })).toBeNull();
+    expect(globallyDisabledRefusalText({ code: "credit_exhausted", message: "globally_disabled: x" })).toBeNull();
+    expect(globallyDisabledRefusalText(null)).toBeNull();
   });
 
   test.each([400, 401])("keeps permanent usage status %i outside transient recovery", async (status) => {

@@ -1,12 +1,15 @@
 import { extractFile, listPackage } from "@electron/asar";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   bridgePackagedDependencyPolicy,
-  classifyBridgePackageDependencies,
 } from "./package-dependency-policy.mjs";
-import { resolveBuildServerUrl } from "./generate-build-config.mjs";
+import {
+  resolveBuildBakeMarker,
+  resolveBuildMultiplayerUrl,
+  resolveBuildServerUrl,
+} from "./generate-build-config.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const bridgeDir = path.resolve(scriptDir, "..");
@@ -22,8 +25,6 @@ const archive = process.env.BRIDGE_PACKAGED_ASAR_PATH
     "app.asar",
   );
 const packageJsonPathPattern = /(?:^|\/)node_modules\/((?:@[^/]+\/[^/]+)|[^/]+)\/package\.json$/;
-const productionServerOrigin = "https://api.alexandria.so";
-const stagingServerOrigin = "https://ambientserver-staging.up.railway.app";
 
 if (!existsSync(archive)) {
   console.error(`[bridge:smoke] missing packaged app archive: ${archive}`);
@@ -43,16 +44,11 @@ for (const packagePath of packagePaths) {
 }
 
 const appPackage = readPackageJson("/package.json");
-const declaredDependencies = Object.keys(appPackage.dependencies ?? {});
-const dependencyClassification = classifyBridgePackageDependencies(declaredDependencies);
-if (dependencyClassification.unclassified.length > 0) {
+const declaredDependencies = Object.keys(appPackage.dependencies ?? {}).sort();
+const expectedRuntimeRoots = [...bridgePackagedDependencyPolicy.runtimeDependencyRoots].sort();
+if (JSON.stringify(declaredDependencies) !== JSON.stringify(expectedRuntimeRoots)) {
   failures.push(
-    `Bridge package dependencies need an explicit packaged dependency policy: ${dependencyClassification.unclassified.join(", ")}`,
-  );
-}
-if (dependencyClassification.missingFromPackageJson.length > 0) {
-  failures.push(
-    `Bridge packaged dependency policy references dependencies missing from package.json: ${dependencyClassification.missingFromPackageJson.join(", ")}`,
+    `Bridge packaged dependencies must equal the external runtime roots (expected ${expectedRuntimeRoots.join(", ")}; found ${declaredDependencies.join(", ")})`,
   );
 }
 
@@ -84,15 +80,40 @@ while (queue.length > 0) {
     queue.push({ dependency: childDependency, parent: packageName, peer: false, traverse: true });
   }
 
+  for (const childDependency of Object.keys(packageJson.optionalDependencies ?? {})) {
+    if (!presentPackages.has(childDependency)) continue;
+    queue.push({ dependency: childDependency, parent: packageName, peer: false, traverse: true });
+  }
+
   for (const childDependency of Object.keys(packageJson.peerDependencies ?? {})) {
     if (packageJson.peerDependenciesMeta?.[childDependency]?.optional === true) continue;
     queue.push({ dependency: childDependency, parent: packageName, peer: true, traverse: true });
   }
 }
 
+const unexpectedPackages = [...presentPackages.keys()]
+  .filter((dependency) => !reachablePackages.has(dependency))
+  .sort();
+if (unexpectedPackages.length > 0) {
+  failures.push(`Bridge app.asar contains packages outside the runtime graph: ${unexpectedPackages.join(", ")}`);
+}
+
+const archiveBytes = statSync(archive).size;
+if (archiveBytes > bridgePackagedDependencyPolicy.maxAsarBytes) {
+  failures.push(
+    `Bridge app.asar is ${formatMiB(archiveBytes)}, above the ${formatMiB(bridgePackagedDependencyPolicy.maxAsarBytes)} budget`,
+  );
+}
+
+const packagedSourceMaps = files.filter((file) => file.endsWith(".map"));
+if (packagedSourceMaps.length > 0) {
+  failures.push(`Bridge app.asar contains ${packagedSourceMaps.length} source maps that should be upload-only`);
+}
+
 verifyPackagedServerOrigin();
 verifyPackagedBridgeUi();
 verifyPublicLicenseNotices();
+verifyBundledLicenseNotices();
 verifyPackagedSharedRuntimeExports();
 
 if (failures.length > 0) {
@@ -104,8 +125,30 @@ if (failures.length > 0) {
 }
 
 console.log(
-  `[bridge:smoke] packaged app dependency verification passed (${presentPackages.size} packages, ${reachablePackages.size} runtime dependency roots/transitives)`,
+  `[bridge:smoke] packaged app dependency verification passed (${formatMiB(archiveBytes)}, ${presentPackages.size} runtime packages)`,
 );
+
+function formatMiB(bytes) {
+  return `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
+}
+
+function verifyBundledLicenseNotices() {
+  for (const noticePath of [
+    "/dist/renderer/THIRD_PARTY_LICENSES.md",
+    "/dist/electron/MAIN_THIRD_PARTY_LICENSES.md",
+    "/dist/electron/PRELOAD_THIRD_PARTY_LICENSES.md",
+  ]) {
+    if (!packageHasPath(noticePath)) {
+      failures.push(`Bridge package is missing bundled dependency notices: ${noticePath}`);
+    }
+  }
+  for (const font of ["inter", "stix-two-text", "jetbrains-mono"]) {
+    const noticePath = path.join(path.dirname(archive), "licenses", `${font}.txt`);
+    if (!existsSync(noticePath) || !readFileSync(noticePath, "utf8").includes("SIL OPEN FONT LICENSE")) {
+      failures.push(`Bridge package is missing the complete font license: ${font}`);
+    }
+  }
+}
 
 function readPackageJson(asarPath) {
   return JSON.parse(readAsarText(asarPath));
@@ -117,40 +160,39 @@ function readAsarText(asarPath) {
 }
 
 function verifyPackagedServerOrigin() {
-  // The default server origin is baked at build time from the release channel
-  // into build-config.js (see generate-build-config.mjs). Expect exactly the
-  // origin that channel resolves to, and guard against the other one leaking in.
+  // Bake still picks one default realm. Dev Settings retarget embeds the other
+  // allowlisted origin in the same bundle, so "found staging" is not a failed
+  // Nightly bake. The generate-time marker is the default.
   const expectedOrigin = resolveBuildServerUrl(process.env);
-  const forbiddenOrigin =
-    expectedOrigin === productionServerOrigin ? stagingServerOrigin : productionServerOrigin;
+  const expectedMultiplayerOrigin = resolveBuildMultiplayerUrl(process.env);
+  const expectedBakeMarker = resolveBuildBakeMarker(process.env);
 
-  for (const runtimePath of ["/dist/electron/auth/server-client.js", "/dist/electron/main.js"]) {
-    if (!packageHasPath(runtimePath)) {
-      failures.push(`Bridge packaged runtime file is missing from app.asar: ${runtimePath}`);
-    }
-  }
-
-  const buildConfigPath = "/dist/electron/generated/build-config.js";
-  if (!packageHasPath(buildConfigPath)) {
-    failures.push(`Bridge packaged build-config is missing from app.asar: ${buildConfigPath}`);
+  const mainPath = "/dist/electron/main.js";
+  if (!packageHasPath(mainPath)) {
+    failures.push(`Bridge packaged runtime file is missing from app.asar: ${mainPath}`);
     return;
   }
-  const source = readAsarText(buildConfigPath);
-  if (!source.includes(expectedOrigin)) {
+  const source = readAsarText(mainPath);
+  if (!source.includes(expectedBakeMarker)) {
     failures.push(
-      `Bridge packaged build-config does not bake the expected server origin for this channel (${expectedOrigin}).`,
+      `Bridge packaged main bundle is missing bake marker ${expectedBakeMarker} (expected default ${expectedOrigin}).`,
     );
   }
-  if (source.includes(forbiddenOrigin)) {
+  if (!source.includes(expectedOrigin)) {
     failures.push(
-      `Bridge packaged build-config bakes the wrong server origin for this channel (found ${forbiddenOrigin}, expected ${expectedOrigin}).`,
+      `Bridge packaged main bundle does not bake the expected server origin for this channel (${expectedOrigin}).`,
+    );
+  }
+  if (!source.includes(expectedMultiplayerOrigin)) {
+    failures.push(
+      `Bridge packaged main bundle does not bake the expected Multiplayer ingest origin for this channel (${expectedMultiplayerOrigin}).`,
     );
   }
 }
 
 function verifyPackagedBridgeUi() {
   for (const runtimePath of [
-    "/dist/electron/bridge-ui-ipc.js",
+    "/dist/electron/main.js",
     "/dist/electron/preload.cjs",
     "/dist/renderer/index.html",
   ]) {
@@ -170,19 +212,16 @@ function verifyPackagedBridgeUi() {
 }
 
 function verifyPackagedSharedRuntimeExports() {
-  const sharedPackagePath = presentPackages.get("@ambient/shared");
-  if (!sharedPackagePath) return;
-
-  const sharedPackage = readPackageJson(sharedPackagePath);
-  const usageRuntime = sharedPackage.exports?.["./usage"]?.default;
-  if (typeof usageRuntime !== "string" || !usageRuntime.endsWith(".js")) {
-    failures.push("@ambient/shared/usage must resolve to packaged JavaScript at runtime.");
-    return;
-  }
-
-  const usageRuntimePath = path.posix.join(path.posix.dirname(sharedPackagePath), usageRuntime);
-  if (!packageHasPath(usageRuntimePath)) {
-    failures.push(`@ambient/shared/usage runtime is missing from app.asar: ${usageRuntimePath}`);
+  // @ambient/shared Electron-main subpaths are Vite-bundled into
+  // dist/electron/main.js. Confirm a representative shared symbol landed in the
+  // main bundle rather than requiring a separate JS file under node_modules.
+  const mainPath = "/dist/electron/main.js";
+  if (!packageHasPath(mainPath)) return;
+  const source = readAsarText(mainPath);
+  for (const marker of ["INSUFFICIENT_CREDIT", "productUpdateFeedUrl", "/updates/apps/"]) {
+    if (!source.includes(marker)) {
+      failures.push(`Bridge packaged main bundle is missing bundled shared runtime marker: ${marker}`);
+    }
   }
 }
 

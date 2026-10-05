@@ -1,17 +1,15 @@
 {
   "compilerOptions": {
-    "declaration": true,
     "lib": ["ES2023", "DOM", "DOM.Iterable"],
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "outDir": "dist/electron",
-    "rootDir": "electron",
+    "noEmit": true,
+    "noUnusedLocals": true,
     "skipLibCheck": true,
-    "sourceMap": true,
     "strict": true,
     "target": "ES2023",
     "types": ["node"]
   },
-  "include": ["electron/**/*.ts", "electron/**/*.cts"],
+  "include": ["electron/**/*.ts"],
   "exclude": ["electron/**/*.test.ts"]
 }

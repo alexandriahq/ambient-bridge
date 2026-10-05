@@ -1,0 +1,30 @@
+{
+  "name": "@alexandria/cloud-contract",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./org-policy": "./src/org-policy.ts",
+    "./policy-layers": "./src/policy-layers.ts",
+    "./plans": "./src/plans.ts",
+    "./org-commercial-api": "./src/org-commercial-api.ts",
+    "./global-controls": "./src/global-controls.ts",
+    "./inference-catalog": "./src/inference-catalog.ts",
+    "./inference-model-assignment": "./src/inference-model-assignment.ts",
+    "./inference-admin-api": "./src/inference-admin-api.ts"
+  },
+  "scripts": {
+    "build": "tsc --project tsconfig.json",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit --project tsconfig.json"
+  },
+  "dependencies": {
+    "zod": "^4.1.8"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "typescript": "5.9.3",
+    "vitest": "^4.1.8"
+  }
+}

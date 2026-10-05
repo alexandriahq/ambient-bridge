@@ -12,7 +12,6 @@ let app: ElectronApplication;
 let page: Page;
 let profileDir: string;
 let wireServer: Server;
-let releaseListRequests = 0;
 
 const requestId = "bridge-e2e-wire-capture";
 const requestBase64 = "AQIDBAUGBwgJCgsMDQ4PEA==";
@@ -20,7 +19,6 @@ const requestBase64 = "AQIDBAUGBwgJCgsMDQ4PEA==";
 test.beforeAll(async () => {
   wireServer = createServer((request, response) => {
     if (request.url?.startsWith("/releases/apps/ambient-bridge/experimental/")) {
-      releaseListRequests += 1;
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify({
         product: { slug: "ambient-bridge" },
@@ -108,6 +106,7 @@ test("drives a real sealed capture through the built inspector, production prelo
     return {
       apiPresent: true,
       capture: await api.getWireCapture("bridge-e2e-wire-capture"),
+      requestLog: await api.getRequestLog(),
       status: await api.getStatus(),
     } as const;
   });
@@ -116,7 +115,8 @@ test("drives a real sealed capture through the built inspector, production prelo
   if (!runtime.apiPresent) return;
   expect(runtime.status.account.kind).toBe("signed_in");
   expect(runtime.status.socketReady).toBe(true);
-  expect(runtime.status.inference.requests).toHaveLength(1);
+  expect("requests" in runtime.status.inference).toBe(false);
+  expect(runtime.requestLog.requests).toHaveLength(1);
   expect(runtime.capture.state).toBe("available");
   if (runtime.capture.state === "available") {
     expect(runtime.capture.capture.request.body.base64).toBe(requestBase64);
@@ -139,15 +139,10 @@ test("drives a real sealed capture through the built inspector, production prelo
   await page.keyboard.press("Escape");
   await page.getByRole("button", { name: /Bridge Electron E2E.*bridge-electron-e2e@example\.invalid/ }).click();
   await page.getByRole("menuitem", { name: "Settings", exact: true }).click();
-  await page.getByRole("button", { name: "Dev", exact: true }).click();
-  await expect(page.getByRole("heading", { name: "Experimental builds" })).toBeVisible();
-  await expect(page.getByText(/1 experimental build available/)).toBeVisible();
-  await expect(page.getByRole("button", { name: "Build version" })).toContainText("0.1.0-experimental.pr310.e2e");
-  await page.getByRole("button", { name: "Install selected build" }).click();
-  await expect.poll(async () => page.evaluate(async () => (await window.ambientBridge?.getUpdateStatus())?.channel))
-    .toBe("experimental");
-  expect(releaseListRequests).toBeGreaterThanOrEqual(2);
-  await page.getByRole("button", { name: "Close settings" }).click();
+  await expect(page.getByRole("button", { name: "Dev", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "Experimental builds" })).toHaveCount(0);
+  await expect(page.getByText(/Ambient installs matching Experimental App and Bridge builds/)).toBeVisible();
+  await page.keyboard.press("Escape");
 
   await page.evaluate(async () => {
     await window.ambientBridge?.signOut();

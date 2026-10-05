@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   BRIDGE_UPDATE_DEFAULT_BASE_URL,
-  bridgeReleaseListUrl,
+  bridgeChangelogUrl,
   bridgeUpdateBaseUrlFromEnv,
   bridgeUpdateFeedUrl,
   bridgeUpdaterUnavailableReason,
@@ -39,12 +39,31 @@ describe("Bridge update feed", () => {
       channel: "alpha",
       platform: "win32",
     })).toBe("https://server.example.test/updates/apps/ambient-bridge/alpha/win32/x64/");
-    expect(bridgeReleaseListUrl({
-      arch: "arm64",
+    expect(bridgeChangelogUrl({
+      arch: "x64",
       baseUrl: "https://server.example.test/root?ignored=true#hash",
       channel: "alpha",
-      platform: "darwin",
-    })).toBe("https://server.example.test/releases/apps/ambient-bridge/alpha/darwin/arm64");
+      platform: "win32",
+    })).toBe("https://server.example.test/changelog/apps/ambient-bridge/alpha/win32/x64");
+  });
+
+  it.each([
+    ["darwin", "arm64"],
+    ["win32", "x64"],
+  ] as const)("keeps optional version segments encoded for %s %s", (platform, arch) => {
+    for (const [version, suffix] of [
+      ["", ""],
+      ["1.0.4", "1.0.4/"],
+      ["1.0.4+qa /?#", "1.0.4%2Bqa%20%2F%3F%23/"],
+    ]) {
+      expect(bridgeUpdateFeedUrl({
+        baseUrl: "https://updates.example.test/base?ignored=yes#hash",
+        platform,
+        arch,
+        channel: "nightly",
+        version,
+      })).toBe(`https://updates.example.test/updates/apps/ambient-bridge/nightly/${platform}/${arch}/${suffix}`);
+    }
   });
 
   it("keeps dev and unsupported Bridge builds out of auto-update", () => {
@@ -55,7 +74,9 @@ describe("Bridge update feed", () => {
     expect(bridgeUpdaterUnavailableReason({ arch: "arm64", isPackaged: true, localQaBuild: true, platform: "darwin" }))
       .toBe("Updates are disabled for local QA builds.");
     expect(bridgeUpdaterUnavailableReason({ arch: "arm64", isPackaged: true, platform: "linux" }))
-      .toBe("Updates are only available for packaged macOS arm64 and Windows x64 builds.");
+      .toBe("Ambient App installs Bridge updates. Bridge does not self-update.");
+    expect(bridgeUpdaterUnavailableReason({ arch: "x64", isPackaged: true, platform: "linux" }))
+      .toBe("Ambient App installs Bridge updates. Bridge does not self-update.");
     expect(bridgeUpdaterUnavailableReason({ arch: "x64", isPackaged: true, platform: "darwin" }))
       .toBe("Updates are only configured for macOS arm64 builds.");
     expect(bridgeUpdaterUnavailableReason({ arch: "arm64", isPackaged: true, platform: "win32" }))
@@ -65,14 +86,14 @@ describe("Bridge update feed", () => {
       channel: "experimental",
       isPackaged: true,
       platform: "win32",
-    })).toBe("Automatic updates are disabled for unsigned experimental Windows builds.");
+    })).toBe("Automatic updates are disabled for Experimental builds. Install a specific Experimental build from Settings → Dev.");
     expect(bridgeUpdaterUnavailableReason({
       arch: "x64",
       channel: "experimental",
       isPackaged: true,
       platform: "win32",
       version: "1.0.0-experimental.pr431.30379606652",
-    })).toBeNull();
+    })).toBe("Automatic updates are disabled for Experimental builds. Install a specific Experimental build from Settings → Dev.");
     expect(bridgeUpdaterUnavailableReason({ arch: "arm64", isPackaged: true, platform: "darwin" })).toBeNull();
     expect(bridgeUpdaterUnavailableReason({ arch: "x64", isPackaged: true, platform: "win32" })).toBeNull();
   });

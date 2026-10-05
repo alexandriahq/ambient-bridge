@@ -26,7 +26,7 @@ describe("resolveBridgeDesktopIdentity", () => {
     });
   });
 
-  it("keeps generated identity for unpackaged development", () => {
+  it("keeps Local identity for unpackaged Local development builds", () => {
     expect(resolveBridgeDesktopIdentity({
       buildAppId: "com.alexandria.ambient.bridge.local",
       buildAppName: "Ambient Bridge Local",
@@ -35,6 +35,30 @@ describe("resolveBridgeDesktopIdentity", () => {
     })).toEqual({
       appId: "com.alexandria.ambient.bridge.local",
       appName: "Ambient Bridge Local",
+    });
+  });
+
+  it("maps unpackaged non-Local runs to the .dev identity so electron.exe cannot claim production AUMID", () => {
+    expect(resolveBridgeDesktopIdentity({
+      buildAppId: "com.alexandria.ambient.bridge",
+      buildAppName: "Ambient Bridge",
+      packaged: false,
+      packagedAppName: "@ambient/bridge",
+    })).toEqual({
+      appId: "com.alexandria.ambient.bridge.dev",
+      appName: "Ambient Bridge Dev",
+    });
+  });
+
+  it("keeps an already-baked .dev identity for unpackaged source runs", () => {
+    expect(resolveBridgeDesktopIdentity({
+      buildAppId: "com.alexandria.ambient.bridge.dev",
+      buildAppName: "Ambient Bridge Dev",
+      packaged: false,
+      packagedAppName: "@ambient/bridge",
+    })).toEqual({
+      appId: "com.alexandria.ambient.bridge.dev",
+      appName: "Ambient Bridge Dev",
     });
   });
 });

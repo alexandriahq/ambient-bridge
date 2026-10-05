@@ -1,7 +1,7 @@
 /**
  * Bridge's closed logging taxonomy, mirroring the Ambient app's
  * (ambient-app/observability/logging.ts): every structured record that reaches
- * the crash ring or hosted telemetry carries a `service` and `component` from
+ * the crash ring and local audit log carry a `service` and `component` from
  * these sets, so queries work the same way across both products.
  */
 

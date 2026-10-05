@@ -1,7 +1,8 @@
 <script lang="ts">
-  import Button from "../design/adapters/button.svelte";
+  import { Button } from "@ambient/shared/ui/button";
   import type { AmbientActionToastInput } from "./index.js";
   import type { AmbientToastAction } from "./types.js";
+  import AmbientUpdateProgress from "./update-progress.svelte";
 
   // Docked-card presentation of the same notification content the toasts
   // render — used by surfaces that own a sidebar (Ambient App) instead of the
@@ -18,7 +19,7 @@
 
   const updateAction = $derived((content.actions ?? []).find((action) => action.label === "Update"));
   const laterAction = $derived((content.actions ?? []).find((action) => action.label === "Later"));
-  const releaseNotesAction = $derived((content.actions ?? []).find((action) => action.label === "See what's new."));
+  const releaseNotesAction = $derived((content.actions ?? []).find((action) => action.label === "See what has changed"));
   const readyToUpdate = $derived(Boolean(updateAction && laterAction));
 
   async function runAction(action: AmbientToastAction, dismissAfter = true): Promise<void> {
@@ -56,27 +57,11 @@
     </div>
 
     <div class="grid min-w-0 grid-cols-2 gap-2" aria-label="Update actions">
-      <Button
-        type="button"
-        variant="secondary"
-        size="sm"
-        full
-        disabled={busyAction !== null}
-        onclick={() => void runAction(laterAction!)}
-      >
+      <Button type="button" variant="secondary" size="sm" disabled={busyAction !== null} onclick={() => void runAction(laterAction!)} class="w-full no-drag">
         {busyAction === laterAction!.label ? "Working…" : laterAction!.label}
       </Button>
-      <Button
-        type="button"
-        variant="primary"
-        size="sm"
-        full
-        class="text-white hover:brightness-95"
-        style="background-color: #0168C9"
-        disabled={busyAction !== null}
-        onclick={() => void runAction(updateAction!)}
-      >
-        {busyAction === updateAction!.label ? "Updating…" : updateAction!.label}
+      <Button type="button" variant="primary" size="sm" style="background-color: #0168C9" disabled={busyAction !== null} onclick={() => void runAction(updateAction!, false)} class="text-white hover:brightness-95 w-full no-drag">
+        {busyAction === updateAction!.label ? "Installing…" : updateAction!.label}
       </Button>
     </div>
   {:else}
@@ -87,15 +72,13 @@
     {#if content.detail}
       <p class="m-0 text-xs leading-tight text-ink-secondary [overflow-wrap:anywhere]">{content.detail}</p>
     {/if}
+    {#if content.progress}
+      <AmbientUpdateProgress percent={content.progress.percent} label={content.progress.label} />
+    {/if}
     {#if content.actions?.length}
       <div class="flex min-w-0 flex-wrap gap-2" aria-label="Notification actions">
         {#each content.actions as action (action.label)}
-        <Button
-          variant={action.tone === "primary" ? "primary" : action.tone === "ghost" ? "ghost" : "secondary"}
-          size="sm"
-          disabled={busyAction !== null}
-          onclick={() => void runAction(action)}
-        >
+        <Button variant={action.tone === "primary" ? "primary" : action.tone === "ghost" ? "ghost" : "secondary"} size="sm" disabled={busyAction !== null} onclick={() => void runAction(action)} class="no-drag">
           {busyAction === action.label ? "Working…" : action.label}
         </Button>
         {/each}

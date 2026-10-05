@@ -162,9 +162,10 @@ describe("Bridge IPC server result writer", () => {
 
   it("streams async handler results as start, delta, and end frames", async () => {
     const chunks: Buffer[] = [];
+    const audit = new MemoryAuditSink();
 
-    await writeIpcHandlerResult({
-      audit: new MemoryAuditSink(),
+    const outcome = await writeIpcHandlerResult({
+      audit,
       frame: { id: "req_stream", method: "inference.responses" },
       result: (async function* () {
         yield { kind: "openai.response.chunk", data: "one" };
@@ -187,6 +188,8 @@ describe("Bridge IPC server result writer", () => {
       { event: "delta", id: "req_stream", payload: { kind: "openai.response.chunk", data: "two" }, type: "stream" },
       { event: "end", id: "req_stream", type: "stream" },
     ]);
+    expect(outcome).toBe("success");
+    expect(audit.recent()).toEqual([]);
   });
 
   it("pauses a response stream until a backpressured socket drains", async () => {
@@ -230,7 +233,7 @@ describe("Bridge IPC server result writer", () => {
     expect(writes).toBe(2);
 
     events.emit("drain");
-    await pending;
+    await expect(pending).resolves.toBe("success");
 
     expect(pulls).toBe(2);
     const decoder = new FrameDecoder();
@@ -281,7 +284,7 @@ describe("Bridge IPC server result writer", () => {
     await backpressureObserved;
     socket.destroyed = true;
     events.emit("close");
-    await pending;
+    await expect(pending).resolves.toBe("cancelled");
 
     expect(iteratorFinalized).toBe(true);
     expect(writes).toBe(2);
@@ -296,7 +299,7 @@ describe("Bridge IPC server result writer", () => {
   it("returns the sanitized stream failure message to the requester", async () => {
     const chunks: Buffer[] = [];
 
-    await writeIpcHandlerResult({
+    const outcome = await writeIpcHandlerResult({
       audit: new MemoryAuditSink(),
       frame: { id: "req_stream_error", method: "inference.responses" },
       result: (async function* () {
@@ -324,6 +327,7 @@ describe("Bridge IPC server result writer", () => {
         type: "error",
       },
     ]);
+    expect(outcome).toBe("failure");
   });
 
   it("preserves a stable provider-service code across the typed IPC error frame", async () => {
@@ -346,7 +350,7 @@ describe("Bridge IPC server result writer", () => {
     expect(frames.at(-1)).toEqual({
       code: "UPSTREAM_BILLING_UNAVAILABLE",
       id: "req_provider_billing",
-      message: "Inference processing is temporarily unavailable. (UPSTREAM_BILLING_UNAVAILABLE)",
+      message: "AI processing is temporarily unavailable. Try again shortly; if this continues, contact Ambient support. (UPSTREAM_BILLING_UNAVAILABLE)",
       type: "error",
     });
   });
@@ -378,4 +382,20 @@ describe("Bridge IPC server result writer", () => {
       type: "error",
     });
   });
+});
+
+it("disposes an admitted stream if the first socket write cannot start", async () => {
+  let pulls = 0, disposed = 0;
+  const result = {
+    [Symbol.asyncIterator]() { return this; },
+    async next() { pulls++; return {done: false as const, value: {data: "unused"}}; },
+    async return() { disposed++; throw new Error("secondary cleanup failure"); },
+  };
+  const outcome = await writeIpcHandlerResult({
+    audit: new MemoryAuditSink(), frame: {id:"unstarted", method:"inference.responses"}, result,
+    socket: {destroyed:true, write() {throw new Error("must not write closed socket");}},
+  });
+  expect(outcome).toBe("cancelled");
+  expect(pulls).toBe(0);
+  expect(disposed).toBe(1);
 });

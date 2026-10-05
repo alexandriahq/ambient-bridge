@@ -1,4 +1,5 @@
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { SignedInWorkOsSession, WorkOsSession } from "./session.js";
 
@@ -31,6 +32,11 @@ export class EncryptedSessionStore {
     return this.readPromise;
   }
 
+  /** In-memory session only — null until the first successful read/write. */
+  peekCached(): WorkOsSession | null {
+    return this.cached ?? null;
+  }
+
   private async readFromDisk(revision: number): Promise<WorkOsSession> {
     let session: WorkOsSession;
     try {
@@ -54,6 +60,24 @@ export class EncryptedSessionStore {
     await this.mutate(async () => this.clearUnlocked());
   }
 
+  async writeIfOwned(session: WorkOsSession, ownsLogin: () => boolean): Promise<boolean> {
+    return this.mutate(async () => {
+      // Check inside the queue: logout may cancel a callback while it waits.
+      if (!ownsLogin()) return false;
+      const previous = await this.read();
+      if (!ownsLogin()) return false;
+      await this.writeUnlocked(session);
+      if (!ownsLogin()) {
+        // Replacement can arrive during the filesystem write. Restore the prior
+        // session inside the mutation queue before another login can commit.
+        if (previous.kind === "signed_out") await this.clearUnlocked();
+        else await this.writeUnlocked(previous);
+        return false;
+      }
+      return true;
+    });
+  }
+
   async clearIfCurrent(expectedSession: SignedInWorkOsSession): Promise<boolean> {
     return await this.mutate(async () => {
       const current = await this.read();
@@ -73,6 +97,7 @@ export class EncryptedSessionStore {
   async writeIfCurrent(
     nextSession: SignedInWorkOsSession,
     expectedSession: SignedInWorkOsSession,
+    ownsCurrent?: (session: SignedInWorkOsSession) => boolean,
   ): Promise<SessionStoreWriteResult> {
     return await this.mutate(async () => {
       const current = await this.read();
@@ -80,6 +105,7 @@ export class EncryptedSessionStore {
       if (
         current.user.id !== expectedSession.user.id
         || current.sessionToken !== expectedSession.sessionToken
+        || ownsCurrent?.(current) === false
       ) {
         return "session_changed";
       }
@@ -96,16 +122,34 @@ export class EncryptedSessionStore {
 
     await mkdir(dirname(this.path), { recursive: true });
     const encrypted = this.crypto.encryptString(JSON.stringify(session));
-    await writeFile(this.path, encrypted, { mode: 0o600 });
+    // Keep the last complete session until its replacement is fully written.
+    // A sibling file keeps rename on the same filesystem, including Windows.
+    const temporaryPath = `${this.path}.tmp-${randomUUID()}`;
+    try {
+      await writeFile(temporaryPath, encrypted, { mode: 0o600, flag: "wx", flush: true });
+      await rename(temporaryPath, this.path);
+    } finally {
+      await rm(temporaryPath, { force: true }).catch(() => undefined);
+    }
     this.revision += 1;
     this.cached = session;
   }
 
   private async clearUnlocked(): Promise<void> {
+    const previous = this.cached;
     this.revision += 1;
     this.cached = { kind: "signed_out" };
     this.readPromise = undefined;
-    await rm(this.path, { force: true });
+    try {
+      await rm(this.path, { force: true });
+    } catch (error) {
+      // Suppress stale refresh publication while clearing, but do not leave a
+      // successful-looking cache when credentials remain on disk. Allow retry.
+      this.revision += 1;
+      this.cached = previous;
+      this.readPromise = undefined;
+      throw error;
+    }
   }
 
   private mutate<T>(operation: () => Promise<T>): Promise<T> {

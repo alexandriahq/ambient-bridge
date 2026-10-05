@@ -1,3 +1,14 @@
+import { usageTopupCheckoutRequestSchema } from "@ambient/shared/usage";
+import { LoginStartGate } from './auth/login-start-gate.js';
+import { LoopbackLoginListener, type LoginCallbackOutcome } from './auth/loopback-listener.js';
+import {
+  AMBIENT_FEATURE_FLAG_DEFINITIONS,
+  assistantFeatureCapabilities,
+  sanitizeFeatureFlagSlugs,
+  type FeatureFlagDefinition as BridgeFeatureFlagDefinition,
+  type FeatureFlagCapabilities as BridgeFeatureFlagCapabilities,
+} from "@ambient/shared/feature-flags";
+
 import {
   app,
   BrowserWindow,
@@ -12,38 +23,47 @@ import {
 } from "electron";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync } from "node:fs";
-import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
+import { writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { join, resolve } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
+import { BridgeStatusClock } from "./bridge-status-clock.js";
+
 import { Effect } from "effect";
-import { BridgeIpcServer, type IpcHandlerContext, type IpcStream } from "./ipc-server/socket.js";
+import { BridgeIpcServer, type IpcHandlerContext, type IpcMethodHandler, type IpcStream } from "./ipc-server/socket.js";
 import type { BridgeRequestFrame, JsonValue } from "./ipc-server/protocol.js";
 import { PairingStore, type PairedClient, type PairingRequest, type PairingResult } from "./ipc-server/pairing.js";
 import { signDescriptor, writeDescriptorFile } from "./ipc-server/descriptor.js";
 import { createDeviceIdentity } from "./devices/identity.js";
 import { CompositeAuditSink, FileAuditSink, MemoryAuditSink, RingAuditSink, type AuditEvent } from "./diagnostics/audit.js";
-import { CrashRing, crashReportTelemetryProperties } from "@ambient/shared/observability";
+import { CrashRing } from "@ambient/shared/observability";
+import { AMBIENT_BRIDGE_CAPABILITIES, AMBIENT_BRIDGE_IPC_PROTOCOL_VERSION } from "@ambient/shared/product-version";
 import { excludeWindowFromSelfCapture } from "@ambient/shared/window-capture";
-import { createBridgeCrashReportStore } from "./diagnostics/crash-report.js";
-import { promptBridgeCrashReportConsent } from "./diagnostics/crash-report-window.js";
+import { bridgeShellStatusSignature } from "./shell-status-signature.js";
+import { BRIDGE_STATUS_REQUEST_LIMIT } from "./status-dto-limits.js";
+import {
+  createBridgeCrashReportStore,
+  type BridgeCrashOrigin,
+} from "./diagnostics/crash-report.js";
 import { EncryptedSessionStore } from "./workos/token-store.js";
 import { LocalSecretVault } from "./local-secret-vault.js";
+import { buildBridgeTrayMenuTemplate } from "./tray-menu.js";
 import { clearBridgeUserQuitMarker, writeBridgeUserQuitMarker } from "./user-quit-marker.js";
 import {
   shouldRefreshWorkOsSession,
+  workOsSessionExpiresAtSeconds,
   type WorkOsFeatureFlagsByOrganization,
   type SignedInWorkOsSession,
   type WorkOsOrganization,
   type WorkOsSession,
 } from "./workos/session.js";
-import { streamResponseBody } from "./proxy/streaming.js";
+import { discardResponseBody, streamResponseBody } from "./proxy/streaming.js";
+import { ownedInferenceStream } from "./inference/owned-stream.js";
 import {
   AuthServerRequestError,
   AuthServerClient,
   BRIDGE_RETURN_URI,
   parseBridgeAuthCallback,
-  resolveServerBaseUrl,
   type AuthBrokerSessionResponse,
   type AuthOrganizationFeatureFlags,
 } from "./auth/server-client.js";
@@ -52,47 +72,59 @@ import {
   BridgeSecureClient,
   BridgeSessionService,
   createBridgeAuditService,
+  createBridgePlaintextClient,
   createBridgeSecureClient,
+  createCloudNodeSecureClient,
   createBridgeSessionService,
   secureInferenceResponse,
   type BridgeSecureClientShape,
   type InferenceProxyPath,
 } from "./inference/effect.js";
 import { forwardHandoffFeedback } from "./analytics/handoff-feedback.js";
-import { forwardTelemetryBatch } from "./analytics/telemetry.js";
+import { forwardSupportFeedback, SUPPORT_FEEDBACK_BRIDGE_METHOD } from "./analytics/support-feedback.js";
+import { parseServerTarget } from "@ambient/shared/server-targets";
+import { persistServerTarget, resolveActiveServerTarget } from "./server-target.js";
 import {
-  bridgeErrorTelemetryBatch,
-  bridgeTelemetryBatch,
-  bridgeTelemetryEnabled,
-  createBridgeErrorForwardLimiter,
-  type BridgeCrashOrigin,
-} from "./diagnostics/crash-telemetry.js";
+  loadPlaintextInferenceWarningHidden,
+  persistPlaintextInferenceWarningHidden,
+} from "./plaintext-inference-warning-preference.js";
+import {
+  forwardMultiplayerEffectivePolicy,
+  forwardMultiplayerEncryption,
+  forwardMultiplayerHeartbeat,
+  forwardMultiplayerMcp,
+  forwardMultiplayerMcpStatus,
+  forwardMultiplayerRawCaptureAvailability,
+  forwardMultiplayerRawCaptureUpload,
+  RAW_CAPTURE_MAX_UPLOAD_BYTES,
+  forwardMultiplayerMemory,
+  forwardMultiplayerPublish,
+  forwardMultiplayerCollection,
+  forwardMultiplayerReport,
+  forwardMultiplayerTrajectories,
+} from "./multiplayer/forward.js";
 import { audioTranscriptionRequestFromPayload, audioUploadMetadataFromPayload } from "./inference/audio-transcription.js";
-import { NetworkRequestHistory, readEhbpResponseEvidence, type NetworkRequestRecord } from "./inference/network-log.js";
+import { NetworkRequestHistory, readEhbpResponseEvidence, readEhbpUsageAfterBody, type NetworkRequestRecord } from "./inference/network-log.js";
 import { WireTap } from "./inference/wire-tap.js";
-import { closeCompactAuthWindow, showCompactAuthWindow } from "./compact-auth-window.js";
 import {
   BridgeWindowLifecycleController,
-  bridgeLoginItemSettings,
   bridgeLoginItemSettingsOptions,
+  isExplicitBackgroundLaunch,
   macBridgeActivationPolicy,
   resolveBridgeLaunchDecision,
-  shouldHideMacDock,
+  shouldDisableHardwareAcceleration,
+  shouldShowMacDock,
   shouldOpenMainWindowOnLaunch,
 } from "./window-lifecycle.js";
 import {
   BRIDGE_RELEASE_DEFAULT_CHANNEL,
-  BRIDGE_RELEASE_EXPERIMENTAL_CHANNEL,
-  bridgeReleaseListUrl,
+  bridgeChangelogUrl,
   bridgeUpdateBaseUrlFromEnv,
   bridgeUpdateFeedUrl,
   bridgeUpdaterUnavailableReason,
-  bridgeVersionedUpdateFeedUrl,
-  parseBridgeExperimentalBuildsResponse,
 } from "./update-feed.js";
 import {
   isHttpUrl,
-  localReleaseBuildsSnapshot,
   normalizeDownloadPercent,
   sanitizedUpdateDiagnostics,
 } from "@ambient/shared/update-core";
@@ -104,15 +136,26 @@ import {
 } from "./reachability.js";
 import { errorMessage } from "./error-message.js";
 import { createBridgeShutdownCoordinator } from "./shutdown-coordinator.js";
+import {
+  bridgeUninstallAvailability,
+  uninstallPackagedBridge,
+  type BridgeUninstallResult,
+} from "./self-uninstall.js";
+import { authCallbackUrlFromArgv, shouldUseLoopbackAuthCallback } from "./auth-callback.js";
 import { inferenceRequestKey, InferenceRequestRegistry } from "./inference/request-registry.js";
 import {
   InferenceAvailabilityCircuit,
+  inferenceAccessBlockReason,
   sessionUsageOwnerKey,
+  type InferenceAccessBlockReason,
   type InferenceAvailabilitySnapshot,
 } from "./inference/availability.js";
 import { createBridgeUsageService } from "./inference/usage-service.js";
 import { BridgeUsageCache } from "./inference/usage-cache.js";
-import { BridgeInsufficientCreditError, inferenceDomainError } from "./inference/errors.js";
+import { BridgeModelAssignmentCache } from "./inference/model-assignment-cache.js";
+import { BridgeInferencePlanCache, type BridgeInferencePlanSnapshot } from "./inference/plan-cache.js";
+import { BridgePricingCache } from "./inference/pricing-cache.js";
+import { BridgeGloballyDisabledError, BridgeInsufficientCreditError, globallyDisabledRefusalText, inferenceDomainError } from "./inference/errors.js";
 import { registerBridgeWireCaptureIpc } from "./bridge-ui-ipc.js";
 import type { BridgeWireCaptureResult } from "./bridge-ui-contract.js";
 import {
@@ -126,10 +169,28 @@ import {
 import {
   BUILD_APP_ID,
   BUILD_APP_NAME,
+  BUILD_BAKE_MARKER,
   BUILD_COMMIT_SHA,
+  BUILD_DEFAULT_MULTIPLAYER_URL,
+  BUILD_DEFAULT_SERVER_URL,
   BUILD_RELEASE_CHANNEL,
 } from "./generated/build-config.js";
 import { resolveBridgeDesktopIdentity } from "./desktop-identity.js";
+import {
+  createCloudNodeRoutingService,
+  cloudNodeSessionBoundaryKey,
+  inferenceRouteFromAssignment,
+  type CloudNodeRoute,
+} from "./cloud/node-assignment.js";
+import {
+  assertInferencePathAllowedInMode,
+  inferenceClientForMode,
+  nodeModeForRequest,
+  requestInferenceModeFromPayload,
+  type RequestInferenceMode,
+} from "./inference/request-mode.js";
+import { BridgeOrgPolicyCache, globalControlsSignature, type BridgeOrgPolicyStatus } from "./cloud/org-policy-cache.js";
+import { orgPolicyFeatureSlugs, withoutGloballyDisabledSlugs } from "@alexandria/cloud-contract";
 
 const requireFromMain = createRequire(import.meta.url);
 const { autoUpdater } = requireFromMain("electron-updater") as typeof import("electron-updater");
@@ -186,33 +247,37 @@ type BridgeFeatureFlags = {
   source: "organization" | "user";
 };
 
-type BridgeFeatureFlagKey =
-  | "integrations"
-  | "automations"
-  | "automationToggleTrack"
-  | "devtooling"
-  | "contextHandoff";
-
-type BridgeFeatureFlagFamily = "integrations" | "automations" | "devtools" | "context";
-
-type BridgeFeatureFlagDefinition = {
-  key: BridgeFeatureFlagKey;
-  slug: string;
-  title: string;
-  family: BridgeFeatureFlagFamily;
-  description: string;
-  requiresKey?: BridgeFeatureFlagKey;
-};
-
-type BridgeFeatureFlagCapabilities = Record<BridgeFeatureFlagKey, boolean>;
+const bridgeStatusClock = new BridgeStatusClock();
 
 type BridgeStatus = {
+  bridgeInstanceId: string;
+  revision: number;
   account: BridgeAccountState;
-  activity: BridgeActivityEvent[];
   authError?: string;
   appVersion: string;
   connection: "ready" | "starting" | "checking" | "retrying" | "degraded" | "proxy_unavailable" | "attestation_invalid" | "offline";
   inference: BridgeInferenceStatus;
+  plaintextInferenceWarningHidden: boolean;
+  nodeRouting: {
+    state: string;
+    organizationId: string | null;
+    workspaceId: string | null;
+    workspaceKind: "personal" | "workos_org" | null;
+    installationId: string | null;
+    origin: string | null;
+    capabilities: string[];
+    entitlements: {
+      inference: boolean;
+      multiplayer: boolean;
+      publishing: boolean;
+      mcp: boolean;
+    };
+    inferenceMode: "confidential" | "plaintext" | null;
+    configurationVersion: number | null;
+    message: string | null;
+  };
+  /** Published Cloud org policy for the signed-in organization (ADR-0295). */
+  orgPolicy: BridgeOrgPolicyStatus;
   pairedClientList: BridgePairedClient[];
   pairedClients: number;
   pairingRequests: BridgePairingRequest[];
@@ -220,6 +285,7 @@ type BridgeStatus = {
     channel: string;
     commitSha: string;
     serverUrl: string;
+    serverTarget: "staging" | "production" | null;
     version: string;
   };
   serverReachable: boolean;
@@ -232,10 +298,16 @@ type BridgeStatus = {
   socketReady: boolean;
 };
 
-type BridgeActivityEvent = {
-  name: string;
-  at: number;
-  fields: Record<string, string | number | boolean | null>;
+type BridgeRequestLogSnapshot = {
+  revision: number;
+  requests: BridgeInferenceRequestStatus[];
+};
+
+type BridgeRequestLogPatch = {
+  revision: number;
+  upserts: BridgeInferenceRequestStatus[];
+  removeIds?: string[];
+  reset?: boolean;
 };
 
 type BridgePairingRequest = {
@@ -258,12 +330,11 @@ type BridgeInferenceStatus = {
   attestation: "not_checked" | "verifying" | "verified" | "failed";
   attestationChecks: BridgeAttestationCheck[];
   attestationInProgress: boolean;
-  encryption: "ehbp";
+  encryption: "ehbp" | "none";
   lastError: string | null;
   lastRequest: BridgeInferenceRequestStatus | null;
-  requests: BridgeInferenceRequestStatus[];
   responsePrivacy: "decrypts_in_bridge";
-  serverAuth: "workos_session";
+  serverAuth: "workos_session" | "cloud_node_identity";
   serverOrigin: string;
   wireCaptureRevision: number;
 };
@@ -297,7 +368,8 @@ type BridgeUpdateStatus = {
 
 type PendingLogin = {
   callbackReturnUri: string;
-  callbackServer?: HttpServer;
+  loginUrl: string;
+  completing?: Promise<LoginCallbackOutcome>;
   callbackTimeout?: NodeJS.Timeout;
   clientState: string;
   organizationId?: string;
@@ -312,6 +384,7 @@ const SERVER_REACHABILITY_TTL_MS = 8_000;
 const SERVER_REACHABILITY_TIMEOUT_MS = 2_500;
 const IPC_SOCKET_HEALTH_INTERVAL_MS = 15_000;
 const USAGE_RECOVERY_INTERVAL_MS = 60_000;
+const ORG_POLICY_POLL_INTERVAL_MS = 60_000;
 // Proactive session-refresh retry budget. A stale access token gets renewed on
 // launch (and when the server comes back online) before the first inference
 // request; a transient WorkOS/network failure at boot is retried with backoff
@@ -322,45 +395,6 @@ const SESSION_REFRESH_MAX_DELAY_MS = 30_000;
 const AMBIENT_SESSION_TOKEN_HEADER = "x-ambient-session-token";
 const STALE_SESSION_MESSAGE = "Your Bridge sign-in expired. Sign in again to continue.";
 const APP_NAME = desktopIdentity.appName;
-const AMBIENT_FEATURE_FLAG_DEFINITIONS: readonly BridgeFeatureFlagDefinition[] = [
-  {
-    key: "integrations",
-    slug: "integrations-enabled",
-    title: "Integrations",
-    family: "integrations",
-    description: "Shows and enables the integrations area in general.",
-  },
-  {
-    key: "automations",
-    slug: "automations-enabled",
-    title: "Automations",
-    family: "automations",
-    description: "Shows and enables the automations area in general.",
-  },
-  {
-    key: "automationToggleTrack",
-    slug: "automations-toggle-track-available",
-    title: "Toggle Track automation",
-    family: "automations",
-    description: "Enables the specific Toggle Track automation capability.",
-    requiresKey: "automations",
-  },
-  {
-    key: "devtooling",
-    slug: "devtools-visible",
-    title: "Dev tooling",
-    family: "devtools",
-    description: "Shows internal and developer-only tooling.",
-  },
-  {
-    key: "contextHandoff",
-    slug: "context-handoff-available",
-    title: "Context Handoff",
-    family: "context",
-    description: "Enables Ambient-native Context Handoff.",
-  },
-];
-
 app.setName(APP_NAME);
 if (process.platform === "win32") {
   app.setAppUserModelId(APP_ID);
@@ -383,9 +417,22 @@ if (process.platform === "darwin") {
 if (process.platform === "win32") {
   app.commandLine.appendSwitch("disable-features", "CalculateNativeWinOcclusion");
 }
+// Bridge never uses Chromium GPU. Must run before app.ready; Open later
+// software-composites. Ambient keeps GPU so the product UI stays smooth.
+const bridgeLaunchDecision = resolveBridgeLaunchDecision({
+  argv: process.argv,
+  env: process.env,
+  loginItemSettings: readBridgeLoginItemSettingsBestEffort(),
+});
+// Silent (managed headless) launches never create a window or tray icon.
+const bridgeSilentMode = bridgeLaunchDecision.reason === "silent";
+if (shouldDisableHardwareAcceleration()) {
+  app.disableHardwareAcceleration();
+}
 
-// In dev the dock/taskbar would otherwise show the stock Electron icon.
-// Packaged builds get their icon from the bundle's .icns (electron-builder).
+// In unpackaged Electron the dock would otherwise show the stock icon if a
+// tile briefly appears before accessory policy sticks. Packaged builds get
+// their icon from the bundle's .icns and use LSUIElement so there is no tile.
 function applyDevDockIcon(): void {
   if (process.platform !== "darwin" || app.isPackaged || !app.dock) return;
   // main.js runs from dist/electron/, so resources/ sits two levels up.
@@ -393,6 +440,10 @@ function applyDevDockIcon(): void {
   const icon = nativeImage.createFromPath(iconPath);
   if (!icon.isEmpty()) {
     app.dock.setIcon(icon);
+  }
+  // setIcon can resurface a hidden Dock tile; re-hide after branding.
+  if (!shouldShowMacDock(process.platform, "background")) {
+    app.dock.hide();
   }
 }
 
@@ -418,7 +469,7 @@ function resolveBridgeWindowIconPath(): string | undefined {
 
 function createBridgeTrayImage(): Electron.NativeImage {
   if (process.platform === "darwin") {
-    // Dedicated monochrome lock glyph: the "Template" filename makes Electron
+    // Monochrome canonical Bridge mark: the "Template" filename makes Electron
     // mark it as a template image (and pick up the @2x sibling), so macOS
     // renders it correctly in light/dark menu bars. Resizing the full-color
     // app icon instead collapses to an illegible alpha blob.
@@ -431,7 +482,14 @@ function createBridgeTrayImage(): Electron.NativeImage {
   const iconFile = process.platform === "win32" ? "bridge-icon.ico" : "bridge-icon-source.png";
   const iconPath = resolveBridgeResourcePath(iconFile);
   const image = iconPath ? nativeImage.createFromPath(iconPath) : nativeImage.createEmpty();
-  if (process.platform !== "darwin" || image.isEmpty()) return image;
+  if (image.isEmpty()) return image;
+  if (process.platform === "linux") {
+    // StatusNotifier hosts (GNOME AppIndicator, KDE, Waybar) disagree on how
+    // aggressively to scale a large source image. Publish a panel-sized bitmap
+    // so the Bridge does not collapse into an effectively invisible icon.
+    return image.resize({ height: 22, width: 22 });
+  }
+  if (process.platform !== "darwin") return image;
 
   const trayImage = image.resize({ height: 18, width: 18 });
   trayImage.setTemplateImage(true);
@@ -444,12 +502,19 @@ let trayMenu: Menu | undefined;
 let pendingShowMainWindowReason: string | null = null;
 let ipcServer: BridgeIpcServer | undefined;
 let pendingLogin: PendingLogin | undefined;
+const loginStartGate = new LoginStartGate();
+const loginListener = new LoopbackLoginListener(query => handleAuthCallback(`${BRIDGE_RETURN_URI}${query}`));
 let authError: string | undefined;
 let workOsSessionStore: EncryptedSessionStore | undefined;
-let organizationsRefresh: Promise<void> | null = null;
+let organizationsRefresh: {
+  readonly generation: number;
+  readonly boundaryKey: string;
+  readonly pending: Promise<void>;
+} | null = null;
 const statusEvents = new EventEmitter();
 statusEvents.setMaxListeners(50);
 let lastAuthStatusSnapshotSignature: string | null = null;
+let lastShellStatusSignature: string | null = null;
 
 // Rolling 30s window of audit activity, persisted alongside crash markers so a
 // Bridge crash report carries "what Bridge was doing" — same architecture as
@@ -469,30 +534,65 @@ const bridgeCrashReports = createBridgeCrashReportStore({
 });
 let pairingStore = new PairingStore();
 const identity = createDeviceIdentity();
-const serverBaseUrl = resolveServerBaseUrl();
+if (!BUILD_BAKE_MARKER.startsWith("ambient-bake:")) {
+  throw new Error(`Invalid BUILD_BAKE_MARKER ${BUILD_BAKE_MARKER}`);
+}
+const activeServer = resolveActiveServerTarget({
+  bakedMultiplayerUrl: BUILD_DEFAULT_MULTIPLAYER_URL,
+  bakedServerUrl: BUILD_DEFAULT_SERVER_URL,
+  userDataDir: app.getPath("userData"),
+});
+const serverBaseUrl = activeServer.serverUrl;
+const multiplayerBaseUrl = activeServer.multiplayerUrl;
 const activeInferenceRequests = new InferenceRequestRegistry();
 const activeAttestationChecks = new Set<string>();
 let inferenceGeneration = 0;
 const networkHistory = new NetworkRequestHistory();
+let requestLogRevision = 0;
 const wireTap = new WireTap({
   onEvict: () => {
     markWireCaptureChanged();
   },
   onUpdate: (requestId) => {
-    networkHistory.patchLatestByRequestId(requestId, { wireCaptured: true });
+    const record = networkHistory.patchLatestByRequestId(requestId, { wireCaptured: true });
     markWireCaptureChanged();
+    if (record) publishRequestLogUpserts([record]);
   },
 });
 wireTap.install();
 const bridgeAuditService = createBridgeAuditService(audit);
-// Every inference request demands attestation: the secure client verifies the
-// enclave through the ambient-server's attestation pass-through before any sealed
-// body leaves this device. There is no unattested route.
+// Confidential Node clients verify attestation and seal requests with EHBP.
 const bridgeSecureClient = createBridgeSecureClient({ serverBaseUrl });
+const nodeSecureClients = new Map<string, BridgeSecureClientShape>();
+let plaintextInferenceWarningHidden = loadPlaintextInferenceWarningHidden(app.getPath("userData"));
 let inferenceStatus: BridgeInferenceStatus = initialInferenceStatus();
 const authServer = new AuthServerClient({ baseUrl: serverBaseUrl });
+const cloudNodeRouting = createCloudNodeRoutingService({
+  cloudBaseUrl: serverBaseUrl,
+  legacyMultiplayerBaseUrl: multiplayerBaseUrl,
+  onRotatedSessionToken: storeRotatedSessionTokenValue,
+  onStateChange: () => notifyStatusChanged(),
+  appVersion: app.getVersion(),
+  platform: process.platform,
+});
 const bridgeUsageService = createBridgeUsageService(authServer);
 const bridgeUsageCache = new BridgeUsageCache();
+const bridgeModelAssignmentCache = new BridgeModelAssignmentCache();
+// Per-account inference plan (ADR-0297); `inference.models` stays for released apps.
+const bridgeInferencePlanCache = new BridgeInferencePlanCache({
+  fetch: (sessionToken, etag) => authServer.inferencePlan(sessionToken, etag),
+  onError: (error) => audit.record("inference.plan_refresh_failed", { message: safeStatusMessage(errorMessage(error)) }),
+});
+const bridgeOrgPolicyCache = new BridgeOrgPolicyCache({
+  directory: join(app.getPath("userData"), "org-policy"),
+  fetch: (sessionToken, etag) => authServer.orgPolicy(sessionToken, etag),
+  onChange: () => notifyStatusChanged(),
+});
+const orgPolicyPollTimer = setInterval(() => {
+  void refreshOrgPolicy("poll");
+}, ORG_POLICY_POLL_INTERVAL_MS);
+orgPolicyPollTimer.unref?.();
+const bridgePricingCache = new BridgePricingCache();
 const inferenceAvailability = new InferenceAvailabilityCircuit();
 const usageRecoveryTimer = setInterval(() => {
   void refreshExhaustedAccountCircuit();
@@ -561,12 +661,14 @@ const windowLifecycle = new BridgeWindowLifecycleController({
   deactivateApp: () => {
     // Return focus/menu bar to the previously active app; without this the
     // hidden accessory app keeps "Ambient Bridge" in the menu bar.
-    if (process.platform === "darwin") app.hide();
+    if (process.platform === "darwin") {
+      app.hide();
+      applyMacBridgePresentation("background");
+    }
   },
   destroyTray,
   onStateChange: (state) => {
     audit.record("lifecycle.state_changed", {
-      authWindow: state.authWindow,
       mainWindow: state.mainWindow,
       quitting: state.quitting,
       services: state.services,
@@ -593,8 +695,8 @@ const shutdownCoordinator = createBridgeShutdownCoordinator({
   beforeShutdown: () => {
     sessionRefreshCoordinator.dispose();
     windowLifecycle.prepareForQuit();
-    closeAuthCompactWindow();
     closePendingLoginCallback();
+    loginListener.close();
   },
   exit: (exitCode) => app.exit(exitCode),
   flushAudit: () => audit.flush(),
@@ -632,9 +734,13 @@ async function createMainWindow(): Promise<BrowserWindow> {
   const icon = resolveBridgeWindowIconPath();
   const useMacWindowChrome = process.platform === "darwin";
   const window = new BrowserWindow({
-    height: 900,
-    minHeight: 560,
-    minWidth: 860,
+    // Compact Bridge shell. Ambient onboarding is wider (1120×640) for the
+    // Privacy Apps|Sites split; Bridge keeps this size so settings stay dense.
+    // The #544 720×480 shrink left the modal flush against the window padding.
+    width: 960,
+    height: 600,
+    minHeight: 520,
+    minWidth: 720,
     autoHideMenuBar: process.platform !== "darwin",
     backgroundColor: useMacWindowChrome ? "#00000000" : "#ffffff",
     ...(icon ? { icon } : {}),
@@ -652,10 +758,18 @@ async function createMainWindow(): Promise<BrowserWindow> {
       preload,
       sandbox: true,
     },
-    width: 1440,
   });
 
   excludeWindowFromSelfCapture(window);
+
+  if (process.platform === "win32" && icon) {
+    window.setAppDetails({
+      appId: APP_ID,
+      appIconPath: icon,
+      appIconIndex: 0,
+      relaunchDisplayName: APP_NAME,
+    });
+  }
 
   window.webContents.on("console-message", (_event, level, message, line, sourceId) => {
     console.log(`[renderer:${level}] ${message} (${sourceId}:${line})`);
@@ -691,6 +805,10 @@ function loadBridgeRenderer(window: BrowserWindow): Promise<void> {
 }
 
 function requestShowMainWindow(reason: string): void {
+  if (bridgeSilentMode) {
+    audit.record("lifecycle.window_show_suppressed", { reason });
+    return;
+  }
   if (!app.isReady()) {
     pendingShowMainWindowReason = reason;
     return;
@@ -699,6 +817,10 @@ function requestShowMainWindow(reason: string): void {
 }
 
 async function showMainWindowNow(reason: string): Promise<void> {
+  if (bridgeSilentMode) {
+    audit.record("lifecycle.window_show_suppressed", { reason });
+    return;
+  }
   try {
     await windowLifecycle.showMainWindow();
     audit.record("lifecycle.window_shown", { reason });
@@ -708,25 +830,21 @@ async function showMainWindowNow(reason: string): Promise<void> {
   }
 }
 
-function applyBridgeBackgroundPresentation(): void {
+function applyMacBridgePresentation(state: "background" | "visible"): void {
   if (process.platform !== "darwin") return;
   try {
-    app.setActivationPolicy(macBridgeActivationPolicy());
+    app.setActivationPolicy(macBridgeActivationPolicy(state));
   } catch (error) {
     audit.record("lifecycle.activation_policy_failed", { message: safeStatusMessage(errorMessage(error)) });
   }
-  if (shouldHideMacDock(process.platform) && app.dock) {
-    app.dock.hide();
-  }
+  if (!app.dock) return;
+  if (shouldShowMacDock(process.platform, state)) void app.dock.show();
+  else app.dock.hide();
 }
 
 function activateBridgeAppForUser(): void {
   if (process.platform !== "darwin") return;
-  // Never reassert the accessory policy / dock.hide() here: that macOS
-  // process-type transform hides the app's windows, so every reveal path
-  // (tray Show, Spotlight/Raycast reopen, activate) flashed the window and
-  // immediately hid it again. The policy is applied once at startup and
-  // nothing reverts it. app.show() undoes the app.hide() from the hide path.
+  applyMacBridgePresentation("visible");
   app.show();
   app.focus({ steal: true });
 }
@@ -741,23 +859,21 @@ function configureApplicationMenu(): void {
     {
       label: APP_NAME,
       submenu: [
-        { label: `Show ${APP_NAME}`, accelerator: "Command+O", click: () => showMainWindow() },
+        { label: `Open ${APP_NAME}`, accelerator: "Command+O", click: () => showMainWindow() },
         { label: "Hide Window", accelerator: "Command+W", click: () => windowLifecycle.hideMainWindow() },
         { type: "separator" },
         { label: `Quit ${APP_NAME}`, accelerator: "Command+Q", click: () => windowLifecycle.requestQuit() },
       ],
     },
-    { role: "editMenu" },
-    { role: "windowMenu" },
   ];
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
 // Create a quiet tray/menu-bar icon so Bridge remains reachable after its
-// window is hidden. Clicking the icon reopens the window on all tray-capable
-// desktop platforms; the menu (right-click on macOS, context menu elsewhere)
-// exposes explicit Show, Open at Login, and Quit paths.
+// window is hidden. On macOS either mouse button opens the same Open/Quit menu;
+// other desktop platforms retain click-to-open plus their native context menu.
 function setupTray(): void {
+  if (bridgeSilentMode) return;
   if (process.platform !== "win32" && process.platform !== "darwin" && process.platform !== "linux") return;
   if (tray && !tray.isDestroyed()) return;
 
@@ -766,71 +882,43 @@ function setupTray(): void {
   tray.setToolTip(APP_NAME);
   updateTrayMenu();
 
-  tray.on("click", () => showMainWindow());
-  tray.on("double-click", () => showMainWindow());
   if (process.platform === "darwin") {
-    // setContextMenu would swallow click events on macOS, leaving the icon
-    // seemingly dead; the menu lives on right-click instead.
-    tray.on("right-click", () => {
+    const showTrayMenu = () => {
       if (tray && !tray.isDestroyed() && trayMenu) tray.popUpContextMenu(trayMenu);
-    });
+    };
+    tray.on("click", showTrayMenu);
+    tray.on("right-click", showTrayMenu);
+  } else {
+    tray.on("click", () => showMainWindow());
+    tray.on("double-click", () => showMainWindow());
   }
 }
 
 function updateTrayMenu(): void {
   if (!tray || tray.isDestroyed()) return;
-  trayMenu = Menu.buildFromTemplate([
-    { label: `Show ${APP_NAME}`, click: () => showMainWindow() },
-    {
-      checked: bridgeOpenAtLogin(),
-      click: (menuItem) => setBridgeOpenAtLogin(menuItem.checked),
-      label: "Open at Login",
-      type: "checkbox",
+  trayMenu = Menu.buildFromTemplate(buildBridgeTrayMenuTemplate({
+    appName: APP_NAME,
+    handlers: {
+      onQuit: () => windowLifecycle.requestQuit(),
+      onShow: () => showMainWindow(),
     },
-    { type: "separator" },
-    { label: "Quit", click: () => windowLifecycle.requestQuit() },
-  ]);
+  }));
   if (process.platform !== "darwin") {
     tray.setContextMenu(trayMenu);
-  }
-}
-
-function bridgeOpenAtLogin(): boolean {
-  try {
-    const settings = getBridgeLoginItemSettings();
-    return Boolean(settings.openAtLogin || settings.executableWillLaunchAtLogin);
-  } catch (error) {
-    audit.record("lifecycle.login_item_read_failed", { message: safeStatusMessage(errorMessage(error)) });
-    return false;
-  }
-}
-
-function setBridgeOpenAtLogin(openAtLogin: boolean): void {
-  try {
-    app.setLoginItemSettings(bridgeLoginItemSettings({
-      execPath: process.execPath,
-      openAtLogin,
-      platform: process.platform,
-    }));
-    const settings = getBridgeLoginItemSettings();
-    audit.record("lifecycle.login_item_updated", {
-      openAtLogin: settings.openAtLogin,
-      requestedOpenAtLogin: openAtLogin,
-      status: settings.status ?? null,
-    });
-  } catch (error) {
-    audit.record("lifecycle.login_item_update_failed", {
-      message: safeStatusMessage(errorMessage(error)),
-      requestedOpenAtLogin: openAtLogin,
-    });
-  } finally {
-    updateTrayMenu();
   }
 }
 
 function getBridgeLoginItemSettings(): Electron.LoginItemSettings {
   const options = bridgeLoginItemSettingsOptions({ execPath: process.execPath, platform: process.platform });
   return options ? app.getLoginItemSettings(options) : app.getLoginItemSettings();
+}
+
+function readBridgeLoginItemSettingsBestEffort(): Electron.LoginItemSettings | undefined {
+  try {
+    return getBridgeLoginItemSettings();
+  } catch {
+    return undefined;
+  }
 }
 
 function destroyTray(): void {
@@ -883,19 +971,91 @@ async function startIpcServer(): Promise<BridgeIpcServer> {
   const socketPath = bridgeIpcSocketPath(supportDir);
   const descriptorPath = join(supportDir, "bridge.json");
 
+  const multiplayerHandlers = {
+    "status": async () => multiplayerRoutingStatusPayload() as unknown as JsonValue,
+    "effectivePolicy": async (frame) => (
+      await forwardMultiplayerEffectivePolicy(frame.id, multiplayerForwardOptions())
+    ) as unknown as JsonValue,
+    "encryption": async (frame) => (
+      await forwardMultiplayerEncryption(frame.id, multiplayerForwardOptions())
+    ) as unknown as JsonValue,
+    "collection": async (frame) => (await forwardMultiplayerCollection(frame.id, frame.payload, multiplayerForwardOptions())) as JsonValue,
+    "publish": async (frame) => (
+      await forwardMultiplayerPublish(frame.id, frame.payload, multiplayerForwardOptions())
+    ) as unknown as JsonValue,
+    "report": async (frame) => (
+      await forwardMultiplayerReport(frame.id, frame.payload, multiplayerForwardOptions())
+    ) as unknown as JsonValue,
+    "heartbeat": async (frame) => (
+      await forwardMultiplayerHeartbeat(frame.id, multiplayerForwardOptions())
+    ) as unknown as JsonValue,
+    "memory": async (frame) => (
+      await forwardMultiplayerMemory(frame.id, frame.payload, multiplayerForwardOptions())
+    ) as unknown as JsonValue,
+    "trajectories": async (frame) => (
+      await forwardMultiplayerTrajectories(frame.id, frame.payload, multiplayerForwardOptions())
+    ) as unknown as JsonValue,
+    "mcp": async (frame) => (
+      await forwardMultiplayerMcp(frame.id, frame.payload, multiplayerForwardOptions())
+    ) as unknown as JsonValue,
+    "mcpStatus": async (frame) => (
+      await forwardMultiplayerMcpStatus(frame.id, multiplayerForwardOptions())
+    ) as unknown as JsonValue,
+  } satisfies Record<string, IpcMethodHandler>;
+  // Raw capture is a new generation-only surface: no legacy lighthouse alias.
+  const rawCaptureMethods: Record<string, IpcMethodHandler> = {
+    "multiplayer.rawCaptureAvailability": async (frame) => (
+      await forwardMultiplayerRawCaptureAvailability(frame.id, multiplayerForwardOptions())
+    ) as unknown as JsonValue,
+    "multiplayer.rawCaptureUpload": async (frame, context) => {
+      const manifest = frame.payload && typeof frame.payload === "object" && !Array.isArray(frame.payload)
+        ? (frame.payload as { manifest?: { byteLength?: unknown; sha256?: unknown } }).manifest : undefined;
+      const expectedByteLength = typeof manifest?.byteLength === "number" ? manifest.byteLength : undefined;
+      if (!expectedByteLength || expectedByteLength > RAW_CAPTURE_MAX_UPLOAD_BYTES) throw new Error("Invalid raw capture upload.");
+      const bytes = await context.readBinaryUpload({ expectedByteLength, maxBytes: RAW_CAPTURE_MAX_UPLOAD_BYTES,
+        ...(typeof manifest?.sha256 === "string" ? { expectedSha256: manifest.sha256 } : {}) });
+      return (await forwardMultiplayerRawCaptureUpload(frame.id, frame.payload, bytes, multiplayerForwardOptions())) as unknown as JsonValue;
+    },
+  };
+  // Both protocol generations share each handler, including its live options.
+  const multiplayerMethods: Record<string, IpcMethodHandler> = {};
+  for (const prefix of ["multiplayer", "lighthouse"]) {
+    for (const [name, handler] of Object.entries(multiplayerHandlers)) {
+      multiplayerMethods[`${prefix}.${name}`] = handler;
+    }
+  }
+
   const server = new BridgeIpcServer({
     audit,
     handlers: {
-      "bridge.health": async () => ({ ok: true, version: app.getVersion() }),
+      "bridge.health": async () => ({
+        // The app sends a feature's new request fields only to a Bridge listing it.
+        capabilities: [AMBIENT_BRIDGE_CAPABILITIES.inferenceMode],
+        ok: true,
+        protocolVersion: AMBIENT_BRIDGE_IPC_PROTOCOL_VERSION,
+        version: app.getVersion(),
+      }),
       "bridge.status": async (frame) => getStatus({
         forceRefreshReachability: payloadBoolean(frame.payload, "refreshReachability"),
         forceRefreshSession: payloadBoolean(frame.payload, "refreshSession"),
       }),
+      "bridge.setServerTarget": async (frame) => setHostedServerTarget(payloadString(frame.payload, "target")),
+      "bridge.setPlaintextInferenceWarningHidden": async (frame) => (
+        setPlaintextInferenceWarningHidden(payloadBoolean(frame.payload, "hidden"))
+      ),
       "bridge.statusSubscribe": (_frame, context) => statusSubscriptionStream(context.socketClosed),
+      "bridge.refreshStatus": async (frame) => {
+        await getStatus({
+          forceRefreshSession: payloadBoolean(frame.payload, "refreshSession"),
+          forceRefreshReachability: payloadBoolean(frame.payload, "refreshReachability"),
+        });
+        statusEvents.emit("changed");
+        return { ok: true };
+      },
       "auth.integrationToken": async () => integrationTokenPayload(),
       "auth.session": async () => localSessionPayload(),
       "auth.cancelSignIn": async () => cancelSignInViaIpc(),
-      "auth.signIn": async () => signInViaIpc(),
+      "auth.signIn": async (frame) => signInViaIpc({ restart: payloadBoolean(frame.payload, "restart"), reopen: payloadBoolean(frame.payload, "reopen") }),
       "auth.signOut": async () => {
         await performSignOut();
         return { ok: true };
@@ -905,19 +1065,79 @@ async function startIpcServer(): Promise<BridgeIpcServer> {
         if (!organizationId) {
           throw new Error("organizationId is required.");
         }
-        return switchOrganization(organizationId, { compactWindow: false });
+        return switchOrganization(organizationId, { showBridgeOnCompletion: false });
       },
       "auth.organizations": async () => organizationsPayload(),
       "usage.summary": async (frame) => (
         await usageSnapshotPayload(payloadBoolean(frame.payload, "refresh"))
       ) as unknown as JsonValue,
+      "usage.pricing": async (frame) => (
+        await usagePricingPayload(payloadBoolean(frame.payload, "refresh"))
+      ) as unknown as JsonValue,
+      "usage.breakdown": async () => (
+        await usageModelBreakdownPayload()
+      ) as unknown as JsonValue,
+      "usage.instanceHistory": async () => (
+        await usageInstanceHistoryPayload()
+      ) as unknown as JsonValue,
+      "usage.topupOptions": async (frame) => (
+        await usageTopupOptionsPayload(payloadBoolean(frame.payload, "customAmounts"))
+      ) as unknown as JsonValue,
+      "usage.createTopupCheckout": async (frame) => (
+        await usageCreateTopupCheckoutPayload(frame.payload)
+      ) as unknown as JsonValue,
+      "usage.billing": async () => (
+        await usageBillingPayload((token) => authServer.usageBillingState(token))
+      ) as unknown as JsonValue,
+      "usage.billingSetupIntent": async () => (
+        await usageBillingPayload((token) => authServer.createUsageBillingSetupIntent(token), { mutates: false })
+      ) as unknown as JsonValue,
+      "usage.billingAttachPaymentMethod": async (frame) => {
+        const setupIntentId = payloadString(frame.payload, "setupIntentId");
+        if (!setupIntentId || !/^seti_[A-Za-z0-9_]{1,200}$/.test(setupIntentId)) {
+          throw new Error("A completed card setup is required.");
+        }
+        return (await usageBillingPayload(
+          (token) => authServer.attachUsageBillingPaymentMethod(token, setupIntentId),
+          { mutates: true },
+        )) as unknown as JsonValue;
+      },
+      "usage.billingRemovePaymentMethod": async () => (
+        await usageBillingPayload((token) => authServer.removeUsageBillingPaymentMethod(token), { mutates: true })
+      ) as unknown as JsonValue,
+      "usage.billingSetSpendingLimit": async (frame) => (
+        await usageBillingPayload(
+          (token) => authServer.setUsageSpendingLimit(token, spendingLimitPayload(frame.payload)),
+          { mutates: true },
+        )
+      ) as unknown as JsonValue,
+      "usage.billingSetMode": async (frame) => {
+        const mode = payloadString(frame.payload, "mode");
+        if (mode !== "usage" && mode !== "credits") throw new Error("Billing mode must be usage or credits.");
+        return (await usageBillingPayload((token) => authServer.setUsageBillingMode(token, mode), { mutates: true })) as unknown as JsonValue;
+      },
+      "plans.list": async () => (await plansListPayload()) as unknown as JsonValue,
+      "plans.checkout": async (frame) => (await planCheckoutPayload(payloadString(frame.payload, "planId"))) as unknown as JsonValue,
+      "plans.portal": async () => (await planPortalPayload()) as unknown as JsonValue,
+      "inference.models": async (frame) => (
+        await inferenceModelsSnapshotPayload(payloadBoolean(frame.payload, "refresh"))
+      ) as unknown as JsonValue,
+      "inference.plan": async (frame) => (
+        await inferencePlanSnapshotPayload(payloadBoolean(frame.payload, "refresh"))
+      ) as unknown as JsonValue,
+      "announcements.list": async (frame) => (
+        await announcementsSnapshotPayload(payloadBoolean(frame.payload, "refresh"))
+      ) as unknown as JsonValue,
       "analytics.handoffFeedback": async (frame) => forwardHandoffFeedbackAnalytics(frame),
-      "analytics.telemetryBatch": async (frame) => forwardTelemetryBatchAnalytics(frame),
+      [SUPPORT_FEEDBACK_BRIDGE_METHOD]: async (frame) => forwardSupportFeedbackToCloud(frame),
+      ...multiplayerMethods,
+      ...rawCaptureMethods,
       "inference.audioSpeech": async () => unsupportedInferenceMethod("inference.audioSpeech"),
       "inference.audioTranscriptions": (frame, context) => forwardAudioTranscription(frame, context),
       "inference.chatCompletions": (frame, context) => forwardInference(frame, context, "/v1/chat/completions"),
-      "inference.embeddings": async () => unsupportedInferenceMethod("inference.embeddings"),
+      "inference.embeddings": (frame, context) => forwardInference(frame, context, "/v1/embeddings"),
       "inference.responses": (frame, context) => forwardInference(frame, context, "/v1/responses"),
+      "inference.dailyReport": (frame, context) => forwardInference(frame, context, "/v1/responses"),
       "inference.cancel": async (frame, context) => cancelInference(frame, context),
       "pair.start": async (frame) => {
         const clientName =
@@ -959,6 +1179,12 @@ async function startIpcServer(): Promise<BridgeIpcServer> {
     identity.privateKeyPem,
   );
   await writeDescriptorFile(descriptorPath, descriptor);
+  await writeFile(join(supportDir, "diagnostic-support.json"), JSON.stringify({
+    schemaVersion: 1, version: app.getVersion(),
+    logPath: join(app.getPath("userData"), "logs", "bridge-audit.jsonl"),
+  }), { mode: 0o600 }).catch((error: unknown) => {
+    audit.record("diagnostics.support_marker_failed", { message: safeStatusMessage(errorMessage(error)) });
+  });
   audit.record("ipc.started", { descriptorPath, socketPath });
   return server;
 }
@@ -987,21 +1213,56 @@ async function getStatus(options: {
     await refreshStoredSessionDirect("forced_status", { force: true });
     await refreshOrganizations();
   }
-  const [session, reachability, socketReady] = await Promise.all([
+  let [session, reachability, socketReady] = await Promise.all([
     sessionStore().read(),
     currentServerReachability({ force: options.forceRefreshReachability === true }),
     ensureIpcSocketAlive(),
   ]);
-  const account = pendingLogin
-    ? { kind: "login_pending" as const }
-    : publicAccountState(bridgeUiE2eWireUrl() ? bridgeUiE2eSession() : session);
+  const currentNodeRouting = await Effect.runPromise(cloudNodeRouting.snapshot());
+  if (
+    session.kind === "signed_in"
+    && !bridgeUiE2eWireUrl()
+    && (
+      currentNodeRouting.state === "unknown"
+      || (options.forceRefreshReachability === true
+        && (currentNodeRouting.state === "unavailable" || currentNodeRouting.state === "seat_limit_reached"))
+    )
+  ) {
+    // Status must stay local-fast: bootstrap runs in the background and its
+    // state-change callback wakes statusSubscribe with resolving/ready/error.
+    // Do not restart a failed bootstrap from the status-change notification;
+    // that would create an unbounded retry loop while Cloud is unavailable.
+    void Effect.runPromise(cloudNodeRouting.resolve(session, {
+      force: options.forceRefreshReachability === true,
+    })).catch(() => undefined);
+  }
+  if (session.kind === "signed_in" && !bridgeUiE2eWireUrl()) {
+    // Local-fast like node routing: the fetch runs in the background and the
+    // cache's change callback wakes statusSubscribe.
+    void refreshOrgPolicy("status");
+  }
+  const nodeRoutingSnapshot = await Effect.runPromise(cloudNodeRouting.snapshot());
+  if (session.kind === "signed_in" && nodeRoutingSnapshot.state === "ready") {
+    // A seat was freed (bootstrap accepted this member again).
+    inferenceAvailability.accessRestored(sessionUsageOwnerKey(session), "seat_limit_reached");
+  }
+  const nodeRouting: BridgeStatus["nodeRouting"] = {
+    ...nodeRoutingSnapshot,
+    capabilities: [...nodeRoutingSnapshot.capabilities],
+  };
   const e2eFixture = bridgeUiE2eWireUrl() !== null;
   const serverReachable = e2eFixture || reachability.state === "reachable";
   const sessionRefresh = sessionRefreshCoordinator.snapshot();
 
-  const status: BridgeStatus = {
+  // No awaits between reading the current account and stamping its revision.
+  // A status request started before logout must not label its old account with
+  // the revision of the newly cleared session.
+  session = sessionStore().peekCached() ?? session;
+  const account = pendingLogin
+    ? { kind: "login_pending" as const }
+    : publicAccountState(bridgeUiE2eWireUrl() ? bridgeUiE2eSession() : session);
+  const status: Omit<BridgeStatus, "bridgeInstanceId" | "revision"> = {
     account,
-    activity: recentActivity(),
     appVersion: app.getVersion(),
     authError,
     connection: e2eFixture
@@ -1016,8 +1277,12 @@ async function getStatus(options: {
       attestationChecks: inferenceStatus.attestationChecks.map((check) => ({ ...check })),
       attestationInProgress: activeAttestationChecks.size > 0,
       lastRequest: networkHistory.latest(),
-      requests: networkHistory.list(),
     },
+    plaintextInferenceWarningHidden,
+    nodeRouting,
+    orgPolicy: bridgeOrgPolicyCache.snapshot(
+      account.kind === "signed_in" ? account.featureFlags.evaluatedFor.organizationId : null,
+    ),
     pairedClientList: pairingStore.listClients().map(publicPairedClient),
     pairedClients: pairingStore.listClients().filter((client) => !client.credential.revokedAt).length,
     pairingRequests: pairingStore.listRequests()
@@ -1027,6 +1292,7 @@ async function getStatus(options: {
       channel: BUILD_RELEASE_CHANNEL,
       commitSha: BUILD_COMMIT_SHA,
       serverUrl: new URL(serverBaseUrl).origin,
+      serverTarget: activeServer.target,
       version: app.getVersion(),
     },
     serverReachable,
@@ -1039,7 +1305,7 @@ async function getStatus(options: {
     socketReady,
   };
   recordAuthStatusSnapshot(status.account, options.forceRefreshSession ? "force_refresh" : "read");
-  return status;
+  return { ...status, ...bridgeStatusClock.observe(JSON.stringify(status)) };
 }
 
 function currentServerReachability(options: { readonly force?: boolean } = {}): Promise<ServerReachabilitySnapshot> | ServerReachabilitySnapshot {
@@ -1057,15 +1323,29 @@ function connectionState(input: {
   return sessionRefreshConnectionState(input.sessionRefresh);
 }
 
-function recentActivity(): BridgeActivityEvent[] {
-  return audit.recent().slice(-200).reverse().map((event) => ({
-    at: event.at,
-    fields: Object.fromEntries(
-      Object.entries(event.fields)
-        .filter((entry): entry is [string, string | number | boolean | null] => entry[1] !== undefined),
-    ),
-    name: event.name,
-  }));
+function getRequestLog(): BridgeRequestLogSnapshot {
+  return {
+    revision: requestLogRevision,
+    requests: networkHistory.list(BRIDGE_STATUS_REQUEST_LIMIT),
+  };
+}
+
+function publishRequestLogUpserts(records: readonly BridgeInferenceRequestStatus[]): void {
+  if (records.length === 0) return;
+  requestLogRevision += 1;
+  sendToMainWindow("bridge:request-log-changed", {
+    revision: requestLogRevision,
+    upserts: records.map((record) => ({ ...record })),
+  } satisfies BridgeRequestLogPatch);
+}
+
+function publishRequestLogReset(): void {
+  requestLogRevision += 1;
+  sendToMainWindow("bridge:request-log-changed", {
+    revision: requestLogRevision,
+    reset: true,
+    upserts: [],
+  } satisfies BridgeRequestLogPatch);
 }
 
 function recordAuthStatusSnapshot(account: BridgeAccountState, reason: string): void {
@@ -1109,6 +1389,7 @@ function authStatusSnapshotSignature(account: BridgeAccountState): string {
 }
 
 ipcMain.handle("bridge:get-status", () => getStatus());
+ipcMain.handle("bridge:get-request-log", () => getRequestLog());
 ipcMain.handle("bridge:retry-reachability", () => getStatus({ forceRefreshReachability: true }));
 ipcMain.handle("bridge:get-update-status", () => getUpdateStatus());
 registerBridgeWireCaptureIpc(ipcMain, {
@@ -1221,78 +1502,134 @@ ipcMain.handle("bridge:install-update", () => installBridgeUpdate());
 
 ipcMain.handle("bridge:view-update-release-notes", () => openBridgeUpdateReleaseNotes());
 
-ipcMain.handle("bridge:experimental-builds", () => listExperimentalBridgeBuilds());
+ipcMain.handle("bridge:get-uninstall-availability", () => bridgeUninstallAvailability({
+  execPath: process.execPath,
+  packaged: app.isPackaged,
+  platform: process.platform,
+}));
 
-ipcMain.handle("bridge:install-experimental", (_event, version: unknown) => installExperimentalBridgeBuild(version));
+ipcMain.handle("bridge:uninstall", async () => {
+  const options = { execPath: process.execPath, packaged: app.isPackaged, platform: process.platform };
+  const availability = bridgeUninstallAvailability(options);
+  if (!availability.available) throw new Error(availability.reason ?? "Ambient Bridge cannot be uninstalled here.");
 
-async function startLoginFlow(options: { organizationId?: string; compactWindow?: boolean } = {}): Promise<void> {
-  authError = undefined;
-  closePendingLoginCallback();
-  const clientState = randomBytes(32).toString("base64url");
-  const callbackTarget = await createAuthCallbackTarget();
-  const callbackTimeout = setTimeout(() => {
-    handleLoginTimeout(clientState);
-  }, LOGIN_CALLBACK_TIMEOUT_MS);
-  callbackTimeout.unref();
-  pendingLogin = {
-    callbackReturnUri: callbackTarget.returnUri,
-    callbackServer: callbackTarget.server,
-    callbackTimeout,
-    clientState,
-    organizationId: options.organizationId,
-    showBridgeOnCompletion: options.compactWindow !== false,
-  };
-
-  const loginUrl = authServer.createLoginUrl(
-    pendingLogin.clientState,
-    pendingLogin.callbackReturnUri,
-    options.organizationId,
-  );
-  audit.record("auth.login_start", {});
-  console.info("[bridge:auth] opening browser sign-in", {
-    callbackMode: pendingLogin.callbackServer ? "loopback" : "protocol",
-    returnUri: pendingLogin.callbackReturnUri,
-  });
-  notifyStatusChanged();
-  if (options.compactWindow !== false) await showAuthPendingCompactWindow();
+  audit.record("lifecycle.uninstall_requested", {});
+  writeBridgeUserQuitMarker(bridgeIpcSupportDir());
   try {
-    await shell.openExternal(loginUrl);
+    await uninstallPackagedBridge({
+      ...options,
+      productName: app.getName(),
+      trashItem: (target) => shell.trashItem(target),
+    });
   } catch (error) {
-    closePendingLoginCallback();
-    if (options.compactWindow !== false) {
-      closeAuthCompactWindow();
-      showMainWindow();
-    }
-    authError = errorMessage(error);
-    notifyStatusChanged();
+    clearBridgeUserQuitMarker(bridgeIpcSupportDir());
+    audit.record("lifecycle.uninstall_failed", { message: safeStatusMessage(errorMessage(error)) });
     throw error;
   }
+  audit.record("lifecycle.uninstall_completed", {});
+  setImmediate(() => windowLifecycle.requestQuit());
+  return { status: "uninstalled" } satisfies BridgeUninstallResult;
+});
+
+async function startLoginFlow(options: {
+  organizationId?: string;
+  showBridgeOnCompletion?: boolean;
+  restart?: boolean;
+  reopen?: boolean;
+} = {}): Promise<void> {
+  if (options.restart || (pendingLogin && options.organizationId !== pendingLogin.organizationId)) closePendingLoginCallback();
+  return loginStartGate.run(async isCurrent => {
+    if (pendingLogin) {
+      pendingLogin.showBridgeOnCompletion ||= options.showBridgeOnCompletion === true;
+      if (options.reopen && !pendingLogin.completing) await shell.openExternal(pendingLogin.loginUrl);
+      notifyStatusChanged();
+      return;
+    }
+    authError = undefined;
+    const clientState = randomBytes(32).toString("base64url");
+    const returnUri = useLoopbackAuthCallback() ? await loginListener.open() : BRIDGE_RETURN_URI;
+    if (!isCurrent()) return;
+    const callbackTimeout = setTimeout(() => handleLoginTimeout(clientState), LOGIN_CALLBACK_TIMEOUT_MS);
+    callbackTimeout.unref();
+    const login: PendingLogin = {
+      callbackReturnUri: returnUri, callbackTimeout, clientState,
+      loginUrl: authServer.createLoginUrl(clientState, returnUri, options.organizationId),
+      organizationId: options.organizationId,
+      showBridgeOnCompletion: options.showBridgeOnCompletion === true,
+    };
+    pendingLogin = login;
+    audit.record("auth.login_start", {});
+    notifyStatusChanged();
+    try { await shell.openExternal(login.loginUrl); }
+    catch (error) {
+      if (pendingLogin === login) {
+        closePendingLoginCallback(); authError = errorMessage(error); notifyStatusChanged();
+      }
+      throw error;
+    }
+  }, options.organizationId ?? "");
+}
+
+function setPlaintextInferenceWarningHidden(hidden: boolean): JsonValue {
+  if (plaintextInferenceWarningHidden === hidden) {
+    return { hidden, ok: true };
+  }
+  persistPlaintextInferenceWarningHidden(app.getPath("userData"), hidden);
+  plaintextInferenceWarningHidden = hidden;
+  audit.record("inference.plaintext_warning_visibility_changed", { hidden });
+  notifyStatusChanged();
+  return { hidden, ok: true };
+}
+
+async function setHostedServerTarget(rawTarget: string | null): Promise<JsonValue> {
+  const target = parseServerTarget(rawTarget);
+  if (!target) {
+    throw new Error("target must be staging or production.");
+  }
+  persistServerTarget(app.getPath("userData"), target);
+  audit.record("server.target_changed", { target });
+  try {
+    await performSignOut();
+  } catch (error) {
+    audit.record("server.target_sign_out_failed", { message: errorMessage(error) });
+  }
+  setImmediate(() => {
+    app.relaunch();
+    app.exit(0);
+  });
+  return { ok: true, relaunching: true, target };
 }
 
 async function performSignOut(): Promise<void> {
+  closePendingLoginCallback();
   const store = sessionStore();
   const session = await store.read();
-  if (session.kind === "signed_in") {
-    try {
-      const logoutUrl = await authServer.createLogoutUrl(session.sessionToken);
-      await shell.openExternal(logoutUrl);
-    } catch (error) {
-      audit.record("auth.logout_remote_failed", { message: errorMessage(error) });
-    }
-  }
-
-  closePendingLoginCallback();
-  closeAuthCompactWindow();
+  const sessionToken = session.kind === "signed_in" ? session.sessionToken : null;
   authError = undefined;
-  clearInferenceTransparency();
   await store.clear();
+  clearInferenceTransparency();
   audit.record("auth.sign_out", {});
   notifyStatusChanged();
+
+  // Local sign-out is authoritative and immediate. WorkOS logout plus browser
+  // presentation is best-effort and must never leave Bridge appearing signed
+  // in when the provider or browser is slow.
+  if (sessionToken) {
+    void (async () => {
+      try {
+        const logoutUrl = await authServer.createLogoutUrl(sessionToken);
+        await shell.openExternal(logoutUrl);
+      } catch (error) {
+        audit.record("auth.logout_remote_failed", { message: errorMessage(error) });
+      }
+    })();
+  }
 }
 
 function cancelPendingLogin(reason: string): boolean {
+  loginStartGate.cancel();
   const login = pendingLogin;
-  if (!login) return false;
+  if (!login) { loginListener.retainForOldTabs(); return false; }
   clearLoginResources(login);
   pendingLogin = undefined;
   authError = undefined;
@@ -1306,13 +1643,7 @@ function cancelSignInViaIpc(): JsonValue {
   return { status: cancelled ? "cancelled" : "idle" };
 }
 
-function cancelAuthFromCompactWindow(): void {
-  cancelPendingLogin("compact_window");
-  closeAuthCompactWindow();
-  showMainWindow();
-}
-
-ipcMain.handle("bridge:start-login", () => startLoginFlow());
+ipcMain.handle("bridge:start-login", (_event, options?: { restart?: boolean; reopen?: boolean }) => startLoginFlow({ restart: options?.restart === true, reopen: options?.reopen === true, showBridgeOnCompletion: true }));
 
 ipcMain.handle("bridge:sign-out", () => performSignOut());
 
@@ -1354,7 +1685,15 @@ if (!hasSingleInstanceLock) {
 app.on("second-instance", (_event, argv) => {
   const decision = resolveBridgeLaunchDecision({ argv, env: process.env });
   audit.record("lifecycle.second_instance", { mode: decision.mode, reason: decision.reason });
-  if (shouldOpenMainWindowOnLaunch(decision)) {
+  const authCallbackUrl = authCallbackUrlFromArgv(argv);
+  if (authCallbackUrl) {
+    void handleAuthCallback(authCallbackUrl);
+    return;
+  }
+  // Finder / Start-menu reopen should reveal UI even though cold start stays
+  // hidden. Only keep the surviving instance headless when the second launch
+  // itself asked for background (login-item / --ambient-bridge-background).
+  if (!isExplicitBackgroundLaunch(decision)) {
     showMainWindow();
   }
 });
@@ -1368,8 +1707,9 @@ app.whenReady().then(async () => {
     audit.record("lifecycle.user_quit_marker_clear_failed", { message: safeStatusMessage(errorMessage(error)) });
   }
   configureApplicationMenu();
+  applyMacBridgePresentation("background");
+  // Dev dock icon must run after accessory/hide so setIcon cannot flash a tile.
   applyDevDockIcon();
-  applyBridgeBackgroundPresentation();
   setupTray();
   if (!useLoopbackAuthCallback()) {
     registerAuthCallbackProtocol();
@@ -1382,6 +1722,8 @@ app.whenReady().then(async () => {
   }, IPC_SOCKET_HEALTH_INTERVAL_MS);
   socketHealthTimer.unref?.();
   configureBridgeUpdater();
+  // Feed config only — do not checkForUpdates here. Ambient App reconciles
+  // Bridge versions; this process stays silent unless Dev IPC asks.
   // Renew a stale WorkOS session on launch (with retry) so the first inference
   // request doesn't fail with "Auth provider unavailable" when the stored
   // access token expired while the app was closed. Refill the organization
@@ -1390,12 +1732,12 @@ app.whenReady().then(async () => {
   void refreshStoredSessionResilient("startup").finally(() => {
     void refreshOrganizations();
   });
-  const launchDecision = resolveBridgeLaunchDecision({
-    argv: process.argv,
-    env: process.env,
-    loginItemSettings: getBridgeLoginItemSettings(),
+  const launchDecision = bridgeLaunchDecision;
+  audit.record("lifecycle.launch", {
+    mode: launchDecision.mode,
+    reason: launchDecision.reason,
+    hardwareAcceleration: shouldDisableHardwareAcceleration() ? "off" : "on",
   });
-  audit.record("lifecycle.launch", { mode: launchDecision.mode, reason: launchDecision.reason });
   const pendingShowReason = pendingShowMainWindowReason;
   pendingShowMainWindowReason = null;
   if (pendingShowReason) {
@@ -1403,10 +1745,6 @@ app.whenReady().then(async () => {
   } else if (shouldOpenMainWindowOnLaunch(launchDecision)) {
     await showMainWindowNow("initial_launch");
   }
-  recordBridgeLaunchTelemetry();
-  void maybePromptPendingBridgeCrashReports().catch((error) => {
-    audit.record("crash.report_flow_failed", { message: safeStatusMessage(errorMessage(error)) });
-  });
   armDevCrashTrigger();
 }).catch((error) => {
   console.error("[bridge] startup failed", error);
@@ -1414,11 +1752,9 @@ app.whenReady().then(async () => {
 });
 
 /**
- * Testing hook for the whole crash pipeline: with AMBIENT_DEV_CRASH_AFTER_MS
- * set, the Bridge main process throws an uncaught exception after that many
- * ms — exercising the real snapshot → marker → reopen-consent → telemetry flow
- * with no code edit, in dev and packaged builds alike. Inert unless the env
- * var is explicitly set to a valid delay.
+ * Testing hook for local crash snapshots: with AMBIENT_DEV_CRASH_AFTER_MS set,
+ * the Bridge main process throws an uncaught exception after that many ms.
+ * Inert unless the env var is explicitly set to a valid delay.
  */
 function armDevCrashTrigger(): void {
   const raw = process.env.AMBIENT_DEV_CRASH_AFTER_MS?.trim();
@@ -1448,8 +1784,20 @@ function registerAuthCallbackProtocol(): void {
   audit.record("auth.protocol_register", { registered });
 }
 
-async function handleAuthCallback(rawUrl: string): Promise<void> {
+async function handleAuthCallback(rawUrl: string): Promise<LoginCallbackOutcome> {
   const login = pendingLogin;
+  // Validate before touching active state: stale tabs must never cancel it.
+  try { parseBridgeAuthCallback(rawUrl, login?.clientState); } catch { return "replaced"; }
+  if (!login) return "replaced";
+  if (login.completing) return login.completing;
+  if (login.callbackTimeout) clearTimeout(login.callbackTimeout);
+  login.completing = completeLogin(rawUrl, login);
+  return login.completing;
+}
+
+async function completeLogin(rawUrl: string, login: PendingLogin): Promise<LoginCallbackOutcome> {
+  const store = sessionStore();
+  let outcome: LoginCallbackOutcome = "failed";
   try {
     if (!login) {
       throw new Error("Bridge auth callback arrived without a pending login.");
@@ -1462,11 +1810,13 @@ async function handleAuthCallback(rawUrl: string): Promise<void> {
     }
 
     const authSession = await authServer.redeemTicket(callback.ticket);
+    if (pendingLogin !== login) return "replaced";
     console.info("[bridge:auth] ticket redeemed", { userId: authSession.user.id });
     audit.record("auth.ticket_redeemed", { userId: authSession.user.id });
 
     clearInferenceTransparency();
-    await sessionStore().write(toStoredSession(authSession));
+    const written = await store.writeIfOwned(toStoredSession(authSession), () => pendingLogin === login);
+    if (!written || pendingLogin !== login) return "replaced";
     // A request could have started with the old cached session while the new
     // encrypted session was being written. Advance the boundary again only
     // after replacement is durable so that work cannot survive re-auth.
@@ -1474,12 +1824,14 @@ async function handleAuthCallback(rawUrl: string): Promise<void> {
     console.info("[bridge:auth] session stored");
     audit.record("auth.session_stored", {});
     pendingLogin = undefined;
+    outcome = "success";
     authError = undefined;
     audit.record("auth.login_complete", {
       userId: authSession.user.id,
     });
     void refreshOrganizations();
   } catch (error) {
+    if (pendingLogin !== login) return "replaced";
     authError = errorMessage(error);
     console.error("[bridge:auth] login failed", authError);
     audit.record("auth.login_failed", { message: authError });
@@ -1491,67 +1843,21 @@ async function handleAuthCallback(rawUrl: string): Promise<void> {
   }
 
   notifyStatusChanged();
-  if (login?.showBridgeOnCompletion) showMainWindow();
-}
-
-async function createAuthCallbackTarget(): Promise<{
-  returnUri: string;
-  server?: HttpServer;
-}> {
-  if (!useLoopbackAuthCallback()) {
-    return { returnUri: BRIDGE_RETURN_URI };
-  }
-
-  const server = createHttpServer((request, response) => {
-    handleLoopbackAuthRequest(request.url ?? "/", request.headers.host, response);
-  });
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      server.off("error", reject);
-      resolve();
-    });
-  });
-
-  const address = server.address();
-  if (!address || typeof address === "string") {
-    closeAuthCallbackServer(server);
-    throw new Error("Could not start Bridge auth callback listener.");
-  }
-
-  return {
-    returnUri: `http://127.0.0.1:${address.port}/auth/callback`,
-    server,
-  };
-}
-
-function handleLoopbackAuthRequest(path: string, host: string | undefined, response: {
-  statusCode: number;
-  setHeader(name: string, value: string): void;
-  end(body: string): void;
-}): void {
-  const requestUrl = new URL(path, `http://${host ?? "127.0.0.1"}`);
-  if (requestUrl.pathname !== "/auth/callback") {
-    response.statusCode = 404;
-    response.end("Not found");
-    return;
-  }
-
-  response.statusCode = 200;
-  response.setHeader("Content-Type", "text/html; charset=utf-8");
-  response.end("<!doctype html><title>Ambient Bridge</title><p>Sign-in complete. You can return to Ambient Bridge.</p>");
-  void handleAuthCallback(`${BRIDGE_RETURN_URI}${requestUrl.search}`);
+  if (login.showBridgeOnCompletion) showMainWindow();
+  return outcome;
 }
 
 function useLoopbackAuthCallback(): boolean {
-  const mode = process.env.AMBIENT_BRIDGE_AUTH_CALLBACK_MODE;
-  if (mode === "protocol") return false;
-  if (mode === "loopback") return true;
-  if (process.platform === "win32") return true;
-  return !app.isPackaged;
+  return shouldUseLoopbackAuthCallback({
+    env: process.env,
+    isPackaged: app.isPackaged,
+    platform: process.platform,
+  });
 }
 
 function closePendingLoginCallback(): void {
+  loginStartGate.cancel();
+  loginListener.retainForOldTabs();
   clearLoginResources(pendingLogin);
   pendingLogin = undefined;
 }
@@ -1568,48 +1874,14 @@ function handleLoginTimeout(clientState: string): void {
   if (login.showBridgeOnCompletion) showMainWindow();
 }
 
-async function showAuthPendingCompactWindow(): Promise<void> {
-  try {
-    const window = await windowLifecycle.showMainWindow() as BrowserWindow;
-    showCompactAuthWindow({
-      appName: APP_NAME,
-      anchorWindow: window,
-      detail: "Continue in your browser",
-      onCancel: cancelAuthFromCompactWindow,
-      onRestore: showMainWindow,
-      onRestoreLoadFailed: (failedWindow) => {
-        console.error("[bridge:auth] compact auth restore URL failed to load; reloading renderer entry");
-        void loadBridgeRenderer(failedWindow).catch(() => undefined);
-      },
-    });
-    windowLifecycle.markAuthWindowVisible();
-  } catch (error) {
-    windowLifecycle.markAuthWindowHidden();
-    console.error("[bridge:auth] failed to show compact sign-in window", errorMessage(error));
-  }
-}
-
-function closeAuthCompactWindow(): void {
-  closeCompactAuthWindow();
-  windowLifecycle.markAuthWindowHidden();
-}
-
 function clearLoginResources(login: PendingLogin | undefined): void {
   if (!login) return;
   if (login.callbackTimeout) {
     clearTimeout(login.callbackTimeout);
   }
-  closeAuthCallbackServer(login.callbackServer);
+  if (!pendingLogin || pendingLogin === login) loginListener.retainForOldTabs();
 }
 
-function closeAuthCallbackServer(server: HttpServer | undefined): void {
-  if (!server || !server.listening) return;
-  server.close((error) => {
-    if (error) {
-      audit.record("auth.callback_close_failed", { message: error.message });
-    }
-  });
-}
 
 function publicPairingRequest(request: PairingRequest): BridgePairingRequest {
   return {
@@ -1679,7 +1951,6 @@ function initialInferenceStatus(): BridgeInferenceStatus {
     encryption: "ehbp",
     lastError: null,
     lastRequest: null,
-    requests: [],
     responsePrivacy: "decrypts_in_bridge",
     serverAuth: "workos_session",
     serverOrigin: publicOrigin(serverBaseUrl),
@@ -1703,14 +1974,18 @@ function startInferenceStatus(
 ): void {
   inferenceStatus = { ...inferenceStatus, lastError: null };
   const model = payloadString(frame.payload, "model");
-  networkHistory.start({
+  const record = networkHistory.start({
+    attestation: "pending",
+    encryption: "ehbp",
     feature: frame.method,
     model,
     path,
     requestBytes,
     requestId: frame.id,
     startedAt: Date.now(),
+    traceId: frame.traceparent?.split("-")[1] ?? null,
   }, statusKey);
+  publishRequestLogUpserts([record]);
   notifyStatusChanged();
 }
 
@@ -1722,7 +1997,8 @@ function beginInferenceAttestationCheck(statusKey: string, generation: number): 
     attestation: inferenceStatus.attestation === "verified" ? "verified" : "verifying",
     attestationInProgress: true,
   };
-  networkHistory.patch(statusKey, { attestation: "pending" });
+  const record = networkHistory.patch(statusKey, { attestation: "pending" });
+  if (record) publishRequestLogUpserts([record]);
   notifyStatusChanged();
 }
 
@@ -1740,7 +2016,8 @@ function completeInferenceAttestationCheck(statusKey: string, requestId: string,
     }),
     attestationInProgress: activeAttestationChecks.size > 0,
   };
-  networkHistory.patch(statusKey, { attestation: "verified" });
+  const record = networkHistory.patch(statusKey, { attestation: "verified" });
+  if (record) publishRequestLogUpserts([record]);
   notifyStatusChanged();
 }
 
@@ -1763,7 +2040,8 @@ function failInferenceAttestationCheck(
     }),
     attestationInProgress: activeAttestationChecks.size > 0,
   };
-  networkHistory.patch(statusKey, { attestation: "failed" });
+  const record = networkHistory.patch(statusKey, { attestation: "failed" });
+  if (record) publishRequestLogUpserts([record]);
   notifyStatusChanged();
 }
 
@@ -1778,19 +2056,21 @@ function secureClientWithAttestationStatus(
   statusKey: string,
   requestId: string,
   generation: number,
+  client: BridgeSecureClientShape = bridgeSecureClient,
+  ownsRequest: () => boolean = () => generation === inferenceGeneration,
 ): BridgeSecureClientShape {
   return {
-    fetch: bridgeSecureClient.fetch,
+    fetch: client.fetch,
     ready: () =>
-      Effect.sync(() => beginInferenceAttestationCheck(statusKey, generation)).pipe(
-        Effect.flatMap(() => bridgeSecureClient.ready()),
-        Effect.tap(() => Effect.sync(() => completeInferenceAttestationCheck(statusKey, requestId, generation))),
-        Effect.tapError((error) => Effect.sync(() => failInferenceAttestationCheck(
+      Effect.sync(() => { if (ownsRequest()) beginInferenceAttestationCheck(statusKey, generation); }).pipe(
+        Effect.flatMap(() => client.ready()),
+        Effect.tap(() => Effect.sync(() => { if (ownsRequest()) completeInferenceAttestationCheck(statusKey, requestId, generation); })),
+        Effect.tapError((error) => Effect.sync(() => { if (ownsRequest()) failInferenceAttestationCheck(
           statusKey,
           requestId,
           errorMessage(error),
           generation,
-        ))),
+        ); })),
       ),
   };
 }
@@ -1798,8 +2078,11 @@ function secureClientWithAttestationStatus(
 function updateInferenceRequest(
   requestId: string,
   patch: Partial<BridgeInferenceRequestStatus>,
+  options: { readonly publishLog?: boolean } = {},
 ): void {
-  networkHistory.patch(requestId, patch);
+  const record = networkHistory.patch(requestId, patch);
+  if (options.publishLog === false || !record) return;
+  publishRequestLogUpserts([record]);
 }
 
 function completeInferenceStatus(
@@ -1826,6 +2109,7 @@ function failInferenceStatus(requestId: string, message: string, generation: num
     error: safeStatusMessage(message),
     status: "failed",
   });
+  notifyStatusChanged();
 }
 
 function publicOrigin(value: string): string {
@@ -1841,32 +2125,67 @@ function safeStatusMessage(value: string): string {
 }
 
 function forwardInference(frame: BridgeRequestFrame, context: IpcHandlerContext, path: InferenceProxyPath): IpcStream {
-  const credentialId = authenticatedCredentialId(context);
-  const statusKey = inferenceRequestKey(credentialId, frame.id);
-  const abortController = new AbortController();
-  const generation = inferenceGeneration;
-  activeInferenceRequests.register({ controller: abortController, credentialId, requestId: frame.id, socketClosed: context.socketClosed });
-  startInferenceStatus(frame, path, jsonPayloadByteLength(frame.payload), statusKey);
-  return inferenceResponseStream(frame, path, credentialId, statusKey, abortController, undefined, generation);
+  // Authentication and the request's mode (ADR-0313) are checked before admission;
+  // `inferenceMode` is removed so the upstream body is the app's request only.
+  authenticatedCredentialId(context);
+  const { mode, payload } = requestInferenceModeFromPayload(frame.payload);
+  const request = { ...frame, payload };
+  return admitInferenceStream(request, context, path, jsonPayloadByteLength(request.payload), undefined, mode);
 }
 
 function forwardAudioTranscription(frame: BridgeRequestFrame, context: IpcHandlerContext): IpcStream {
+  // Authentication and metadata validation must precede request admission.
+  authenticatedCredentialId(context);
+  const { mode, payload } = requestInferenceModeFromPayload(frame.payload);
+  const request = { ...frame, payload };
+  const metadata = audioUploadMetadataFromPayload(request.payload);
+  return admitInferenceStream(request, context, "/v1/audio/transcriptions", metadata.expectedByteLength,
+    (signal) => prepareAudioTranscriptionRequest(request, context, metadata, signal), mode);
+}
+
+const inferenceAdmissions = new Map<string, { retired: boolean }>();
+
+function admitInferenceStream(
+  frame: BridgeRequestFrame,
+  context: IpcHandlerContext,
+  path: InferenceProxyPath,
+  requestBytes: number,
+  prepare?: (signal: AbortSignal) => Promise<SecureInferenceRequestOverrides>,
+  requestedMode: RequestInferenceMode | null = null,
+): IpcStream {
   const credentialId = authenticatedCredentialId(context);
   const statusKey = inferenceRequestKey(credentialId, frame.id);
   const abortController = new AbortController();
   const generation = inferenceGeneration;
-  const path: InferenceProxyPath = "/v1/audio/transcriptions";
   activeInferenceRequests.register({ controller: abortController, credentialId, requestId: frame.id, socketClosed: context.socketClosed });
-  const metadata = audioUploadMetadataFromPayload(frame.payload);
-  startInferenceStatus(frame, path, metadata.expectedByteLength, statusKey);
-  return inferenceResponseStream(
-    frame,
-    path,
-    credentialId,
-    statusKey,
+  const previous = inferenceAdmissions.get(statusKey);
+  if (previous) previous.retired = true;
+  const owner = { retired: false };
+  inferenceAdmissions.set(statusKey, owner);
+  activeAttestationChecks.delete(statusKey);
+  inferenceStatus = { ...inferenceStatus, attestationInProgress: activeAttestationChecks.size > 0 };
+  startInferenceStatus(frame, path, requestBytes, statusKey);
+  const ownsRequest = () => !owner.retired && generation === inferenceGeneration;
+  const request = prepare?.(abortController.signal);
+  // Uploads start before the socket's first write; observe rejection even when
+  // that write fails and the response iterator is never pulled.
+  void request?.catch(() => {});
+  return ownedInferenceStream(
+    inferenceResponseStream(frame, path, statusKey, abortController, ownsRequest, request, generation, requestedMode),
     abortController,
-    prepareAudioTranscriptionRequest(frame, context, metadata),
-    generation,
+    (cancel) => {
+      const current = ownsRequest();
+      owner.retired = true;
+      if (inferenceAdmissions.get(statusKey) === owner) inferenceAdmissions.delete(statusKey);
+      activeInferenceRequests.release(credentialId, frame.id, abortController);
+      if (cancel) {
+        if (current) {
+          activeAttestationChecks.delete(statusKey);
+          inferenceStatus = { ...inferenceStatus, attestationInProgress: activeAttestationChecks.size > 0 };
+          completeInferenceStatus(statusKey, "cancelled", generation);
+        }
+      }
+    },
   );
 }
 
@@ -1878,8 +2197,10 @@ async function prepareAudioTranscriptionRequest(
   frame: BridgeRequestFrame,
   context: IpcHandlerContext,
   metadata: ReturnType<typeof audioUploadMetadataFromPayload>,
+  signal: AbortSignal,
 ): Promise<SecureInferenceRequestOverrides> {
   const audio = await context.readBinaryUpload({
+    signal,
     expectedByteLength: metadata.expectedByteLength,
     expectedSha256: metadata.expectedSha256,
     maxBytes: metadata.expectedByteLength,
@@ -1890,22 +2211,67 @@ async function prepareAudioTranscriptionRequest(
 async function* inferenceResponseStream(
   frame: BridgeRequestFrame,
   path: InferenceProxyPath,
-  credentialId: string,
   statusKey: string,
   abortController: AbortController,
+  ownsRequest: () => boolean,
   request?: SecureInferenceRequestOverrides | Promise<SecureInferenceRequestOverrides>,
   generation = inferenceGeneration,
+  requestedMode: RequestInferenceMode | null = null,
 ): IpcStream {
   audit.record("inference.forward_start", {
     method: frame.method,
     path,
+    requestedMode: requestedMode ?? "assigned",
     requestId: frame.id,
   });
 
+  let nodeRoute: CloudNodeRoute | null = null;
+  let response: Response | undefined;
   try {
     const preparedRequest = await request;
-    if (generation !== inferenceGeneration) return;
-    const response = await Effect.runPromise(
+    if (!ownsRequest()) return;
+    nodeRoute = await resolveInferenceNodeRoute();
+    if (!ownsRequest()) return;
+    // The request's mode picks the transport (ADR-0313): the app's choice when it
+    // sent one, else the Node's assigned mode. A Node serves every allowed mode, so
+    // Confidential runs through the Tinfoil client even on a plaintext-default
+    // Node. A Confidential request is never retried or rerouted as plaintext.
+    const nodeMode = nodeModeForRequest(nodeRoute.inferenceMode, requestedMode);
+    assertInferencePathAllowedInMode(path, nodeMode);
+    const nodePlaintext = nodeMode === "plaintext";
+    const routedSecureClient = createCloudNodeSecureClient({
+      client: nodePlaintext
+        ? createBridgePlaintextClient({ serverBaseUrl: nodeRoute.baseUrl })
+        : nodeSecureClient(nodeRoute.baseUrl),
+      accessToken: nodeRoute.accessToken,
+      mode: nodeMode,
+      feature: frame.method === "inference.dailyReport" ? "daily_report" : "bridge",
+    });
+    inferenceStatus = {
+      ...inferenceStatus,
+      attestation: nodePlaintext ? "not_checked" : inferenceStatus.attestation,
+      encryption: nodePlaintext ? "none" : "ehbp",
+      serverAuth: "cloud_node_identity",
+      serverOrigin: publicOrigin(nodeRoute.baseUrl),
+    };
+    if (nodePlaintext) {
+      updateInferenceRequest(statusKey, { attestation: "skipped", encryption: "none" });
+    }
+    const routedClientWithAttestation = secureClientWithAttestationStatus(
+      statusKey,
+      frame.id,
+      generation,
+      routedSecureClient,
+      ownsRequest,
+    );
+    const selectedInferenceClient = inferenceClientForMode(
+      nodeMode,
+      {
+        cloudNodePlaintext: routedSecureClient,
+        cloudNodeConfidential: routedClientWithAttestation,
+      },
+    );
+    const inferenceResult = await Effect.runPromise(
       secureInferenceResponse({
         appVersion: app.getVersion(),
         availability: inferenceAvailability,
@@ -1915,7 +2281,7 @@ async function* inferenceResponseStream(
         ...preparedRequest,
         requestId: frame.id,
         signal: abortController.signal,
-        usage: bridgeUsageService,
+        traceparent: frame.traceparent,
       }).pipe(
         Effect.provideService(
           BridgeSessionService,
@@ -1926,24 +2292,24 @@ async function* inferenceResponseStream(
         ),
         Effect.provideService(
           BridgeSecureClient,
-          secureClientWithAttestationStatus(statusKey, frame.id, generation),
+          selectedInferenceClient,
         ),
         Effect.provideService(BridgeAuditService, bridgeAuditService),
+        Effect.either,
       ),
     );
-    if (generation !== inferenceGeneration) return;
+    if (inferenceResult._tag === "Left") throw inferenceResult.left;
+    response = inferenceResult.right;
+    if (!ownsRequest()) return;
     updateInferenceRequest(statusKey, {
       responseHeadersAt: Date.now(),
       statusCode: response.status,
       ...readEhbpResponseEvidence(response.headers),
     });
-    await storeRotatedSessionToken(response);
-    if (generation !== inferenceGeneration) return;
-    notifyStatusChanged();
+    if (!ownsRequest()) return;
 
     if (!response.ok) {
-      const statusText = response.statusText.trim();
-      throw new Error(`Tinfoil secure request failed: ${response.status}${statusText ? ` ${statusText}` : ""}`);
+      throw await inferenceHttpError(response);
     }
 
     yield {
@@ -1953,12 +2319,12 @@ async function* inferenceResponseStream(
     };
 
     let firstChunkObserved = false;
-    for await (const chunk of streamResponseBody(response)) {
-      if (generation !== inferenceGeneration) return;
+    for await (const chunk of streamResponseBody(response, abortController.signal)) {
+      if (!ownsRequest()) return;
       if (chunk.kind === "delta") {
         if (!firstChunkObserved) {
           firstChunkObserved = true;
-          updateInferenceRequest(statusKey, { firstChunkAt: Date.now() });
+          updateInferenceRequest(statusKey, { firstChunkAt: Date.now() }, { publishLog: false });
         }
         yield {
           data: chunk.value ?? "",
@@ -1974,9 +2340,21 @@ async function* inferenceResponseStream(
       path,
       requestId: frame.id,
     });
+    const lateUsage = await readEhbpUsageAfterBody(response);
+    if (!ownsRequest()) return;
+    if (lateUsage) {
+      updateInferenceRequest(statusKey, { usage: lateUsage }, { publishLog: false });
+    }
     completeInferenceStatus(statusKey, "completed", generation);
     void refreshInferenceUsageCircuit();
   } catch (error) {
+    if (!ownsRequest()) return;
+    if (generation === inferenceGeneration && nodeRoute && !isProviderInferenceError(error)) {
+      // A failed customer-Node request can invalidate only the short-lived
+      // destination credential. The WorkOS session remains Cloud-owned.
+      await Effect.runPromise(cloudNodeRouting.invalidate()).catch(() => undefined);
+    }
+    if (!ownsRequest()) return;
     if (abortController.signal.aborted) {
       audit.record("inference.forward_cancelled", {
         method: frame.method,
@@ -1991,10 +2369,26 @@ async function* inferenceResponseStream(
     const domainError = inferenceDomainError(error);
     if (domainError instanceof BridgeInsufficientCreditError && domainError.summary) {
       bridgeUsageCache.observe(domainError.summary);
+    } else if (error instanceof ProviderInferenceError && accessBlockReason(error)) {
+      // Seat / member caps (ADR-0295 commercial terms) and plan refusals (ADR-0324): a precise card, not "out of credit".
+      const cached = sessionStore().peekCached?.();
+      if (cached?.kind === "signed_in") inferenceAvailability.accessBlocked(sessionUsageOwnerKey(cached), accessBlockReason(error)!);
+    } else if (error instanceof ProviderInferenceError && error.code === "credit_exhausted") {
+      // Cloud refused the grant (no credit, spending limit or failed invoice;
+      // ADR-0243). The fresh summary carries the reason and trips the circuit.
+      void refreshInferenceUsageCircuit().catch(() => undefined);
     }
-    const safeMessage = safeStatusMessage(message);
+    // A globally disabled provider/model (ADR-0296) is a per-request refusal:
+    // no circuit, no access block. The thrown error keeps the prefixed text
+    // for the app; Bridge's own request log shows the readable part.
+    const globallyDisabled = globallyDisabledRefusalText(error);
+    const safeMessage = safeStatusMessage(globallyDisabled ?? message);
+    if (domainError && ownsRequest()) updateInferenceRequest(statusKey, { statusCode: domainError.httpStatus });
     audit.record("inference.forward_failed", {
       message,
+      errorCode: domainError?.code,
+      errorSource: domainError?.source,
+      httpStatus: domainError?.httpStatus,
       method: frame.method,
       path,
       requestId: frame.id,
@@ -2005,12 +2399,113 @@ async function* inferenceResponseStream(
       path,
       requestId: frame.id,
     });
-    failInferenceStatus(statusKey, message, generation);
+    failInferenceStatus(statusKey, globallyDisabled ?? message, generation);
     if (generation === inferenceGeneration) notifyStatusChanged();
     throw error;
   } finally {
-    activeInferenceRequests.release(credentialId, frame.id, abortController);
+    discardResponseBody(response);
   }
+}
+
+const PUBLIC_INFERENCE_ERROR_CODES = new Set([
+  "authentication_required",
+  "principal_forbidden",
+  "policy_denied",
+  "plaintext_not_enabled",
+  "assurance_unavailable",
+  "attestation_failed",
+  "key_expired",
+  "grant_expired",
+  "replay_detected",
+  "credit_exhausted",
+  "capacity_exhausted",
+  "provider_unavailable",
+  "deadline_exceeded",
+  "request_cancelled",
+]);
+
+/** Seat, member cap, or plan refusal (`inferenceAccessBlockReason`). */
+function accessBlockReason(error: ProviderInferenceError): InferenceAccessBlockReason | null {
+  return inferenceAccessBlockReason(error.code, error.message);
+}
+
+class ProviderInferenceError extends Error {
+  constructor(
+    readonly code: string,
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = "ProviderInferenceError";
+  }
+}
+
+async function inferenceHttpError(response: Response): Promise<ProviderInferenceError> {
+  let raw = "";
+  try { raw = (await response.text()).slice(0, 16_000); } catch { /* Use the status fallback below. */ }
+  let providerCode: string | null = null;
+  let providerMessage: string | null = null;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const record = parsed as Record<string, unknown>;
+      const nested = record.error && typeof record.error === "object" && !Array.isArray(record.error)
+        ? record.error as Record<string, unknown>
+        : null;
+      const code = nested?.code ?? record.code;
+      const message = nested?.message ?? record.message;
+      providerCode = typeof code === "string" && code.trim() ? code.trim() : null;
+      providerMessage = typeof message === "string" && message.trim() ? message.trim() : null;
+    }
+  } catch {
+    providerMessage = raw.trim() || null;
+  }
+  const fallbackCode = response.status === 401 ? "authentication_required"
+    : response.status === 402 ? "credit_exhausted"
+      : response.status === 403 ? "policy_denied"
+        : response.status === 408 || response.status === 504 ? "deadline_exceeded"
+          : response.status === 429 ? "capacity_exhausted"
+            : "provider_unavailable";
+  const code = providerCode && PUBLIC_INFERENCE_ERROR_CODES.has(providerCode)
+    ? providerCode
+    : fallbackCode;
+  const statusText = response.statusText.trim();
+  const detail = providerMessage?.replace(/[\u0000-\u001f\u007f]+/gu, " ").slice(0, 320);
+  return new ProviderInferenceError(
+    code,
+    response.status,
+    detail || `Inference request failed (${response.status}${statusText ? ` ${statusText}` : ""}).`,
+  );
+}
+
+function isProviderInferenceError(error: unknown): boolean {
+  return inferenceDomainError(error) !== null
+    || error instanceof BridgeGloballyDisabledError
+    || (error instanceof ProviderInferenceError && error.code !== "authentication_required");
+}
+
+async function resolveInferenceNodeRoute(): Promise<CloudNodeRoute> {
+  const session = await readSignedInSession();
+  if (!session) throw new Error("Bridge is not signed in.");
+  const active = shouldRefreshWorkOsSession(session)
+    ? await refreshInferenceSessionIfNeeded(session)
+    : session;
+  if (active.kind !== "signed_in") throw new Error("Bridge is not signed in.");
+  const route = await Effect.runPromise(cloudNodeRouting.resolve(active));
+  const inferenceRoute = inferenceRouteFromAssignment(route);
+  if (!inferenceRoute.capabilities.includes("inference") || !inferenceRoute.entitlements.inference) {
+    throw new Error("Alexandria Node inference is not enabled for this workspace.");
+  }
+  return inferenceRoute;
+}
+
+function nodeSecureClient(baseUrl: string): BridgeSecureClientShape {
+  const normalized = baseUrl.replace(/\/+$/, "");
+  const cached = nodeSecureClients.get(normalized);
+  if (cached) return cached;
+  const created = createBridgeSecureClient({ serverBaseUrl: normalized });
+  nodeSecureClients.set(normalized, created);
+  return created;
 }
 
 async function refreshInferenceUsageCircuit(): Promise<void> {
@@ -2037,6 +2532,188 @@ async function usageSnapshotPayload(force: boolean): Promise<import("@ambient/sh
   return snapshot;
 }
 
+async function usagePricingPayload(force: boolean): Promise<import("@ambient/shared/usage").UsagePricingCatalog> {
+  const stored = await sessionStore().read();
+  const session = stored.kind === "signed_in" ? stored : null;
+  return bridgePricingCache.read({
+    session,
+    force,
+    load: (activeSession) => authServer.usagePricing(activeSession.sessionToken),
+  });
+}
+
+async function usageModelBreakdownPayload(): Promise<import("@ambient/shared/usage").UsageModelBreakdown> {
+  const stored = await sessionStore().read();
+  if (stored.kind !== "signed_in") {
+    throw new Error("Sign in to view account usage breakdown.");
+  }
+  return authServer.usageModelBreakdown(stored.sessionToken);
+}
+
+async function usageInstanceHistoryPayload(): Promise<
+  readonly import("@ambient/shared/usage").UsageInstanceHistoryEntry[]
+> {
+  const stored = await sessionStore().read();
+  if (stored.kind !== "signed_in") {
+    throw new Error("Sign in to view local inference usage history.");
+  }
+  return networkHistory.list().map((entry) => ({
+    requestId: entry.requestId,
+    modelId: entry.model,
+    route: entry.path,
+    status: entry.status,
+    statusCode: entry.statusCode,
+    completedAt: entry.completedAt,
+    usage: entry.usage,
+  }));
+}
+
+const ANNOUNCEMENTS_CACHE_TTL_MS = 60_000;
+let announcementsCache: {
+  readonly organizationId: string | null;
+  readonly document: import("@ambient/shared/announcements").AppAnnouncementsDocument;
+  readonly fetchedAtMs: number;
+} | null = null;
+let announcementsInFlight: {
+  readonly organizationId: string | null;
+  readonly pending: Promise<import("@ambient/shared/announcements").AppAnnouncementsDocument>;
+} | null = null;
+
+async function announcementsSnapshotPayload(
+  force: boolean,
+): Promise<import("@ambient/shared/announcements").AppAnnouncementsDocument> {
+  const stored = await sessionStore().read();
+  const organizationId = stored.kind === "signed_in" && stored.organizationId
+    ? stored.organizationId
+    : null;
+  const nowMs = Date.now();
+  if (
+    !force
+    && announcementsCache
+    && announcementsCache.organizationId === organizationId
+    && nowMs - announcementsCache.fetchedAtMs < ANNOUNCEMENTS_CACHE_TTL_MS
+  ) {
+    return announcementsCache.document;
+  }
+  if (!force && announcementsInFlight?.organizationId === organizationId) {
+    return announcementsInFlight.pending;
+  }
+  const pending = authServer.announcements({ organizationId })
+    .then((document) => {
+      announcementsCache = { organizationId, document, fetchedAtMs: Date.now() };
+      return document;
+    })
+    .finally(() => {
+      if (announcementsInFlight?.pending === pending) announcementsInFlight = null;
+    });
+  announcementsInFlight = { organizationId, pending };
+  return pending;
+}
+
+async function inferenceModelsSnapshotPayload(
+  force: boolean,
+): Promise<import("@ambient/shared/inference-models").InferenceModelsSnapshot> {
+  const stored = await sessionStore().read();
+  const session = stored.kind === "signed_in" ? stored : null;
+  return bridgeModelAssignmentCache.read({
+    session,
+    force,
+    load: (activeSession) => authServer.inferenceModels(activeSession.sessionToken),
+  });
+}
+
+/** The account's inference plan, or null (signed out, or a Cloud that predates it). */
+async function inferencePlanSnapshotPayload(force: boolean): Promise<BridgeInferencePlanSnapshot | null> {
+  const stored = await sessionStore().read();
+  return bridgeInferencePlanCache.read(stored.kind === "signed_in" ? stored : null, { force });
+}
+
+async function usageTopupOptionsPayload(customAmounts: boolean): Promise<import("@ambient/shared/usage").UsageTopupOptions> {
+  const stored = await sessionStore().read();
+  if (stored.kind !== "signed_in") {
+    throw new Error("Sign in to view credit top-up options.");
+  }
+  return authServer.usageTopupOptions(stored.sessionToken, customAmounts);
+}
+
+/**
+ * Billing calls (ADR-0243). A change that can unblock inference (card added,
+ * limit raised, mode switched) refreshes the usage circuit right away so a
+ * paused account resumes without waiting for the next poll.
+ */
+async function usageBillingPayload<T>(
+  call: (sessionToken: string) => Promise<T>,
+  options: { readonly mutates?: boolean } = {},
+): Promise<T> {
+  const stored = await sessionStore().read();
+  if (stored.kind !== "signed_in") {
+    throw new Error("Sign in to manage billing.");
+  }
+  const result = await call(stored.sessionToken);
+  if (options.mutates) {
+    void refreshInferenceUsageCircuit().catch(() => undefined);
+  }
+  return result;
+}
+
+function spendingLimitPayload(payload: unknown): import("@ambient/shared/usage").UsageSpendingLimit | null {
+  const limit = payload && typeof payload === "object" && "limit" in payload ? (payload as { limit: unknown }).limit : undefined;
+  if (limit === null) return null;
+  if (!limit || typeof limit !== "object") throw new Error("A spending limit or null is required.");
+  const { amountMicros, period } = limit as { amountMicros?: unknown; period?: unknown };
+  if (typeof amountMicros !== "string" || !/^[1-9][0-9]{0,18}$/.test(amountMicros)) {
+    throw new Error("Spending limit amount is invalid.");
+  }
+  if (period !== "day" && period !== "week" && period !== "month") throw new Error("Spending limit period is invalid.");
+  return { amountMicros, period };
+}
+
+async function usageCreateTopupCheckoutPayload(
+  input: unknown,
+): Promise<import("@ambient/shared/usage").UsageTopupCheckoutResponse> {
+  const request = usageTopupCheckoutRequestSchema.parse(input);
+  const stored = await sessionStore().read();
+  if (stored.kind !== "signed_in") {
+    throw new Error("Sign in to add inference credit.");
+  }
+  return authServer.createUsageTopupCheckout(stored.sessionToken, request);
+}
+
+/**
+ * Subscription plans for people without an organization (ADR-0324). An
+ * active plan clears a `plan_required` block right away, so a checkout
+ * finished in the browser resumes processing without waiting for it to expire.
+ */
+async function plansListPayload(): Promise<import("@alexandria/cloud-contract/plans").AccountPlansResponse> {
+  const session = await signedInPlansSession();
+  const plans = await authServer.accountPlans(session.sessionToken);
+  if (plans.subscription?.active) {
+    const ownerKey = sessionUsageOwnerKey(session);
+    if (inferenceAvailability.snapshot(ownerKey).state === "plan_required") {
+      inferenceAvailability.accessRestored(ownerKey, "plan_required");
+      statusEvents.emit("changed");
+    }
+  }
+  return plans;
+}
+
+async function planCheckoutPayload(planId: string | null): Promise<import("@alexandria/cloud-contract/plans").PlanCheckoutResponse> {
+  if (!planId) throw new Error("planId is required.");
+  const session = await signedInPlansSession();
+  return authServer.createPlanCheckout(session.sessionToken, planId);
+}
+
+async function planPortalPayload(): Promise<import("@alexandria/cloud-contract/plans").PlanPortalResponse> {
+  const session = await signedInPlansSession();
+  return authServer.createPlanPortal(session.sessionToken);
+}
+
+async function signedInPlansSession(): Promise<SignedInWorkOsSession> {
+  const stored = await sessionStore().read();
+  if (stored.kind !== "signed_in") throw new Error("Sign in to manage your plan.");
+  return stored;
+}
+
 async function forwardHandoffFeedbackAnalytics(frame: BridgeRequestFrame): Promise<JsonValue> {
   return forwardHandoffFeedback(frame.id, frame.payload, {
     audit,
@@ -2048,8 +2725,8 @@ async function forwardHandoffFeedbackAnalytics(frame: BridgeRequestFrame): Promi
   });
 }
 
-async function forwardTelemetryBatchAnalytics(frame: BridgeRequestFrame): Promise<JsonValue> {
-  return forwardTelemetryBatch(frame.id, frame.payload, {
+async function forwardSupportFeedbackToCloud(frame: BridgeRequestFrame): Promise<JsonValue> {
+  return forwardSupportFeedback(frame.id, frame.payload, {
     audit,
     onUnauthorized: clearInvalidStoredSession,
     onResponse: storeRotatedSessionToken,
@@ -2059,26 +2736,37 @@ async function forwardTelemetryBatchAnalytics(frame: BridgeRequestFrame): Promis
   });
 }
 
-const bridgeErrorForwardAllowed = createBridgeErrorForwardLimiter();
-
-function bridgeTelemetryForwardOptions() {
+function multiplayerForwardOptions() {
   return {
     audit,
+    multiplayerBaseUrl,
+    resolveRoute: (session: SignedInWorkOsSession) => Effect.runPromise(cloudNodeRouting.resolve(session)),
+    onNodeUnauthorized: () => Effect.runPromise(cloudNodeRouting.invalidate()),
     onUnauthorized: clearInvalidStoredSession,
     onResponse: storeRotatedSessionToken,
     readSession: () => sessionStore().read(),
     refreshSession: refreshInferenceSessionIfNeeded,
-    serverBaseUrl,
+    appVersion: app.getVersion(),
   };
 }
 
+async function multiplayerRoutingStatusPayload() {
+  const snapshot = await Effect.runPromise(cloudNodeRouting.snapshot());
+  return {
+    configured: snapshot.state === "ready" || snapshot.state === "legacy",
+    origin: snapshot.origin,
+    state: snapshot.state,
+    organizationId: snapshot.organizationId,
+    capabilities: snapshot.capabilities,
+    inferenceMode: snapshot.inferenceMode,
+    configurationVersion: snapshot.configurationVersion,
+    message: snapshot.message,
+  };
+}
 /**
  * Last-resort handler for Bridge process errors. Always audits locally
- * (bridge-audit.jsonl); a fatal exception additionally persists a crash marker
- * + 30s window (driving the next-launch consent prompt) and forwards a
- * sanitized crash signature to hosted telemetry when signed in, rate-limited so
- * a rejection storm cannot flood the server. Never rethrows — diagnostics must
- * not take Bridge down.
+ * (bridge-audit.jsonl); a fatal exception additionally persists a local crash
+ * marker and 30s window. Never rethrows — diagnostics must not take Bridge down.
  */
 function recordBridgeProcessError(origin: BridgeCrashOrigin, error: unknown): void {
   try {
@@ -2095,89 +2783,8 @@ function recordBridgeProcessError(origin: BridgeCrashOrigin, error: unknown): vo
       });
       if (marker) audit.record("crash.snapshot_written", { crashId: marker.id });
     }
-    if (!bridgeTelemetryEnabled() || !bridgeErrorForwardAllowed()) return;
-    const batch = bridgeErrorTelemetryBatch({
-      origin,
-      error,
-      appVersion: app.getVersion(),
-      platform: process.platform,
-    });
-    void forwardTelemetryBatch(`bridge_err_${randomUUID()}`, batch, bridgeTelemetryForwardOptions())
-      .catch(() => undefined);
   } catch {
     // Nothing else we can safely do while handling a process-level error.
-  }
-}
-
-/**
- * Record one lifecycle event per launch so hosted analytics can relate Bridge
- * crash reports to launch volume (crash rate) — mirrors the Ambient app's
- * ambient.main.appLaunched. Must run before the pending-crash prompt consumes
- * the on-disk markers.
- */
-function recordBridgeLaunchTelemetry(): void {
-  try {
-    const pending = bridgeCrashReports.listPending();
-    if (!bridgeTelemetryEnabled()) return;
-    const batch = bridgeTelemetryBatch({
-      eventName: "bridge.main.appLaunched",
-      severity: "info",
-      status: "success",
-      appVersion: app.getVersion(),
-      platform: process.platform,
-      properties: {
-        previousCrashPending: pending.length > 0,
-        previousCrashOrigin: pending[0]?.origin ?? null,
-        launchToReadyMs: Math.round(process.uptime() * 1_000),
-      },
-    });
-    void forwardTelemetryBatch(`bridge_launch_${randomUUID()}`, batch, bridgeTelemetryForwardOptions())
-      .catch(() => undefined);
-  } catch {
-    // Launch telemetry is best-effort.
-  }
-}
-
-/** On startup, offer to send any crash report left behind by a previous run. */
-async function maybePromptPendingBridgeCrashReports(): Promise<void> {
-  if (!bridgeTelemetryEnabled()) return;
-  const pending = bridgeCrashReports.listPending();
-  if (pending.length === 0) return;
-  const [latest, ...older] = pending;
-  // Only surface the most recent crash; discard older ones to avoid prompt spam.
-  for (const stale of older) bridgeCrashReports.delete(stale.id);
-  try {
-    const consent = await promptBridgeCrashReportConsent(latest, (message) => {
-      audit.record("crash.consent_window_failed", { message: safeStatusMessage(message) });
-    });
-    if (consent.send) {
-      const batch = bridgeTelemetryBatch({
-        eventName: "bridge.main.crashReport",
-        severity: "fatal",
-        status: "failure",
-        appVersion: app.getVersion(),
-        platform: process.platform,
-        properties: crashReportTelemetryProperties(latest, {
-          note: consent.note,
-          reportedAtMs: Date.now(),
-          logWindowIncluded: consent.includeLogs,
-        }),
-        exception: {
-          type: latest.exception.type,
-          message: latest.exception.message,
-          stack: latest.exception.stack,
-          handled: true,
-        },
-      });
-      const result = await forwardTelemetryBatch(`bridge_crash_${latest.id}`, batch, bridgeTelemetryForwardOptions());
-      audit.record("crash.report_submitted", { accepted: result.accepted, crashId: latest.id, ok: result.ok });
-    } else {
-      audit.record("crash.report_declined", { crashId: latest.id });
-    }
-  } catch (error) {
-    audit.record("crash.report_flow_failed", { crashId: latest.id, message: safeStatusMessage(errorMessage(error)) });
-  } finally {
-    bridgeCrashReports.delete(latest.id);
   }
 }
 
@@ -2286,6 +2893,7 @@ async function refreshStoredSession(options: {
     if (options.force || authStatusChanged) {
       notifyStatusChanged();
     }
+    void refreshOrgPolicy("session_refresh", { force: options.force === true || authStatusChanged });
     return nextSession;
   } catch (error) {
     const message = errorMessage(error);
@@ -2328,15 +2936,22 @@ async function storeRotatedSessionToken(response: Response): Promise<void> {
   const sessionToken = response.headers.get(AMBIENT_SESSION_TOKEN_HEADER);
   if (!sessionToken) return;
 
+  const current = await readSignedInSession();
+  if (!current) return;
+  await storeRotatedSessionTokenValue(sessionToken, current);
+}
+
+async function storeRotatedSessionTokenValue(
+  sessionToken: string,
+  expectedSession: SignedInWorkOsSession,
+): Promise<void> {
   try {
-    const current = await readSignedInSession();
-    if (!current) return;
     const authSession = await authServer.validateSession(sessionToken);
     const nextSession = withCachedCurrentOrganizationFeatureFlags(
-      toStoredSession(authSession, current),
+      toStoredSession(authSession, expectedSession),
       { overwrite: true },
     );
-    const wrote = await writeSignedInSessionIfCurrent(nextSession, current, "session_rotation");
+    const wrote = await writeSignedInSessionIfCurrent(nextSession, expectedSession, "session_rotation");
     if (!wrote) return;
     recordSessionFeatureFlags("auth.session_rotation_feature_flags_received", nextSession);
     audit.record("auth.session_rotation_stored", { userId: nextSession.user.id });
@@ -2412,7 +3027,7 @@ function toStoredSession(
     : undefined;
   return {
     email,
-    expiresAt: authSession.expiresAt,
+    expiresAt: workOsSessionExpiresAtSeconds(authSession.expiresAt),
     featureFlags,
     featureFlagsByOrganization: base?.featureFlagsByOrganization,
     kind: "signed_in",
@@ -2512,8 +3127,9 @@ async function writeSignedInSessionIfCurrent(
   nextSession: SignedInWorkOsSession,
   expectedSession: SignedInWorkOsSession,
   reason: string,
+  ownsCurrent?: (session: SignedInWorkOsSession) => boolean,
 ): Promise<boolean> {
-  const result = await sessionStore().writeIfCurrent(nextSession, expectedSession);
+  const result = await sessionStore().writeIfCurrent(nextSession, expectedSession, ownsCurrent);
   if (result !== "written") {
     audit.record("auth.session_write_skipped", {
       reason,
@@ -2526,18 +3142,18 @@ async function writeSignedInSessionIfCurrent(
   return true;
 }
 
-async function signInViaIpc(): Promise<JsonValue> {
+async function signInViaIpc(options: { restart?: boolean; reopen?: boolean } = {}): Promise<JsonValue> {
   const session = await readSignedInSession();
   if (session) {
     return { status: "already_signed_in" };
   }
-  await startLoginFlow({ compactWindow: false });
+  await startLoginFlow({ ...options, showBridgeOnCompletion: false });
   return { status: "login_started" };
 }
 
 async function switchOrganization(
   organizationId: string,
-  options: { readonly compactWindow?: boolean } = {},
+  options: { readonly showBridgeOnCompletion?: boolean } = {},
 ): Promise<JsonValue> {
   const session = await readSignedInSession();
   if (!session) {
@@ -2570,6 +3186,7 @@ async function switchOrganization(
       elapsedMs: Date.now() - startedAt,
     });
     await refreshOrganizations();
+    void refreshOrgPolicy("organization_switch", { force: true });
     audit.record("auth.organization_switched", {
       elapsedMs: Date.now() - startedAt,
       organizationId,
@@ -2582,7 +3199,10 @@ async function switchOrganization(
       // through the browser flow scoped to that organization; the AuthKit
       // session cookie usually makes this a single redirect.
       audit.record("auth.organization_switch_reauth", { organizationId });
-      await startLoginFlow({ compactWindow: options.compactWindow, organizationId });
+      await startLoginFlow({
+        organizationId,
+        showBridgeOnCompletion: options.showBridgeOnCompletion === true,
+      });
       return { organizationId, status: "login_started" };
     }
     audit.record("auth.organization_switch_failed", {
@@ -2594,6 +3214,7 @@ async function switchOrganization(
 }
 
 function clearInferenceTransparency(): void {
+  inferenceAdmissions.clear();
   inferenceGeneration += 1;
   activeInferenceRequests.abortAll("inference_boundary_changed");
   activeAttestationChecks.clear();
@@ -2602,6 +3223,12 @@ function clearInferenceTransparency(): void {
   inferenceStatus = initialInferenceStatus();
   inferenceAvailability.clearAccount();
   bridgeUsageCache.clear();
+  bridgeModelAssignmentCache.clear();
+  bridgeInferencePlanCache.clear();
+  bridgeOrgPolicyCache.clear();
+  bridgePricingCache.clear();
+  Effect.runSync(cloudNodeRouting.invalidate());
+  publishRequestLogReset();
   notifyStatusChanged();
 }
 
@@ -2611,27 +3238,48 @@ function clearInferenceTransparency(): void {
  * render the org switcher without extra round-trips. Best-effort: callers
  * fire-and-forget; failures keep the previous directory.
  */
-function refreshOrganizations(): Promise<void> {
-  organizationsRefresh ??= refreshOrganizationsOnce()
-    .catch((error) => {
-      audit.record("auth.organizations_refresh_failed", {
-        message: safeStatusMessage(errorMessage(error)),
-      });
-    })
-    .finally(() => {
-      organizationsRefresh = null;
+async function refreshOrganizations(): Promise<void> {
+  try {
+    const generation = inferenceGeneration;
+    const session = await readSignedInSession();
+    if (!session || generation !== inferenceGeneration) return;
+    const boundaryKey = cloudNodeSessionBoundaryKey(session);
+    if (organizationsRefresh?.generation === generation) {
+      const active = organizationsRefresh;
+      if (active.boundaryKey === boundaryKey) return active.pending;
+      await active.pending;
+      if (generation === inferenceGeneration) return refreshOrganizations();
+      return;
+    }
+    const pending: Promise<void> = refreshOrganizationsOnce(session, generation, (current) =>
+      organizationsRefresh?.pending === pending
+      && generation === inferenceGeneration
+      && cloudNodeSessionBoundaryKey(current) === boundaryKey,
+    ).catch(recordOrganizationsRefreshFailure).finally(() => {
+      if (organizationsRefresh?.pending === pending) organizationsRefresh = null;
     });
-  return organizationsRefresh;
+    organizationsRefresh = { generation, boundaryKey, pending };
+    return pending;
+  } catch (error) {
+    recordOrganizationsRefreshFailure(error);
+  }
 }
 
-async function refreshOrganizationsOnce(): Promise<void> {
-  const session = await readSignedInSession();
-  if (!session) return;
+function recordOrganizationsRefreshFailure(error: unknown): void {
+  audit.record("auth.organizations_refresh_failed", {
+    message: safeStatusMessage(errorMessage(error)),
+  });
+}
 
+async function refreshOrganizationsOnce(
+  session: SignedInWorkOsSession,
+  generation: number,
+  ownsCurrent: (session: SignedInWorkOsSession) => boolean,
+): Promise<void> {
   const response = await authServer.listOrganizations(session.sessionToken, { includeFeatureFlags: true });
-  // Re-read: the listing round-trip may have raced a refresh elsewhere.
+  // Token refresh can rebase within this request's account/organization boundary.
   const current = await readSignedInSession();
-  if (!current) return;
+  if (!current || !ownsCurrent(current)) return;
 
   const base = response.session ? toStoredSession(response.session, current) : current;
   const organizationId = response.organizationId ?? base.organizationId ?? null;
@@ -2648,8 +3296,15 @@ async function refreshOrganizationsOnce(): Promise<void> {
       : undefined,
     organizations: response.organizations,
   };
-  const wrote = await writeSignedInSessionIfCurrent(nextSession, current, "organizations_refresh");
-  if (!wrote) return;
+  const wrote = await writeSignedInSessionIfCurrent(nextSession, current, "organizations_refresh", ownsCurrent);
+  const committed = sessionStore().peekCached();
+  if (
+    !wrote || generation !== inferenceGeneration || committed?.kind !== "signed_in"
+    || cloudNodeSessionBoundaryKey(committed) !== cloudNodeSessionBoundaryKey(nextSession)
+  ) return;
+  if (cloudNodeSessionBoundaryKey(current) !== cloudNodeSessionBoundaryKey(nextSession)) {
+    clearInferenceTransparency();
+  }
   audit.record("auth.organizations_refreshed", {
     activeOrganizationId: organizationId,
     count: response.organizations.length,
@@ -2741,8 +3396,35 @@ function publicAccountState(session: WorkOsSession): BridgeStatus["account"] {
   };
 }
 
+/**
+ * Fetches the org policy for the stored session (sign-in, org switch, session
+ * refresh via status reads, and a 60s poll). Failures keep the last good policy.
+ */
+async function refreshOrgPolicy(reason: string, options: { readonly force?: boolean } = {}): Promise<void> {
+  try {
+    const session = await readSignedInSession();
+    await bridgeOrgPolicyCache.refresh(
+      session ? { organizationId: session.organizationId ?? null, sessionToken: session.sessionToken } : null,
+      options,
+    );
+  } catch (error) {
+    audit.record("org_policy.refresh_failed", { reason, message: safeStatusMessage(errorMessage(error)) });
+  }
+}
+
 function publicFeatureFlags(session: SignedInWorkOsSession): BridgeFeatureFlags {
-  const enabledSlugs = sessionFeatureFlagSlugs(session);
+  // A known policy for this exact organization decides registry features
+  // (ADR-0295); otherwise the WorkOS slugs apply unchanged.
+  // Global controls (ADR-0296) then remove killed features, with or without a policy.
+  const enabledSlugs = withoutGloballyDisabledSlugs(
+    orgPolicyFeatureSlugs(
+      sessionFeatureFlagSlugs(session),
+      bridgeOrgPolicyCache.policyFor(session.organizationId)?.policy ?? null,
+    ),
+    bridgeOrgPolicyCache.globalControlsFor(session.organizationId),
+    session.organizationId ?? null,
+    Date.now(),
+  );
   const capabilities = featureFlagCapabilities(enabledSlugs);
   return {
     capabilities,
@@ -2818,14 +3500,8 @@ function featureFlagCapabilities(enabledSlugs: readonly string[]): BridgeFeature
     automations,
     automationToggleTrack: automations && enabled.has("automations-toggle-track-available"),
     devtooling: enabled.has("devtools-visible"),
-    contextHandoff: enabled.has("context-handoff-available"),
+    ...assistantFeatureCapabilities(enabledSlugs),
   };
-}
-
-function sanitizeFeatureFlagSlugs(value: unknown): string[] {
-  if (!Array.isArray(value)) return [];
-  return [...new Set(value.filter((slug): slug is string => typeof slug === "string" && slug.trim().length > 0))]
-    .sort();
 }
 
 function sessionStore(): EncryptedSessionStore {
@@ -2856,23 +3532,16 @@ function bridgeUpdateStatusForFeed(input: { readonly channel: string; readonly v
   const baseUrl = bridgeUpdateBaseUrlFromEnv();
   const feedUrl = reason
     ? null
-    : input.version
-      ? bridgeVersionedUpdateFeedUrl({
-        arch: process.arch,
-        baseUrl,
-        channel: input.channel,
-        platform: process.platform,
-        version: input.version,
-      })
-      : bridgeUpdateFeedUrl({
-        arch: process.arch,
-        baseUrl,
-        channel: input.channel,
-        platform: process.platform,
-      });
+    : bridgeUpdateFeedUrl({
+      arch: process.arch,
+      baseUrl,
+      channel: input.channel,
+      platform: process.platform,
+      version: input.version,
+    });
   const releaseNotesUrl = reason
     ? null
-    : bridgeReleaseListUrl({
+    : bridgeChangelogUrl({
       arch: process.arch,
       baseUrl,
       channel: input.channel,
@@ -2897,7 +3566,7 @@ function bridgeUpdateStatusForFeed(input: { readonly channel: string; readonly v
 
 function isLocalQaBuild(): boolean {
   if (!app.isPackaged) return false;
-  // dev.ps1 and dev.sh pin local installer versions to X.Y.Z-local.<timestamp>,
+  // Local packaged builds pin installer versions to X.Y.Z-local.<timestamp>,
   // so the version alone identifies a local build even if the extraMetadata flag
   // is dropped from the build invocation again (regressed once in 5145131).
   if (app.getVersion().includes("-local.")) return true;
@@ -2986,8 +3655,6 @@ async function checkForBridgeUpdates(): Promise<BridgeUpdateStatus> {
   return getUpdateStatus();
 }
 
-const EXPERIMENTAL_BUILDS_FETCH_TIMEOUT_MS = 15_000;
-
 async function checkForBridgeUpdatesFromFeed(input: {
   readonly allowDowngrade?: boolean;
   readonly channel: string;
@@ -3004,63 +3671,6 @@ async function checkForBridgeUpdatesFromFeed(input: {
     setUpdateStatus({ checking: false, downloadPercent: null, downloading: false, updateError: errorMessage(error) });
   }
   return getUpdateStatus();
-}
-
-async function listExperimentalBridgeBuilds() {
-  const channel = BRIDGE_RELEASE_EXPERIMENTAL_CHANNEL;
-  const localSnapshot = localReleaseBuildsSnapshot({
-    arch: process.arch,
-    channel,
-    currentVersion: app.getVersion(),
-    isPackaged: app.isPackaged,
-    localBuild: isLocalQaBuild(),
-    platform: process.platform,
-  });
-  if (localSnapshot) return localSnapshot;
-
-  const releasesUrl = bridgeReleaseListUrl({
-    arch: process.arch,
-    baseUrl: bridgeUpdateBaseUrlFromEnv(),
-    channel,
-    platform: process.platform,
-  });
-  const response = await fetch(releasesUrl, {
-    headers: { accept: "application/json" },
-    signal: AbortSignal.timeout(EXPERIMENTAL_BUILDS_FETCH_TIMEOUT_MS),
-  });
-  if (!response.ok) {
-    throw new Error(`Experimental build list request failed (${response.status}).`);
-  }
-  const body = await response.json() as unknown;
-  return parseBridgeExperimentalBuildsResponse({
-    arch: process.arch,
-    body,
-    channel,
-    currentVersion: app.getVersion(),
-    platform: process.platform,
-    releasesUrl,
-  });
-}
-
-async function installExperimentalBridgeBuild(identifierInput: unknown): Promise<BridgeUpdateStatus> {
-  if (typeof identifierInput !== "string" || identifierInput.length === 0 || identifierInput.length > 360) {
-    throw new Error("Invalid experimental build selection.");
-  }
-
-  const builds = await listExperimentalBridgeBuilds();
-  const byStableKey = builds.builds.find((build) => build.releaseKey === identifierInput || build.id === identifierInput);
-  const byVersion = builds.builds.filter((build) => build.version === identifierInput);
-  if (!byStableKey && byVersion.length > 1) {
-    throw new Error("Multiple experimental builds share that version. Refresh and choose the exact build row.");
-  }
-  const selected = byStableKey ?? byVersion[0];
-  if (!selected) throw new Error("The selected experimental build is not available for this device.");
-
-  return checkForBridgeUpdatesFromFeed({
-    allowDowngrade: true,
-    channel: BRIDGE_RELEASE_EXPERIMENTAL_CHANNEL,
-    version: selected.version,
-  });
 }
 
 async function openBridgeUpdateReleaseNotes(): Promise<boolean> {
@@ -3099,7 +3709,65 @@ function recordUpdateStatusAudit(status: BridgeUpdateStatus): void {
   audit.record("update.status", sanitizedUpdateDiagnostics(status));
 }
 
+function currentShellAccountSignature(): string {
+  if (pendingLogin) return "login_pending";
+  if (bridgeUiE2eWireUrl()) {
+    return authStatusSnapshotSignature(publicAccountState(bridgeUiE2eSession()));
+  }
+  const cached = workOsSessionStore?.peekCached();
+  if (!cached) return lastAuthStatusSnapshotSignature ?? "unknown";
+  return authStatusSnapshotSignature(publicAccountState(cached));
+}
+
+function currentShellStatusSignature(): string {
+  const reachability = serverReachability.current();
+  const sessionRefresh = sessionRefreshCoordinator.snapshot();
+  const nodeRouting = Effect.runSync(cloudNodeRouting.snapshot());
+  const latest = networkHistory.latest();
+  const pendingPairingRequests = pairingStore.listRequests()
+    .filter((request) => request.status === "pending").length;
+  const pairedClients = pairingStore.listClients()
+    .filter((client) => !client.credential.revokedAt).length;
+  const cachedSession = bridgeUiE2eWireUrl()
+    ? bridgeUiE2eSession()
+    : workOsSessionStore?.peekCached();
+  const inferenceAvailabilitySnapshot = cachedSession?.kind === "signed_in"
+    ? inferenceAvailability.snapshot(sessionUsageOwnerKey(cachedSession))
+    : inferenceAvailability.snapshot();
+  return bridgeShellStatusSignature({
+    accountSignature: currentShellAccountSignature(),
+    activeRequests: activeInferenceRequests.size,
+    attestation: inferenceStatus.attestation,
+    attestationInProgress: activeAttestationChecks.size > 0,
+    authError: authError ?? "",
+    lastError: inferenceStatus.lastError ?? "",
+    lastRequestId: latest?.requestId ?? "",
+    lastRequestStatus: latest?.status ?? "",
+    loginPending: Boolean(pendingLogin),
+    plaintextInferenceWarningHidden,
+    inferenceAvailability: inferenceAvailabilitySnapshot,
+    nodeRouting,
+    orgPolicy: shellOrgPolicySignatureInput(bridgeOrgPolicyCache.snapshot(
+      cachedSession?.kind === "signed_in" ? cachedSession.organizationId ?? null : null,
+    )),
+    pairedClients,
+    pendingPairingRequests,
+    reachability: reachability.state,
+    sessionRefreshAttempt: sessionRefresh.attempt,
+    sessionRefreshState: sessionRefresh.state,
+    socketReady: Boolean(ipcServer),
+    wireCaptureRevision: inferenceStatus.wireCaptureRevision,
+  });
+}
+
+function shellOrgPolicySignatureInput(status: BridgeOrgPolicyStatus) {
+  return { ...status, globalControlsSignature: globalControlsSignature(status.globalControls) };
+}
+
 function notifyStatusChanged(): void {
+  const signature = currentShellStatusSignature();
+  if (signature === lastShellStatusSignature) return;
+  lastShellStatusSignature = signature;
   sendToMainWindow("bridge:status-changed");
   statusEvents.emit("changed");
 }
@@ -3121,7 +3789,6 @@ function sendToMainWindow(channel: string, ...args: unknown[]): void {
 }
 
 function showMainWindow(): void {
-  closeAuthCompactWindow();
   requestShowMainWindow("show_main_window");
 }
 

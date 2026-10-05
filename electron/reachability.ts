@@ -32,6 +32,8 @@ export type ServerReachabilityMonitorOptions = {
   onReachabilityChange?: (reachable: boolean, snapshot: ServerReachabilitySnapshot) => void;
   onStateChange?: (snapshot: ServerReachabilitySnapshot) => void;
   probe: () => Promise<ServerReachabilityProbeResult>;
+  /** Consecutive timeout/network failures required before visible unavailability. */
+  transientFailureThreshold?: number;
   ttlMs: number;
 };
 
@@ -49,6 +51,8 @@ export class ServerReachabilityMonitor {
   private readonly onStateChange?: (snapshot: ServerReachabilitySnapshot) => void;
   private readonly probe: () => Promise<ServerReachabilityProbeResult>;
   private readonly ttlMs: number;
+  private readonly transientFailureThreshold: number;
+  private transientFailureCount = 0;
   private inFlight?: Promise<ServerReachabilitySnapshot>;
   private snapshot: ServerReachabilitySnapshot = INITIAL_SNAPSHOT;
 
@@ -57,6 +61,7 @@ export class ServerReachabilityMonitor {
     this.onReachabilityChange = options.onReachabilityChange;
     this.onStateChange = options.onStateChange;
     this.probe = options.probe;
+    this.transientFailureThreshold = Math.max(1, Math.floor(options.transientFailureThreshold ?? 2));
     this.ttlMs = options.ttlMs;
   }
 
@@ -90,7 +95,25 @@ export class ServerReachabilityMonitor {
 
   private applyProbeResult(result: ServerReachabilityProbeResult): ServerReachabilitySnapshot {
     const previous = this.snapshot;
-    const next = normalizeProbeResult(result, this.clock());
+    const probed = normalizeProbeResult(result, this.clock());
+    let next = probed;
+    if (probed.reachable) {
+      this.transientFailureCount = 0;
+    } else if (isTransientFailure(probed.reason)) {
+      this.transientFailureCount += 1;
+      if (
+        previous.state !== "unavailable"
+        && this.transientFailureCount < this.transientFailureThreshold
+      ) {
+        next = {
+          ...previous,
+          checkedAt: probed.checkedAt,
+          httpStatus: null,
+        };
+      }
+    } else {
+      this.transientFailureCount = 0;
+    }
     this.snapshot = next;
 
     if (previous.checkedAt !== null && previous.reachable !== next.reachable) {
@@ -102,6 +125,10 @@ export class ServerReachabilityMonitor {
 
     return next;
   }
+}
+
+function isTransientFailure(reason: ServerReachabilityReason): boolean {
+  return reason === "timeout" || reason === "network_error";
 }
 
 function normalizeProbeResult(

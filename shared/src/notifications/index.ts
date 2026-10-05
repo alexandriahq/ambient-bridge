@@ -3,6 +3,7 @@ import ActionToast from "./action-toast.svelte";
 import type { AmbientToastAction, AmbientToastVariant } from "./types.js";
 export { default as AmbientToaster } from "./ambient-toaster.svelte";
 export { default as AmbientUpdateCard } from "./update-card.svelte";
+export { default as AmbientUpdateProgress } from "./update-progress.svelte";
 export { toast as ambientToast } from "svelte-sonner";
 export type { AmbientToastAction, AmbientToastVariant } from "./types.js";
 export {
@@ -14,6 +15,7 @@ export {
 } from "./update-controller.js";
 
 export type AmbientUpdateToastStatus = {
+  readonly backgroundCheck?: boolean;
   readonly channel: string;
   readonly checking: boolean;
   readonly currentVersion: string;
@@ -24,6 +26,13 @@ export type AmbientUpdateToastStatus = {
   readonly updateAvailable: boolean;
   readonly updateError?: string;
   readonly downloadPercent?: number | null;
+  /** Renderer-local: the user started install/restart and the process is still here. */
+  readonly installing?: boolean;
+};
+
+export type AmbientUpdateProgressView = {
+  readonly percent: number | null;
+  readonly label: string;
 };
 
 export type AmbientUpdateToastActions = {
@@ -55,23 +64,15 @@ export type AmbientActionToastInput = {
   readonly actions?: readonly AmbientToastAction[];
   readonly durationMs?: number;
   readonly important?: boolean;
+  readonly progress?: AmbientUpdateProgressView | null;
 };
 
 export function showAmbientActionToast(input: AmbientActionToastInput): string | number {
   return toast.custom(ActionToast, toastOptions(input));
 }
 
-export function showAmbientUpdateToast(
-  status: AmbientUpdateToastStatus,
-  actions: AmbientUpdateToastActions = {},
-  options: { readonly id?: string; readonly productName?: string; readonly stableLabel?: string } = {},
-): string | number | null {
-  const content = ambientUpdateToastContent(status, actions, options);
-  return content ? showAmbientActionToast(content) : null;
-}
-
-// The update-notification content is presentation-agnostic: the toast layer
-// and docked surfaces (e.g. the app sidebar UpdateCard) render the same input.
+// Update content is presentation-agnostic. The App renders it in the docked
+// sidebar card while retaining the same action and progress contracts.
 export function ambientUpdateToastContent(
   status: AmbientUpdateToastStatus,
   actions: AmbientUpdateToastActions = {},
@@ -100,6 +101,21 @@ export function ambientUpdateToastContent(
     };
   }
 
+  if (status.installing) {
+    return {
+      id,
+      title: `Installing ${productName}…`,
+      description: version
+        ? `Version ${version} is being installed.`
+        : `The ${stableLabel} channel update is being installed.`,
+      detail: "Ambient will restart to finish the update.",
+      variant: "loading",
+      durationMs: 60_000,
+      important: true,
+      progress: ambientUpdateProgress(status),
+    };
+  }
+
   if (status.downloaded) {
     return {
       id,
@@ -120,14 +136,17 @@ export function ambientUpdateToastContent(
   }
 
   if (status.downloading || status.checking) {
+    const progress = ambientUpdateProgress(status);
     return {
       id,
-      title: status.downloading ? `${productName} update` : `Checking ${productName} updates`,
+      title: status.downloading ? `Downloading ${productName}…` : `Checking ${productName} updates`,
       description: status.downloading
-        ? updateProgressDescription(status.downloadPercent)
+        ? (version ? `Version ${version}` : "Downloading the update in the background.")
         : `Looking for a newer ${stableLabel} channel build.`,
       variant: "loading",
-      durationMs: 8_000,
+      durationMs: status.downloading ? 60_000 : 8_000,
+      important: status.downloading,
+      progress,
       actions: compactActions([
         actions.viewReleaseNotes ? { label: "Release notes", tone: "ghost", onClick: actions.viewReleaseNotes } : null,
       ]),
@@ -199,11 +218,37 @@ function toastOptions(input: AmbientActionToastInput): ExternalToast<typeof Acti
       detail: input.detail ?? null,
       variant: input.variant ?? "info",
       actions: input.actions ?? [],
+      progress: input.progress ?? null,
     },
     duration: input.durationMs ?? 10_000,
     important: input.important ?? false,
     unstyled: true,
   } satisfies ExternalToast<typeof ActionToast>;
+}
+
+export function ambientUpdateProgress(
+  status: Pick<
+    AmbientUpdateToastStatus,
+    "checking" | "downloaded" | "downloadPercent" | "downloading" | "installing"
+  >,
+): AmbientUpdateProgressView | null {
+  if (status.installing) {
+    return { percent: null, label: "Installing…" };
+  }
+  if (status.downloaded) {
+    return { percent: 100, label: "Ready to install" };
+  }
+  if (status.downloading) {
+    const percent = roundedDownloadPercent(status.downloadPercent);
+    return {
+      percent,
+      label: percent === null ? "Downloading…" : `Downloading… ${percent}%`,
+    };
+  }
+  if (status.checking) {
+    return { percent: null, label: "Checking for updates…" };
+  }
+  return null;
 }
 
 function compactActions(
@@ -212,9 +257,9 @@ function compactActions(
   return actions.filter((action): action is AmbientToastAction => Boolean(action));
 }
 
-function updateProgressDescription(percent: number | null | undefined): string {
-  if (typeof percent !== "number" || !Number.isFinite(percent)) return "Downloading the update in the background.";
-  return `Downloading the update (${Math.round(Math.max(0, Math.min(100, percent)))}%).`;
+function roundedDownloadPercent(percent: number | null | undefined): number | null {
+  if (typeof percent !== "number" || !Number.isFinite(percent)) return null;
+  return Math.round(Math.max(0, Math.min(100, percent)));
 }
 
 function boundedDetail(value: string): string {

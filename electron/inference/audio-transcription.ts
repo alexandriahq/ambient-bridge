@@ -47,9 +47,12 @@ export function audioTranscriptionRequestFromPayload(
   const prompt = typeof payload.prompt === "string" ? payload.prompt.trim() : "";
   const temperature = typeof payload.temperature === "number" ? String(payload.temperature) : "0";
   const responseFormat = typeof payload.responseFormat === "string" && payload.responseFormat ? payload.responseFormat : "json";
+  // ISO 639 hint from the App's transcription language; absent lets Whisper detect it.
+  const language = typeof payload.language === "string" && /^[a-z]{2,3}$/.test(payload.language) ? payload.language : "";
   const body = new FormData();
   body.set("model", model);
   if (prompt) body.set("prompt", prompt);
+  if (language) body.set("language", language);
   body.set("response_format", responseFormat);
   body.set("temperature", temperature);
   body.set("file", new Blob([blobPartFromBuffer(audio)], { type: mediaType }), fileName);
@@ -62,6 +65,11 @@ export function audioTranscriptionRequestFromPayload(
 }
 
 function blobPartFromBuffer(buffer: Buffer): Uint8Array<ArrayBuffer> {
+  // Blob copies the exact view into its own storage during construction.
+  if (buffer.buffer instanceof ArrayBuffer) {
+    return new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+  }
+  // BlobPart excludes shared backing buffers, so retain a private copy here.
   const bytes = new Uint8Array(buffer.byteLength);
   bytes.set(buffer);
   return bytes;

@@ -1,9 +1,13 @@
 import type {
+  NetworkRequestRecord as BridgeInferenceRequestStatus,
   BridgeCopyWirePayloadResult,
   BridgeWireCaptureResult,
 } from "../../electron/bridge-ui-contract.js";
 
 export type {
+  InferenceUsage as BridgeInferenceUsage,
+  InferenceProxyPath as BridgeInferenceProxyPath,
+  NetworkRequestRecord as BridgeInferenceRequestStatus,
   BridgeCopyWirePayloadResult,
   BridgeWireBody,
   BridgeWireCapture,
@@ -36,7 +40,9 @@ export type BridgeFeatureFlagKey =
   | "automations"
   | "automationToggleTrack"
   | "devtooling"
-  | "contextHandoff";
+  | "contextHandoff"
+  | "skills"
+  | "reports";
 
 export type BridgeFeatureFlagFamily = "integrations" | "automations" | "devtools" | "context";
 
@@ -93,12 +99,6 @@ export type BridgeSessionRefreshSnapshot = {
   state: "ready" | "refreshing" | "retrying" | "degraded";
 };
 
-export type BridgeActivityEvent = {
-  name: string;
-  at: number;
-  fields: Record<string, string | number | boolean | null>;
-};
-
 export type BridgePairingRequest = {
   id: string;
   clientName: string;
@@ -113,19 +113,34 @@ export type BridgePairedClient = {
   revokedAt: number | null;
 };
 
+/** Shell inference fields only — never carry the request list. */
 export type BridgeInferenceStatus = {
   activeRequests: number;
   attestation: "not_checked" | "verifying" | "verified" | "failed";
   attestationChecks: BridgeAttestationCheck[];
   attestationInProgress: boolean;
-  encryption: "ehbp";
+  encryption: "ehbp" | "none";
   lastError: string | null;
   lastRequest: BridgeInferenceRequestStatus | null;
-  requests: BridgeInferenceRequestStatus[];
   responsePrivacy: "decrypts_in_bridge";
   serverAuth: "workos_session";
   serverOrigin: string;
   wireCaptureRevision: number;
+};
+
+/** Initial newest-first page for the Bridge window network log. */
+export type BridgeRequestLogSnapshot = {
+  revision: number;
+  requests: BridgeInferenceRequestStatus[];
+};
+
+/** Incremental network-log update; renderer merges by requestId. */
+export type BridgeRequestLogPatch = {
+  revision: number;
+  upserts: BridgeInferenceRequestStatus[];
+  removeIds?: string[];
+  /** When true, drop the current list before applying upserts (sign-out / clear). */
+  reset?: boolean;
 };
 
 export type BridgeAttestationCheck = {
@@ -135,42 +150,41 @@ export type BridgeAttestationCheck = {
   status: "passed" | "failed";
 };
 
-export type BridgeInferenceUsage = {
-  promptTokens: number;
-  completionTokens: number;
-  totalTokens: number;
-};
-
-export type BridgeInferenceProxyPath = "/v1/chat/completions" | "/v1/responses" | "/v1/audio/transcriptions";
-
-export type BridgeInferenceRequestStatus = {
-  completedAt: number | null;
-  feature: string;
-  model: string | null;
-  path: BridgeInferenceProxyPath;
-  requestId: string;
-  startedAt: number;
-  status: "active" | "completed" | "failed" | "cancelled";
-  statusCode: number | null;
-  requestBytes: number | null;
-  encryption: "ehbp";
-  attestation: "pending" | "verified" | "failed";
-  ehbpResponseNonce: string | null;
-  tinfoilRequestId: string | null;
-  usage: BridgeInferenceUsage | null;
-  error: string | null;
-  wireCaptured: boolean;
-};
-
+/** Window shell + Ambient pairing snapshot. No request list / activity feed. */
 export type BridgeStatus = {
   account: BridgeAccountState;
-  activity: BridgeActivityEvent[];
   authError?: string;
   connection: BridgeConnectionState;
   inference: BridgeInferenceStatus;
+  plaintextInferenceWarningHidden: boolean;
+  nodeRouting: {
+    state: string;
+    organizationId: string | null;
+    workspaceId: string | null;
+    workspaceKind: "personal" | "workos_org" | null;
+    installationId: string | null;
+    origin: string | null;
+    capabilities: string[];
+    entitlements: {
+      inference: boolean;
+      multiplayer: boolean;
+      publishing: boolean;
+      mcp: boolean;
+    };
+    inferenceMode: "confidential" | "plaintext" | null;
+    configurationVersion: number | null;
+    message: string | null;
+  };
   pairedClientList: BridgePairedClient[];
   pairedClients: number;
   pairingRequests: BridgePairingRequest[];
+  runtimeIdentity: {
+    channel: string;
+    commitSha: string;
+    serverUrl: string;
+    serverTarget: "staging" | "production" | null;
+    version: string;
+  };
   serverReachable: boolean;
   serverReachability: BridgeServerReachabilityState;
   serverReachabilityCheckedAt: number | null;
@@ -180,25 +194,6 @@ export type BridgeStatus = {
   sessionRefresh: BridgeSessionRefreshSnapshot;
   appVersion: string;
   socketReady: boolean;
-};
-
-export type BridgeExperimentalBuildsSnapshot = {
-  channel: string;
-  platform: string;
-  arch: string;
-  currentVersion: string;
-  releasesUrl: string | null;
-  builds: readonly {
-    id: string | null;
-    releaseKey: string;
-    version: string;
-    channel: string;
-    platform: string;
-    arch: string;
-    commitSha: string;
-    notes: string | null;
-    releasedAt: string;
-  }[];
 };
 
 export type BridgeUpdateStatus = {
@@ -222,18 +217,24 @@ export type BridgeUpdateStatus = {
 export type BridgeUiApi = {
   copyWirePayload(requestId: string): Promise<BridgeCopyWirePayloadResult>;
   getStatus(): Promise<BridgeStatus>;
+  getRequestLog(): Promise<BridgeRequestLogSnapshot>;
   getUpdateStatus(): Promise<BridgeUpdateStatus>;
   getWireCapture(requestId: string): Promise<BridgeWireCaptureResult>;
   onStatusChanged(callback: () => void): () => void;
+  onRequestLogChanged(callback: (patch: BridgeRequestLogPatch) => void): () => void;
   onUpdateStatusChanged(callback: (status: BridgeUpdateStatus) => void): () => void;
   checkForUpdates(): Promise<BridgeUpdateStatus>;
   checkForStableUpdates?(): Promise<BridgeUpdateStatus>;
   installUpdate(): Promise<BridgeUpdateStatus>;
+  getUninstallAvailability(): Promise<{
+    readonly available: boolean;
+    readonly reason: string | null;
+    readonly method: "trash" | "pkexec" | "nsis" | null;
+  }>;
+  uninstall(): Promise<{ readonly status: "uninstalled" }>;
   retryReachability(): Promise<BridgeStatus>;
   viewUpdateReleaseNotes(): Promise<boolean>;
-  listExperimentalBuilds(): Promise<BridgeExperimentalBuildsSnapshot>;
-  installExperimentalBuild(version: string): Promise<BridgeUpdateStatus>;
-  startLogin(): Promise<void>;
+  startLogin(options?: { restart?: boolean; reopen?: boolean }): Promise<void>;
   signOut(): Promise<void>;
   switchOrganization(organizationId: string): Promise<void>;
   completePairing(requestId: string, approved: boolean): Promise<BridgePairedClient | null>;

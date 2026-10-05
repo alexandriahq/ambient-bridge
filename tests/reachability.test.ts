@@ -38,7 +38,7 @@ describe("ServerReachabilityMonitor", () => {
     expect(monitor.current()).toMatchObject({ reason: "ok", state: "reachable" });
   });
 
-  it("keeps the last visible state while a later stale check runs", async () => {
+  it("keeps the last visible state through one transient probe failure", async () => {
     let now = 1_000;
     const probeResults: Deferred<boolean>[] = [];
     const probe = vi.fn(() => {
@@ -68,9 +68,31 @@ describe("ServerReachabilityMonitor", () => {
     probeResults[1]?.resolve(false);
     await flushPromises();
 
+    expect(monitor.current()).toMatchObject({ reason: "ok", state: "reachable" });
+    expect(onReachabilityChange).not.toHaveBeenCalled();
+
+    now += 8_001;
+    expect(monitor.current()).toMatchObject({ state: "reachable" });
+    probeResults[2]?.resolve(false);
+    await flushPromises();
+
     expect(monitor.current()).toMatchObject({ reason: "network_error", state: "unavailable" });
     expect(onReachabilityChange).toHaveBeenCalledWith(false, expect.objectContaining({ state: "unavailable" }));
-    expect(onStateChange).toHaveBeenCalledTimes(2);
+    expect(onStateChange).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not replace initial checking with a single timeout", async () => {
+    const results = [
+      { reachable: false, reason: "timeout" as const, message: "Server health check timed out." },
+      { reachable: false, reason: "timeout" as const, message: "Server health check timed out." },
+    ];
+    const monitor = new ServerReachabilityMonitor({
+      probe: async () => results.shift()!,
+      ttlMs: 8_000,
+    });
+
+    await expect(monitor.refresh()).resolves.toMatchObject({ reason: "not_checked", state: "checking" });
+    await expect(monitor.refresh()).resolves.toMatchObject({ reason: "timeout", state: "unavailable" });
   });
 
   it("exposes sanitized failure reasons from detailed probes", async () => {

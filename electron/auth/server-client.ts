@@ -1,14 +1,48 @@
-import { BUILD_DEFAULT_SERVER_URL } from "../generated/build-config.js";
+import { sanitizeFeatureFlagSlugs } from "@ambient/shared/feature-flags";
 import {
   parseUsageApiError,
+  parseUsageBillingSetupIntent,
+  parseUsageBillingState,
+  parseUsageModelBreakdown,
+  parseUsagePricingCatalog,
   parseUsageReservationResponse,
   parseUsageSummary,
+  parseUsageTopupCheckoutResponse,
+  usageTopupCheckoutRequestSchema,
+  type UsageTopupCheckoutRequest,
+  parseUsageTopupOptions,
   type UsageApiErrorBody,
+  type UsageBillingMode,
+  type UsageBillingSetupIntent,
+  type UsageBillingState,
+  type UsageSpendingLimit,
   type UsageErrorCode,
+  type UsageModelBreakdown,
+  type UsagePricingCatalog,
   type UsageReservationRequest,
   type UsageReservationResponse,
   type UsageSummary,
+  type UsageTopupCheckoutResponse,
+  type UsageTopupOptions,
 } from "@ambient/shared/usage";
+import {
+  parseInferenceModelAssignment,
+  type InferenceModelAssignment,
+} from "@ambient/shared/inference-models";
+import {
+  accountPlansResponseSchema,
+  planCheckoutRequestSchema,
+  planCheckoutResponseSchema,
+  planPortalResponseSchema,
+  type AccountPlansResponse,
+  type PlanCheckoutResponse,
+  type PlanPortalResponse,
+} from "@alexandria/cloud-contract/plans";
+import {
+  parseAppAnnouncementsDocument,
+  type AppAnnouncementsDocument,
+} from "@ambient/shared/announcements";
+import { workOsSessionExpiresAtSeconds } from "../workos/session.js";
 
 export type AuthBrokerUser = {
   id: string;
@@ -22,6 +56,7 @@ export type AuthBrokerUser = {
 export type AuthBrokerSessionResponse = {
   sessionToken: string;
   user: AuthBrokerUser;
+  /** JWT `exp`: Unix seconds. */
   expiresAt: number;
   organizationId: string | null;
   featureFlags: string[];
@@ -57,6 +92,11 @@ export type DelegatedIntegrationTokenResponse = {
 };
 
 type ServerDelegatedIntegrationTokenResponse = Omit<DelegatedIntegrationTokenResponse, "serverBaseUrl">;
+
+export type InferencePlanFetchResult =
+  | { readonly kind: "not_modified" }
+  | { readonly kind: "not_found" }
+  | { readonly kind: "ok"; readonly etag: string | null; readonly body: unknown };
 
 export type AuthServerClientOptions = {
   baseUrl: string;
@@ -97,6 +137,18 @@ export class AuthServerUsageError extends Error {
   }
 }
 
+/** A `/v1/plans*` refusal: `{ error: { code, message } }` (ADR-0324). */
+export class AuthServerPlansError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: string,
+    readonly serverMessage: string,
+  ) {
+    super(serverMessage);
+    this.name = "AuthServerPlansError";
+  }
+}
+
 export class AuthServerTimeoutError extends Error {
   readonly _tag = "AuthServerTimeoutError";
 
@@ -111,11 +163,6 @@ export type BridgeAuthCallback =
   | { kind: "error"; error: string; errorDescription?: string; clientState: string };
 
 export const BRIDGE_RETURN_URI = "ambient-bridge://auth/callback";
-// Baked at build time by scripts/generate-build-config.mjs. Every standard
-// release channel defaults to production; deliberate staging/local builds use
-// the explicit build-time override. There is no runtime server-URL override, so
-// a shipped app can never be pointed at an arbitrary URL.
-const DEFAULT_SERVER_URL = BUILD_DEFAULT_SERVER_URL;
 
 export class AuthServerClient {
   private readonly baseUrl: string;
@@ -181,6 +228,171 @@ export class AuthServerClient {
 
   usageSummary(sessionToken: string): Promise<UsageSummary> {
     return this.usageJson("/usage/summary", sessionToken, { method: "GET" }, parseUsageSummary);
+  }
+
+  usagePricing(sessionToken: string): Promise<UsagePricingCatalog> {
+    return this.usageJson("/usage/pricing", sessionToken, { method: "GET" }, parseUsagePricingCatalog);
+  }
+
+  usageModelBreakdown(sessionToken: string): Promise<UsageModelBreakdown> {
+    return this.usageJson("/usage/breakdown", sessionToken, { method: "GET" }, parseUsageModelBreakdown);
+  }
+
+  inferenceModels(sessionToken: string): Promise<InferenceModelAssignment> {
+    return this.sessionJson("/inference/models", sessionToken, parseInferenceModelAssignment);
+  }
+
+  /**
+   * `GET /v1/org-policy` with If-None-Match (ADR-0295). The body is validated
+   * by the Bridge org policy cache, which also owns the organization check.
+   */
+  async orgPolicy(
+    sessionToken: string,
+    etag: string | null,
+  ): Promise<{ readonly kind: "not_modified" } | { readonly kind: "ok"; readonly etag: string | null; readonly body: unknown }> {
+    const timeoutSignal = AbortSignal.timeout(this.requestTimeoutMs);
+    let response: Response;
+    try {
+      response = await this.fetchImpl(new URL("/v1/org-policy", this.baseUrl), {
+        headers: {
+          Accept: "application/json",
+          Authorization: `Bearer ${sessionToken}`,
+          ...(etag ? { "If-None-Match": etag } : {}),
+        },
+        method: "GET",
+        signal: timeoutSignal,
+      });
+    } catch (error) {
+      if (timeoutSignal.aborted || isAbortError(error) || isTimeoutError(error)) {
+        throw new AuthServerTimeoutError(this.requestTimeoutMs);
+      }
+      throw error;
+    }
+    if (response.status === 304) return { kind: "not_modified" };
+    let body: unknown = {};
+    try {
+      body = await response.json();
+    } catch (error) {
+      if (timeoutSignal.aborted || isTimeoutError(error)) throw new AuthServerTimeoutError(this.requestTimeoutMs);
+    }
+    if (!response.ok) throw authRequestError(response.status, body);
+    return { kind: "ok", etag: response.headers.get("etag"), body };
+  }
+
+  /**
+   * `GET /v1/inference/plan` with If-None-Match (ADR-0297). Clouds released
+   * before the plan answer 404 (`not_found`); the body is validated by the
+   * Bridge plan cache.
+   */
+  async inferencePlan(sessionToken: string, etag: string | null): Promise<InferencePlanFetchResult> {
+    const timeoutSignal = AbortSignal.timeout(this.requestTimeoutMs);
+    let response: Response;
+    try {
+      response = await this.fetchImpl(new URL("/v1/inference/plan", this.baseUrl), {
+        headers: {
+          Accept: "application/json",
+          Authorization: `Bearer ${sessionToken}`,
+          ...(etag ? { "If-None-Match": etag } : {}),
+        },
+        method: "GET",
+        signal: timeoutSignal,
+      });
+    } catch (error) {
+      if (timeoutSignal.aborted || isAbortError(error) || isTimeoutError(error)) {
+        throw new AuthServerTimeoutError(this.requestTimeoutMs);
+      }
+      throw error;
+    }
+    if (response.status === 304) return { kind: "not_modified" };
+    if (response.status === 404) return { kind: "not_found" };
+    let body: unknown = {};
+    try {
+      body = await response.json();
+    } catch (error) {
+      if (timeoutSignal.aborted || isTimeoutError(error)) throw new AuthServerTimeoutError(this.requestTimeoutMs);
+    }
+    if (!response.ok) throw authRequestError(response.status, body);
+    return { kind: "ok", etag: response.headers.get("etag"), body };
+  }
+
+  announcements(options: { readonly organizationId?: string | null } = {}): Promise<AppAnnouncementsDocument> {
+    const organizationId = options.organizationId?.trim();
+    const path = organizationId
+      ? `/announcements?organizationId=${encodeURIComponent(organizationId)}`
+      : "/announcements";
+    return this.publicJson(path, parseAppAnnouncementsDocument);
+  }
+
+  usageTopupOptions(sessionToken: string, customAmounts = false): Promise<UsageTopupOptions> {
+    return this.usageJson(customAmounts ? "/usage/topups?customAmounts=true" : "/usage/topups", sessionToken, { method: "GET" }, parseUsageTopupOptions);
+  }
+
+  createUsageTopupCheckout(sessionToken: string, input: string | UsageTopupCheckoutRequest): Promise<UsageTopupCheckoutResponse> {
+    return this.usageJson(
+      "/usage/topups/checkout",
+      sessionToken,
+      { method: "POST", body: JSON.stringify(usageTopupCheckoutRequestSchema.parse(typeof input === "string" ? { packageId: input } : input)) },
+      parseUsageTopupCheckoutResponse,
+    );
+  }
+
+  /** `GET /v1/plans` (ADR-0324). Unknown fields are dropped, so a newer Cloud still parses. */
+  accountPlans(sessionToken: string): Promise<AccountPlansResponse> {
+    return this.plansJson("/v1/plans", sessionToken, { method: "GET" }, (value) => accountPlansResponseSchema.parse(value));
+  }
+
+  /** `POST /v1/plans/checkout`: a Stripe Checkout URL for a subscription. */
+  async createPlanCheckout(sessionToken: string, planId: string): Promise<PlanCheckoutResponse> {
+    return this.plansJson(
+      "/v1/plans/checkout",
+      sessionToken,
+      { method: "POST", body: JSON.stringify(planCheckoutRequestSchema.parse({ planId })) },
+      (value) => planCheckoutResponseSchema.parse(value),
+    );
+  }
+
+  /** `POST /v1/plans/portal`: the Stripe customer portal (change plan, cancel, card, invoices). */
+  createPlanPortal(sessionToken: string): Promise<PlanPortalResponse> {
+    return this.plansJson("/v1/plans/portal", sessionToken, { method: "POST", body: "{}" }, (value) => planPortalResponseSchema.parse(value));
+  }
+
+  usageBillingState(sessionToken: string): Promise<UsageBillingState> {
+    return this.usageJson("/usage/billing", sessionToken, { method: "GET" }, parseUsageBillingState);
+  }
+
+  createUsageBillingSetupIntent(sessionToken: string): Promise<UsageBillingSetupIntent> {
+    return this.usageJson("/usage/billing/setup-intent", sessionToken, { method: "POST", body: "{}" }, parseUsageBillingSetupIntent);
+  }
+
+  attachUsageBillingPaymentMethod(sessionToken: string, setupIntentId: string): Promise<UsageBillingState> {
+    return this.usageJson(
+      "/usage/billing/payment-method",
+      sessionToken,
+      { method: "PUT", body: JSON.stringify({ setupIntentId }) },
+      parseUsageBillingState,
+    );
+  }
+
+  removeUsageBillingPaymentMethod(sessionToken: string): Promise<UsageBillingState> {
+    return this.usageJson("/usage/billing/payment-method", sessionToken, { method: "DELETE" }, parseUsageBillingState);
+  }
+
+  setUsageSpendingLimit(sessionToken: string, limit: UsageSpendingLimit | null): Promise<UsageBillingState> {
+    return this.usageJson(
+      "/usage/billing/spending-limit",
+      sessionToken,
+      { method: "PUT", body: JSON.stringify({ limit }) },
+      parseUsageBillingState,
+    );
+  }
+
+  setUsageBillingMode(sessionToken: string, mode: UsageBillingMode): Promise<UsageBillingState> {
+    return this.usageJson(
+      "/usage/billing/mode",
+      sessionToken,
+      { method: "PUT", body: JSON.stringify({ mode }) },
+      parseUsageBillingState,
+    );
   }
 
   reserveUsage(sessionToken: string, request: UsageReservationRequest): Promise<UsageReservationResponse> {
@@ -249,61 +461,82 @@ export class AuthServerClient {
     return logoutUrl;
   }
 
-  private async postJson<T>(
+  private postJson<T>(
     path: string,
     body: Record<string, unknown>,
     parse: (value: unknown) => T,
   ): Promise<T> {
-    const timeoutSignal = AbortSignal.timeout(this.requestTimeoutMs);
-    let response: Response;
-    try {
-      response = await this.fetchImpl(new URL(path, this.baseUrl), {
-        body: JSON.stringify(body),
-        headers: { "Content-Type": "application/json" },
-        method: "POST",
-        signal: timeoutSignal,
-      });
-    } catch (error) {
-      if (timeoutSignal.aborted || isAbortError(error) || isTimeoutError(error)) {
-        throw new AuthServerTimeoutError(this.requestTimeoutMs);
-      }
-      throw error;
-    }
-
-    let responseBody: unknown;
-    try {
-      responseBody = await response.json();
-    } catch (error) {
-      if (timeoutSignal.aborted || isTimeoutError(error)) {
-        throw new AuthServerTimeoutError(this.requestTimeoutMs);
-      }
-      responseBody = {};
-    }
-    if (!response.ok) {
-      const message = asRecord(responseBody).error;
-      throw new AuthServerRequestError(response.status, typeof message === "string" ? message : undefined);
-    }
-
-    return parse(responseBody);
+    return this.requestJson(path, () => ({
+      body: JSON.stringify(body),
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    }), parse);
   }
 
-  private async usageJson<T>(
+  private publicJson<T>(path: string, parse: (value: unknown) => T): Promise<T> {
+    return this.requestJson(path, () => ({
+      headers: { Accept: "application/json" },
+      method: "GET",
+    }), parse);
+  }
+
+  private sessionJson<T>(
     path: string,
     sessionToken: string,
-    init: { readonly method: "GET" | "POST" | "DELETE"; readonly body?: string },
     parse: (value: unknown) => T,
+  ): Promise<T> {
+    return this.requestJson(path, () => ({
+      headers: { Accept: "application/json", Authorization: `Bearer ${sessionToken}` },
+      method: "GET",
+    }), parse);
+  }
+
+  private usageJson<T>(
+    path: string,
+    sessionToken: string,
+    init: { readonly method: "GET" | "POST" | "PUT" | "DELETE"; readonly body?: string },
+    parse: (value: unknown) => T,
+  ): Promise<T> {
+    return this.requestJson(path, () => ({
+      ...(init.body === undefined ? {} : { body: init.body }),
+      headers: {
+        Accept: "application/json",
+        Authorization: `Bearer ${sessionToken}`,
+        ...(init.body === undefined ? {} : { "Content-Type": "application/json" }),
+      },
+      method: init.method,
+    }), parse, usageRequestError);
+  }
+
+  private plansJson<T>(
+    path: string,
+    sessionToken: string,
+    init: { readonly method: "GET" | "POST"; readonly body?: string },
+    parse: (value: unknown) => T,
+  ): Promise<T> {
+    return this.requestJson(path, () => ({
+      ...(init.body === undefined ? {} : { body: init.body }),
+      headers: {
+        Accept: "application/json",
+        Authorization: `Bearer ${sessionToken}`,
+        ...(init.body === undefined ? {} : { "Content-Type": "application/json" }),
+      },
+      method: init.method,
+    }), parse, plansRequestError);
+  }
+
+  private async requestJson<T>(
+    path: string,
+    init: () => RequestInit,
+    parse: (value: unknown) => T,
+    requestError: (status: number, body: unknown) => Error = authRequestError,
   ): Promise<T> {
     const timeoutSignal = AbortSignal.timeout(this.requestTimeoutMs);
     let response: Response;
     try {
+      // Auth serialization belongs inside this deadline/error boundary.
       response = await this.fetchImpl(new URL(path, this.baseUrl), {
-        ...(init.body === undefined ? {} : { body: init.body }),
-        headers: {
-          Accept: "application/json",
-          Authorization: `Bearer ${sessionToken}`,
-          ...(init.body === undefined ? {} : { "Content-Type": "application/json" }),
-        },
-        method: init.method,
+        ...init(),
         signal: timeoutSignal,
       });
     } catch (error) {
@@ -322,9 +555,14 @@ export class AuthServerClient {
       }
       responseBody = {};
     }
-    if (!response.ok) throw usageRequestError(response.status, responseBody);
+    if (!response.ok) throw requestError(response.status, responseBody);
     return parse(responseBody);
   }
+}
+
+function authRequestError(status: number, value: unknown): AuthServerRequestError {
+  const message = asRecord(value).error;
+  return new AuthServerRequestError(status, typeof message === "string" ? message : undefined);
 }
 
 function usageRequestError(status: number, value: unknown): Error {
@@ -335,8 +573,12 @@ function usageRequestError(status: number, value: unknown): Error {
   return new AuthServerRequestError(status, "Usage response was unavailable.");
 }
 
-export function resolveServerBaseUrl(): string {
-  return normalizeAuthServerBaseUrl(DEFAULT_SERVER_URL);
+function plansRequestError(status: number, value: unknown): Error {
+  const error = asRecord(asRecord(value).error);
+  if (typeof error.code === "string" && typeof error.message === "string" && error.message.trim()) {
+    return new AuthServerPlansError(status, error.code.slice(0, 80), error.message.trim().slice(0, 300));
+  }
+  return new AuthServerRequestError(status, status === 404 ? "Plans are not available on this server." : "Plans could not be loaded.");
 }
 
 export function createAuthLoginUrl(input: {
@@ -449,10 +691,13 @@ export function parseBridgeAuthCallback(rawValue: string, expectedClientState?: 
 function parseSessionResponse(value: unknown): AuthBrokerSessionResponse {
   const body = asRecord(value);
   const sessionToken = body.sessionToken;
-  const expiresAt = body.expiresAt;
+  const expiresAt = workOsSessionExpiresAtSeconds(expectNumber(body.expiresAt, "expiresAt"));
+  if (!Number.isFinite(expiresAt)) {
+    throw new Error("Server response returned an invalid expiresAt.");
+  }
   return {
-    expiresAt: expectNumber(expiresAt, "expiresAt"),
-    featureFlags: parseFeatureFlagSlugs(body.featureFlags),
+    expiresAt,
+    featureFlags: sanitizeFeatureFlagSlugs(body.featureFlags),
     organizationId: expectOptionalNullableString(body.organizationId),
     sessionToken: expectString(sessionToken, "sessionToken"),
     user: parseUser(body.user),
@@ -514,7 +759,7 @@ function parseFeatureFlagsByOrganization(value: unknown): AuthOrganizationFeatur
       : null;
     if (!organizationId) continue;
     entries.push({
-      featureFlags: parseFeatureFlagSlugs(entry.featureFlags),
+      featureFlags: sanitizeFeatureFlagSlugs(entry.featureFlags),
       organizationId,
     });
   }
@@ -525,12 +770,6 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : {};
-}
-
-function parseFeatureFlagSlugs(value: unknown): string[] {
-  if (!Array.isArray(value)) return [];
-  return [...new Set(value.filter((slug): slug is string => typeof slug === "string" && slug.trim().length > 0))]
-    .sort();
 }
 
 function expectString(value: unknown, field: string): string {
